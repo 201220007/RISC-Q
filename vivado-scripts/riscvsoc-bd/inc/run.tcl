@@ -111,37 +111,9 @@ if {$RUN_SYNTH} {
 }
 
 if {$RUN_IMPL} {
-  set_property strategy Performance_NetDelay_high [get_runs impl_1]
-  set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
-  set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE Explore [get_runs impl_1]
-  set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
-  # RISCQ_PLACE_DIRECTIVE overrides the placer directive (e.g. AltSpreadLogic_high) to relieve the
-  # RF-DAC edge congestion — placement, not routing, is the binder.
-  # RISCQ_PLACE_SEED varies the placer seed WITHOUT changing anything else -- the only honest way to
-  # separate a real design change from run-to-run placement noise. At 14q the feature-ON design was
-  # measured spanning 0.29 ns of WNS across four otherwise-equivalent runs, so single-run comparisons
-  # at this density mean nothing on their own.
-  if {[info exists ::env(RISCQ_PLACE_SEED)]} {
-    set_property STEPS.PLACE_DESIGN.ARGS.MORE\ OPTIONS "-seed $::env(RISCQ_PLACE_SEED)" [get_runs impl_1]
-    puts "\[run\] placer seed = $::env(RISCQ_PLACE_SEED)"
-  }
-  if {[info exists ::env(RISCQ_PLACE_DIRECTIVE)]} {
-    set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE $::env(RISCQ_PLACE_DIRECTIVE) [get_runs impl_1]
-    puts "\[run\] place directive override: $::env(RISCQ_PLACE_DIRECTIVE)"
-  }
-  # RISCQ_PBLOCK hooks a pre-place Tcl (pblocks.tcl) that creates 14 per-core Pblocks pinning ONLY
-  # each RISC-V core + its RAM (riscqFiber_riscq + mem) to a clock region, the DSP/RF datapath left
-  # to float — the fix for the X5-edge congestion wall that placer-directive experiments
-  # could not break.
-  # RISCQ_PBLOCK_TCL overrides the pre-place floorplan file (default pblocks-bd.tcl) — build-riscvsoc-bd.sh
-  # points it at this dir's pblocks-bd.tcl, the OOC floorplan (cores → X0 Y3-Y7 bands, datapath →
-  # X1Y0:X5Y7) ported into the BD hierarchy.
-  if {[info exists ::env(RISCQ_PBLOCK)]} {
-    set _ppre $SCRIPT_DIR/pblocks-bd.tcl
-    if {[info exists ::env(RISCQ_PBLOCK_TCL)]} { set _ppre $::env(RISCQ_PBLOCK_TCL) }
-    set_property STEPS.PLACE_DESIGN.TCL.PRE $_ppre [get_runs impl_1]
-    puts "\[run\] pblock floorplan: $_ppre (RISCQ_PBLOCK=$::env(RISCQ_PBLOCK))"
-  }
+  # settings shared with trial-impl.tcl (P1 timing trials) -- inc/impl-settings.tcl is the ONE
+  # definition of the implementation recipe, so a trial can never drift from the full flow.
+  source $INC/impl-settings.tcl
   if {$RUN_BITSTREAM} {
     launch_runs impl_1 -to_step write_bitstream -jobs 1
   } else {
@@ -152,20 +124,8 @@ if {$RUN_IMPL} {
     error "implementation failed — see $BUILD_DIR/$PRJ.runs/impl_1"
   }
   open_run impl_1
-  # Reports FIRST: if the CDC gate below rejects the build, the timing/utilisation reports are exactly
-  # what is needed to diagnose it, so they must already be on disk.
-  report_utilization    -file $BUILD_DIR/util_impl.rpt
-  report_timing_summary -file $BUILD_DIR/timing_impl.rpt -max_paths 20
-  # r12-#10: the async clock groups are declared with `get_clocks -quiet`; verify here, against the
-  # ROUTED design, that all four names resolved, that the uplink's own ddrClk is in the ui group, and
-  # that no cross-domain pair is still analysed. A typo would otherwise silently disable the group.
-  if {$DDR_READOUT} { source $INC/ddr-check-cdc.tcl }
-  # per-cone failing-endpoint classifier (specs/riscv-fmax.md A1) → cones_impl.rpt / cones_paths.tsv
-  if {[catch {
-    set CONES_DIR $BUILD_DIR
-    source $SCRIPT_DIR/../report-cones.tcl
-  } _ce]} { puts "\[run\] WARN: report-cones failed: $_ce" }
-  puts "\[run\] implementation OK — reports in $BUILD_DIR (util_impl.rpt / timing_impl.rpt / cones_impl.rpt)"
+  # reports + [ddr-cdc] gate + check_timing + cones: shared with trial-impl.tcl
+  source $INC/impl-reports.tcl
   if {$RUN_BITSTREAM} {
     file copy -force $BUILD_DIR/$PRJ.runs/impl_1/${BD_NAME}_wrapper.bit $BUILD_DIR/$TOP_MODULE.bit
     puts "\[run\] bitstream -> $BUILD_DIR/$TOP_MODULE.bit"

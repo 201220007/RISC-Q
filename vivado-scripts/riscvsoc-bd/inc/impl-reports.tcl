@@ -9,6 +9,10 @@ check_timing -verbose -file $BUILD_DIR/check_timing_impl.rpt
 puts "\[run\] check_timing -> $BUILD_DIR/check_timing_impl.rpt"
 # r12-#10: verify against the ROUTED design that the async clock-group names all resolved and no
 # cross-domain pair is analysed -- a typo would silently disable the group.
+if {[info exists ::env(RISCQ_INCR_DCP)]} {
+  report_incremental_reuse -file $BUILD_DIR/incremental_reuse.rpt
+  puts "\[run\] incremental reuse -> $BUILD_DIR/incremental_reuse.rpt (abandon P3 if reuse is not overwhelming)"
+}
 if {$DDR_READOUT} { source $INC/ddr-check-cdc.tcl }
 if {[catch {
   set CONES_DIR $BUILD_DIR

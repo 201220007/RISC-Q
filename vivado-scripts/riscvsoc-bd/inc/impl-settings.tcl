@@ -13,6 +13,17 @@ if {[info exists ::env(RISCQ_PLACE_DIRECTIVE)]} {
 }
 # (The old RISCQ_PLACE_SEED knob is deliberately GONE: its `MORE\ OPTIONS` word-split killed
 # set_property, and `place_design -help` on 2026.1 shows no -seed option exists at all.)
+# RISCQ_INCR_DCP: incremental implementation against a reference checkpoint (P3 -- the closed
+# feature-OFF baseline's routed DCP, so the cores keep the placement that met timing and only the
+# uplink/MIG/DMA logic places fresh). Loud error if the property is absent -- a silently ignored
+# reference would masquerade as a normal trial (r34-#4).
+if {[info exists ::env(RISCQ_INCR_DCP)]} {
+  if {[lsearch -exact [list_property [get_runs impl_1]] INCREMENTAL_CHECKPOINT] < 0} {
+    error "RISCQ_INCR_DCP set but impl_1 has no INCREMENTAL_CHECKPOINT property on Vivado [version -short]"
+  }
+  set_property INCREMENTAL_CHECKPOINT [file normalize $::env(RISCQ_INCR_DCP)] [get_runs impl_1]
+  puts "\[run\] incremental reference: $::env(RISCQ_INCR_DCP)"
+}
 # RISCQ_PBLOCK hooks the pre-place floorplan (14 per-core Pblocks; datapath floats).
 if {[info exists ::env(RISCQ_PBLOCK)]} {
   set _ppre $SCRIPT_DIR/pblocks-bd.tcl

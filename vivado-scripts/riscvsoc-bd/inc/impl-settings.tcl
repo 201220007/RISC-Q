@@ -28,7 +28,10 @@ if {[info exists ::env(RISCQ_INCR_DCP)]} {
   if {[info exists ::env(RISCQ_INCR_DIRECTIVE)]} {
     set _ip [get_runs impl_1]
     if {[lsearch -exact [list_property $_ip] INCREMENTAL_CHECKPOINT.MORE_OPTIONS] >= 0} {
-      set_property INCREMENTAL_CHECKPOINT.MORE_OPTIONS "-incremental_directive $::env(RISCQ_INCR_DIRECTIVE)" $_ip
+      # the value BEGINS WITH A DASH, so it must go through -name/-value or set_property eats it
+      # as its own option ("Unknown option '-incremental_directive ...'") -- same family as the
+      # dead seed knob's failure, different limb.
+      set_property -name INCREMENTAL_CHECKPOINT.MORE_OPTIONS -value "-incremental_directive $::env(RISCQ_INCR_DIRECTIVE)" -objects $_ip
       puts "\[run\] incremental directive: $::env(RISCQ_INCR_DIRECTIVE)"
     } else {
       puts "\[run\] WARN: no INCREMENTAL_CHECKPOINT.MORE_OPTIONS on Vivado [version -short] -- incremental directive SKIPPED (record this; the trial then runs default incremental)"

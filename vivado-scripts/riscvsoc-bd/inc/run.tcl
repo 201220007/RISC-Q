@@ -40,7 +40,13 @@ if {$RUN_SYNTH} {
   # cores (the OOC bench's `synth_design -retiming`), so a block-design impl is a fair compare to the
   # out-of-context vivado-scripts/riscvsoc bench — the synth_1 GLOBAL_RETIMING above only touches the
   # ≈FF-free BD wrapper, never the cores. Both levers reuse the one create_ip_run materialisation.
-  if {[info exists ::env(RISCQ_CSET_THRESH)] || [info exists ::env(RISCQ_IP_RETIMING)]} {
+  # RISCQ_SYNTH_DIRECTIVE overrides the synth directive (e.g. AlternateRoutability) -- on the IP run
+  # below (where the cores are); set on synth_1 too for the wrapper, harmless and consistent.
+  if {[info exists ::env(RISCQ_SYNTH_DIRECTIVE)]} {
+    set_property STEPS.SYNTH_DESIGN.ARGS.DIRECTIVE $::env(RISCQ_SYNTH_DIRECTIVE) $_s1
+    puts "\[run\] synth directive override on synth_1: $::env(RISCQ_SYNTH_DIRECTIVE)"
+  }
+  if {[info exists ::env(RISCQ_CSET_THRESH)] || [info exists ::env(RISCQ_IP_RETIMING)] || [info exists ::env(RISCQ_SYNTH_DIRECTIVE)]} {
     set _bd [get_files -quiet $BD_NAME.bd]
     if {[llength $_bd]} { catch { create_ip_run $_bd } }
     set _ipruns [get_runs -quiet -filter {IS_SYNTHESIS && NAME =~ *_top_*}]
@@ -59,6 +65,14 @@ if {$RUN_SYNTH} {
           puts "\[run\] control-set opt threshold $::env(RISCQ_CSET_THRESH) -> IP run $_r"
         } else {
           puts "\[run\] WARN: IP run $_r has no CONTROL_SET_OPT_THRESHOLD property (Vivado [version -short]) -- lever skipped"
+        }
+      }
+      if {[info exists ::env(RISCQ_SYNTH_DIRECTIVE)]} {
+        if {[lsearch -exact $_props STEPS.SYNTH_DESIGN.ARGS.DIRECTIVE] >= 0} {
+          set_property STEPS.SYNTH_DESIGN.ARGS.DIRECTIVE $::env(RISCQ_SYNTH_DIRECTIVE) $_r
+          puts "\[run\] synth directive $::env(RISCQ_SYNTH_DIRECTIVE) -> IP run $_r"
+        } else {
+          puts "\[run\] WARN: IP run $_r has no ARGS.DIRECTIVE property -- synth directive skipped"
         }
       }
       if {[info exists ::env(RISCQ_IP_RETIMING)]} {

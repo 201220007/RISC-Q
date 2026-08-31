@@ -31,7 +31,9 @@ if {[info exists ::env(RISCQ_INCR_DCP)]} {
       # the value BEGINS WITH A DASH, so it must go through -name/-value or set_property eats it
       # as its own option ("Unknown option '-incremental_directive ...'") -- same family as the
       # dead seed knob's failure, different limb.
-      set_property -name INCREMENTAL_CHECKPOINT.MORE_OPTIONS -value "-incremental_directive $::env(RISCQ_INCR_DIRECTIVE)" -objects $_ip
+      # 2026.1 spells it `read_checkpoint -incremental <dcp> -directive <mode>` -- the old
+      # -incremental_directive is gone (probed via `help read_checkpoint`, 2026-08-31).
+      set_property -name INCREMENTAL_CHECKPOINT.MORE_OPTIONS -value "-directive $::env(RISCQ_INCR_DIRECTIVE)" -objects $_ip
       puts "\[run\] incremental directive: $::env(RISCQ_INCR_DIRECTIVE)"
     } else {
       puts "\[run\] WARN: no INCREMENTAL_CHECKPOINT.MORE_OPTIONS on Vivado [version -short] -- incremental directive SKIPPED (record this; the trial then runs default incremental)"

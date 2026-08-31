@@ -23,6 +23,17 @@ if {[info exists ::env(RISCQ_INCR_DCP)]} {
   }
   set_property INCREMENTAL_CHECKPOINT [file normalize $::env(RISCQ_INCR_DCP)] [get_runs impl_1]
   puts "\[run\] incremental reference: $::env(RISCQ_INCR_DCP)"
+  # RISCQ_INCR_DIRECTIVE selects the incremental mode (e.g. TimingClosure: reuse selectively and
+  # re-optimise critical paths, instead of the default that locked 95% and could not place the rest).
+  if {[info exists ::env(RISCQ_INCR_DIRECTIVE)]} {
+    set _ip [get_runs impl_1]
+    if {[lsearch -exact [list_property $_ip] INCREMENTAL_CHECKPOINT.MORE_OPTIONS] >= 0} {
+      set_property INCREMENTAL_CHECKPOINT.MORE_OPTIONS "-incremental_directive $::env(RISCQ_INCR_DIRECTIVE)" $_ip
+      puts "\[run\] incremental directive: $::env(RISCQ_INCR_DIRECTIVE)"
+    } else {
+      puts "\[run\] WARN: no INCREMENTAL_CHECKPOINT.MORE_OPTIONS on Vivado [version -short] -- incremental directive SKIPPED (record this; the trial then runs default incremental)"
+    }
+  }
 }
 # RISCQ_PBLOCK hooks the pre-place floorplan (14 per-core Pblocks; datapath floats).
 if {[info exists ::env(RISCQ_PBLOCK)]} {

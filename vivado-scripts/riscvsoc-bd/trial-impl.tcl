@@ -21,15 +21,29 @@ open_project [lindex $_xpr 0]
 if {[get_property PROGRESS [get_runs synth_1]] != "100%"} {
   error "synth_1 is not complete in the copied parent -- refusing to (re)synthesise in a trial"
 }
-set _dcp [glob -nocomplain $BUILD_DIR/$PRJ.runs/synth_1/*.dcp]
-if {[llength $_dcp] != 1} { error "expected one synth_1 DCP, got: $_dcp" }
+# The netlist mass of a BD project lives in the OOC child runs (riscq_bd_top_0 alone carries the
+# whole PulseTableSoc); the top synth_1 DCP is just the wrapper. Freeze therefore covers ALL
+# synthesis DCPs: combined hash = sha256 over the per-file sha256 list, sorted by path relative to
+# the runs dir (absolute paths differ between parent and trial copies).
+set _dcps [glob -nocomplain $BUILD_DIR/$PRJ.runs/*synth_1*/*.dcp $BUILD_DIR/$PRJ.runs/synth_1/*.dcp]
+set _dcps [lsort -unique $_dcps]
+if {[llength $_dcps] < 2} { error "expected the top + OOC synthesis DCPs under $PRJ.runs, got: $_dcps" }
+set _pairs {}
+foreach _f $_dcps {
+  set _rel [string range $_f [string length $BUILD_DIR/$PRJ.runs/] end]
+  lappend _pairs [list $_rel [lindex [exec sha256sum $_f] 0]]
+}
+set _pairs [lsort -index 0 $_pairs]
+set _cat ""
+foreach _pr $_pairs { append _cat "[lindex $_pr 1]  [lindex $_pr 0]\n" }
+set _got [lindex [exec sha256sum << $_cat] 0]
+puts "\[trial\] [llength $_dcps] synthesis DCPs, combined sha256 = $_got"
 if {[llength $argv] >= 1} {
   set _want [lindex $argv 0]
-  set _got  [lindex [exec sha256sum [lindex $_dcp 0]] 0]
   if {$_got ne $_want} {
-    error "synth_1 DCP sha256 mismatch: got $_got want $_want -- the frozen-synthesis premise is broken"
+    error "combined synthesis-DCP sha256 mismatch: got $_got want $_want -- the frozen-synthesis premise is broken"
   }
-  puts "\[trial\] synth DCP sha256 verified: $_got"
+  puts "\[trial\] frozen synthesis verified against the ledger"
 }
 
 source $INC/impl-settings.tcl

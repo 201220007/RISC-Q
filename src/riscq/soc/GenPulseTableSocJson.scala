@@ -82,6 +82,9 @@ object GenPulseTableSocJson extends App {
     // specs/dsp-fmax.md converter-edge lever (C2), default off — a confirmation build turns it on in
     // its JSON so the lever state is part of the recorded build geometry (soc-fmax R5).
     adcPipe           = intOr("adc_pipe", 3),
+    // qubic3 readout->DDR uplink. Absent/false => not one signal is elaborated and the emitted RTL is
+    // byte-identical to the baseline (gated by evidence/G0's hash).
+    ddrReadout    = boolOr("ddr_readout", false),
     vivado        = vivadoMode)
 
   // vivado mode: LUT6 packing + the companion ClockInterface.v BUFG wrapper, matching GenPulseTableSocVivado.

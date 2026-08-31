@@ -32,9 +32,19 @@
 #   RISCQ_SKIP_GEN=1   ./build-riscvsoc-bd.sh # reuse the RTL already in the build dir (skip mill)
 #   RISCQ_PROJ_NAME=foo ./build-riscvsoc-bd.sh # build into <repo>/build/foo (parallel designs)
 #
-# Env: RISCQ_VIVADO_BIN, RISCQ_CONFIG (default software/configs/zcu216-14q.json), RISCQ_SKIP_GEN,
+#   # readout->DDR uplink (qubic3 C1). BOTH knobs are required and they are INDEPENDENT:
+#   #   RISCQ_DDR_READOUT=1 adds the DDR4 MIG + axi_dma + SmartConnects to the BLOCK DESIGN;
+#   #   the *_-ddr.json config turns the feature on in the RTL (SocParams.ddrReadout).
+#   # Setting only one of them fails: with the BD on and the RTL off the SoC has no m_axi_ddr/
+#   # s_axi_ddr_ctrl/m_axis_rd ports to connect (ddr-connect.tcl errors); with the RTL on and the BD
+#   # off those ports stay dangling and the design is useless. There is deliberately no auto-coupling
+#   # -- the RTL config is the design's identity, the env knob is the flow's.
+#   RISCQ_DDR_READOUT=1 RISCQ_CONFIG=software/configs/zcu216-14q-ddr.json ./build-riscvsoc-bd.sh
+#
+# Env: RISCQ_MILL (the mill launcher; the repo pins 1.1.0 in .mill-version), RISCQ_VIVADO_BIN, RISCQ_CONFIG (default software/configs/zcu216-14q.json), RISCQ_SKIP_GEN,
 #   RISCQ_RUN_BITSTREAM (default 1 — bitstream + xsa; set 0 for impl-only),
-#   RISCQ_PROJ_NAME (default riscvsoc-bd), plus the floorplan knobs read by pblocks-bd.tcl:
+#   RISCQ_PROJ_NAME (default riscvsoc-bd), RISCQ_DDR_READOUT (default 0 — see above),
+#   plus the floorplan knobs read by pblocks-bd.tcl:
 #   RISCQ_{ROW,PERROW,CONFINE}, RISCQ_BD_BASE, and RISCQ_PLACE_DIRECTIVE (default ExtraNetDelay_high —
 #   the placer directive). RISCQ_MREG_LOCK=1 freezes the carrierGen ComplexMul product DSPs against
 #   phys_opt MREG-stripping (specs/dsp-fmax.md). See README.md.
@@ -51,7 +61,7 @@ mkdir -p "$BUILD"
 # 1) RTL — the BD (vivado=true) form — emitted INTO the project build dir from the SocParams JSON.
 if [ "${RISCQ_SKIP_GEN:-0}" != "1" ]; then
   echo "[riscvsoc-bd] generating BD RTL (GenPulseTableSocJson $CONFIG, vivado=true) → $BUILD"
-  ( cd "$REPO_DIR" && mill runMain riscq.soc.GenPulseTableSocJson "$CONFIG" "$BUILD" vivado )
+  ( cd "$REPO_DIR" && "${RISCQ_MILL:-mill}" runMain riscq.soc.GenPulseTableSocJson "$CONFIG" "$BUILD" vivado )
 else
   echo "[riscvsoc-bd] RISCQ_SKIP_GEN=1 — reusing RTL in $BUILD"
   [ -f "$BUILD/PulseTableSoc.v" ] || { echo "[riscvsoc-bd] no $BUILD/PulseTableSoc.v — run once without RISCQ_SKIP_GEN" >&2; exit 1; }
@@ -65,7 +75,9 @@ export RISCQ_PBLOCK=1
 export RISCQ_PBLOCK_TCL="$BD_DIR/pblocks-bd.tcl"
 export RISCQ_IP_RETIMING=1
 export RISCQ_PLACE_DIRECTIVE="${RISCQ_PLACE_DIRECTIVE:-ExtraNetDelay_high}"   # route stays AggressiveExplore (run.tcl)
-export RISCQ_RUN_IMPL=1
+# Honour an explicit RISCQ_RUN_IMPL=0: a simulation-only build (G4b) needs the BD and the generated
+# simulation sources, not a netlist, and implementation is ~40 min of pointless CPU there.
+export RISCQ_RUN_IMPL=${RISCQ_RUN_IMPL:-1}
 export RISCQ_RUN_BITSTREAM="${RISCQ_RUN_BITSTREAM:-1}"   # bitstream + XSA (hardware handoff) by default; set 0 for impl-only
 
 echo "[riscvsoc-bd] building block design in $BUILD (floorplan, IP retiming, place=$RISCQ_PLACE_DIRECTIVE / route=AggressiveExplore, bitstream+xsa=$RISCQ_RUN_BITSTREAM) …"

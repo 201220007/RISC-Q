@@ -1,0 +1,69 @@
+--- /tmp/claude-1000/-home-yicheng-Desktop/aa87a57e-fa06-4135-a770-44c84fc503d5/scratchpad/vendor/orig/circular_buffer_axi_writer.v	2026-08-23 04:37:34.981957122 -0700
++++ src/riscq/ddr/rtl/circular_buffer_axi_writer.v	2026-08-23 05:02:02.339519760 -0700
+@@ -31,6 +31,8 @@
+     input  wire                          write_finished_ext, // external force finish signal
+     output reg  [AXI_ADDR_WIDTH-1:0]     final_addr,
+     output wire [AXI_ADDR_WIDTH-1:0]     cur_axi_addr_out,       // running write address for AWADDR
++    output wire                          writer_idle,            // [qubic3 Fork C2] state==ST_IDLE (base_reset admissible)
++    output reg                           addr_fault,             // [qubic3 Fork C4] sticky: ring wrap OR burst end > WRAP_LIMIT; cleared by base_reset
+     output reg                           current_user_done,
+     input  wire [RD_DATA_WIDTH-1:0]      rd_data,
+ 
+@@ -103,6 +105,7 @@
+     assign bank_bytes             = bank_len * (RD_DATA_WIDTH/8);
+     assign cur_axi_addr_plus_bank = cur_axi_addr + bank_bytes;
+     assign cur_axi_addr_out        = cur_axi_addr;
++    assign writer_idle             = (state == ST_IDLE);   // [qubic3 Fork C2]
+ 
+     // ----------------------------------------------------------------
+     // Combinational assignments
+@@ -110,8 +113,9 @@
+     assign m_axi_wdata = rd_data;
+ 
+     // wlast on final beat of a bank
+-    assign m_axi_wlast =
+-        (m_axi_wready && m_axi_wvalid) && (beat_count == bank_len - 1);
++    // [qubic3 Fork C] WLAST must be stable while WVALID && !WREADY (AXI A3.2.1); beat_count only
++    // advances on a W handshake, so this is stable by construction.
++    assign m_axi_wlast = m_axi_wvalid && (beat_count == bank_len - 1);
+ 
+     // rd_addr driven from beat_count during READ_WRITE; 0 otherwise
+     assign rd_addr =
+@@ -180,6 +184,7 @@
+             last_burst           <= 1'b0;
+             final_addr           <= {AXI_ADDR_WIDTH{1'b0}};
+             current_user_done    <= 1'b0;
++            addr_fault           <= 1'b0;   // [qubic3 Fork C4]
+ 
+             // Reset debug outputs and timer
+             debug_counter        <= 32'd0;
+@@ -199,8 +204,18 @@
+                 cur_axi_addr         <= base_addr;
+                 write_finished_ext_d <= 1'b0;
+                 last_burst           <= 1'b0;
++                addr_fault           <= 1'b0;   // [qubic3 Fork C4] per-run sticky
+             end
+ 
++            // [qubic3 Fork C4] address-fault detection (sticky until base_reset):
++            //  (a) the ring-wrap branch fires on a non-final bank advance;
++            //  (b) an issued burst ends past WRAP_LIMIT (the final-burst path bypasses the wrap branch).
++            if (state == ST_WAIT_B && m_axi_bvalid && !last_burst && (cur_axi_addr_plus_bank > WRAP_LIMIT))
++                addr_fault <= 1'b1;
++            if (state == ST_IDLE && able_to_read && !rd_empty && !base_reset &&
++                ((cur_axi_addr + (({1'b0, rd_addr_valid} + 1'b1) * (RD_DATA_WIDTH/8)) - 1) > WRAP_LIMIT))
++                addr_fault <= 1'b1;
++
+             // Defaults each cycle
+             read_finished      <= 1'b0;
+             m_axi_bready       <= 1'b1;
+@@ -220,7 +235,9 @@
+                     m_axi_wvalid  <= 1'b0;
+                     gap_timer     <= 32'd0; // Reset timer in IDLE
+ // warning: may have some logic problem for able_to_read signal
+-                    if (able_to_read) begin
++                    // [qubic3 Fork C3] base_reset has priority: never start a burst in the cycle the
++                    // pointer is being re-based (awaddr would capture the OLD cur_axi_addr).
++                    if (able_to_read && !base_reset) begin
+                         if (!rd_empty) begin
+                             // If this is the last burst in this user shot,
+                             // mark it so we reset addr after it finishes.

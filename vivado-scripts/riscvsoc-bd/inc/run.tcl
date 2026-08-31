@@ -2,7 +2,27 @@
 set_param general.maxThreads 2
 if {$RUN_SYNTH} {
   set_property strategy Flow_PerfOptimized_high [get_runs synth_1]
-  set_property STEPS.SYNTH_DESIGN.ARGS.GLOBAL_RETIMING on [get_runs synth_1]
+  # qubic3 / Vivado-version portability. Two separate traps here, both hit on this machine:
+  #  1. Setting an ABSENT property is a hard error that kills the whole build. Vivado 2022.1 has no
+  #     `STEPS.SYNTH_DESIGN.ARGS.GLOBAL_RETIMING` (added later; this repo targets 2026.1), so the lever
+  #     must be probed, not assumed.
+  #  2. `...ARGS.RETIMING` is NOT a drop-in stand-in for it -- it is the older, more aggressive
+  #     `synth_design -retiming`. Substituting it survived the 2-qubit build but **segfaulted Vivado
+  #     2022.1** partway through the 14-qubit SoC ("Retiming module `Uram' done" -> "An unrecoverable
+  #     error has occurred, synthesis cancelled", abnormal termination 6).
+  # Retiming is a performance lever, not a correctness one, so on a tool that lacks the intended
+  # property we SKIP it and say so, rather than substituting one that crashes.
+  set _rt_names {STEPS.SYNTH_DESIGN.ARGS.GLOBAL_RETIMING}
+  set _s1 [get_runs synth_1]
+  set _s1props [list_property $_s1]
+  set _done 0
+  foreach _n $_rt_names {
+    if {!$_done && [lsearch -exact $_s1props $_n] >= 0} {
+      set_property $_n on $_s1; set _done 1
+      puts "\[run\] retiming lever on synth_1 = $_n (Vivado [version -short])"
+    }
+  }
+  if {!$_done} { puts "\[run\] WARN: no GLOBAL_RETIMING on Vivado [version -short] -- retiming lever SKIPPED for synth_1 (see the note above: ARGS.RETIMING is not equivalent and crashes the 14q synthesis here)" }
   # RISCQ_CSET_THRESH raises the control-set optimisation threshold: clock-enable / set-reset nets
   # whose flop fanout is below N are mapped to LUT recirculation instead of the FF's dedicated
   # CE/SR pin, collapsing low-fanout control sets so cells pack densely again. Attacks the per-core
@@ -27,17 +47,58 @@ if {$RUN_SYNTH} {
     if {[llength $_ipruns] == 0} {
       puts "\[run\] WARN: an IP-synth lever (RISCQ_CSET_THRESH / RISCQ_IP_RETIMING) was set but no *_top_* IP synth run found — cores will NOT get it"
     }
+    # qubic3: on Vivado 2022.1 an OOC IP synth run exposes a REDUCED set of STEPS.SYNTH_DESIGN.ARGS.*
+    # properties -- GLOBAL_RETIMING is absent, and set_property then hard-errors the whole build
+    # ("The object 'run' does not have a property ..."). The repo targets 2026.1 where it exists, so
+    # check before setting and degrade to a warning: a missing performance lever must not stop a build.
     foreach _r $_ipruns {
+      set _props [list_property $_r]
       if {[info exists ::env(RISCQ_CSET_THRESH)]} {
-        set_property STEPS.SYNTH_DESIGN.ARGS.CONTROL_SET_OPT_THRESHOLD $::env(RISCQ_CSET_THRESH) $_r
-        puts "\[run\] control-set opt threshold $::env(RISCQ_CSET_THRESH) -> IP run $_r"
+        if {[lsearch -exact $_props STEPS.SYNTH_DESIGN.ARGS.CONTROL_SET_OPT_THRESHOLD] >= 0} {
+          set_property STEPS.SYNTH_DESIGN.ARGS.CONTROL_SET_OPT_THRESHOLD $::env(RISCQ_CSET_THRESH) $_r
+          puts "\[run\] control-set opt threshold $::env(RISCQ_CSET_THRESH) -> IP run $_r"
+        } else {
+          puts "\[run\] WARN: IP run $_r has no CONTROL_SET_OPT_THRESHOLD property (Vivado [version -short]) -- lever skipped"
+        }
       }
       if {[info exists ::env(RISCQ_IP_RETIMING)]} {
-        set_property STEPS.SYNTH_DESIGN.ARGS.GLOBAL_RETIMING on $_r
-        puts "\[run\] global retiming on -> IP run $_r"
+        set _d 0
+        foreach _n $_rt_names {
+          if {!$_d && [lsearch -exact $_props $_n] >= 0} {
+            set_property $_n on $_r; set _d 1
+            puts "\[run\] retiming on -> IP run $_r ($_n)"
+          }
+        }
+        if {!$_d} { puts "\[run\] WARN: no GLOBAL_RETIMING on this Vivado -- retiming lever SKIPPED for IP run $_r" }
       }
     }
   }
+  # ---- memory-initialisation data, the part that actually works (r27-#4 follow-up) ----
+  # `PulseTableSoc.v` uses `$readmemb "<bare name>.bin"`, and Vivado resolves a bare name against the
+  # SYNTHESIS RUN DIRECTORY. Packaging them into the IP (inc/package-ip.tcl) registers them in the
+  # component but does NOT get them into `bd/<bd>/ipshared/*/src/`, where the BD re-copies the IP's
+  # sources -- verified: that directory contained only PulseTableSoc.v, and the OOC synthesis still
+  # emitted 3x `Synth 8-4445`. The packaging check passing while the goal was unmet is exactly why the
+  # acceptance proof is "zero Synth 8-4445 in a fresh OOC synthesis", not "the script said OK".
+  # So stage them where the tool looks: every run directory, plus the ipshared copy next to the .v.
+  set _bins [glob -nocomplain $SOURCE_PATH/*.bin]
+  if {[llength $_bins]} {
+    set _dests {}
+    foreach _r [get_runs -quiet] {
+      set _d [get_property DIRECTORY $_r]
+      if {$_d ne "" && [file isdirectory $_d]} { lappend _dests $_d }
+    }
+    foreach _d [glob -nocomplain $BUILD_DIR/*.gen/sources_1/bd/*/ipshared/*/src                                  $BUILD_DIR/bd/*/ipshared/*/src] {
+      lappend _dests $_d
+    }
+    set _n 0
+    foreach _d $_dests {
+      foreach _b $_bins { file copy -force $_b $_d/[file tail $_b]; incr _n }
+    }
+    puts "\[run\] staged [llength $_bins] memory-init .bin file(s) into [llength $_dests] location(s)\
+          ($_n copies): every run directory + the ipshared source dir"
+  }
+
   launch_runs synth_1 -jobs 1
   wait_on_run synth_1
   if {[get_property PROGRESS [get_runs synth_1]] != "100%"} {
@@ -56,6 +117,14 @@ if {$RUN_IMPL} {
   set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
   # RISCQ_PLACE_DIRECTIVE overrides the placer directive (e.g. AltSpreadLogic_high) to relieve the
   # RF-DAC edge congestion — placement, not routing, is the binder.
+  # RISCQ_PLACE_SEED varies the placer seed WITHOUT changing anything else -- the only honest way to
+  # separate a real design change from run-to-run placement noise. At 14q the feature-ON design was
+  # measured spanning 0.29 ns of WNS across four otherwise-equivalent runs, so single-run comparisons
+  # at this density mean nothing on their own.
+  if {[info exists ::env(RISCQ_PLACE_SEED)]} {
+    set_property STEPS.PLACE_DESIGN.ARGS.MORE\ OPTIONS "-seed $::env(RISCQ_PLACE_SEED)" [get_runs impl_1]
+    puts "\[run\] placer seed = $::env(RISCQ_PLACE_SEED)"
+  }
   if {[info exists ::env(RISCQ_PLACE_DIRECTIVE)]} {
     set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE $::env(RISCQ_PLACE_DIRECTIVE) [get_runs impl_1]
     puts "\[run\] place directive override: $::env(RISCQ_PLACE_DIRECTIVE)"
@@ -83,8 +152,14 @@ if {$RUN_IMPL} {
     error "implementation failed — see $BUILD_DIR/$PRJ.runs/impl_1"
   }
   open_run impl_1
+  # Reports FIRST: if the CDC gate below rejects the build, the timing/utilisation reports are exactly
+  # what is needed to diagnose it, so they must already be on disk.
   report_utilization    -file $BUILD_DIR/util_impl.rpt
   report_timing_summary -file $BUILD_DIR/timing_impl.rpt -max_paths 20
+  # r12-#10: the async clock groups are declared with `get_clocks -quiet`; verify here, against the
+  # ROUTED design, that all four names resolved, that the uplink's own ddrClk is in the ui group, and
+  # that no cross-domain pair is still analysed. A typo would otherwise silently disable the group.
+  if {$DDR_READOUT} { source $INC/ddr-check-cdc.tcl }
   # per-cone failing-endpoint classifier (specs/riscv-fmax.md A1) → cones_impl.rpt / cones_paths.tsv
   if {[catch {
     set CONES_DIR $BUILD_DIR

@@ -45,6 +45,28 @@ cd vivado-scripts/riscvsoc-bd   && ./build-riscvsoc-bd.sh     # block design, 14
 `RISCQ_QUBITS=3 ./build-*.sh` runs a smaller config for fast iteration. Each subfolder's `README.md`
 documents its full env-knob set, recipe, and the reports it writes.
 
+### Readout → DDR uplink (qubic3 C1)
+
+The uplink is off by default and needs **two independent switches**, one per layer:
+
+| knob | layer | what it does |
+|---|---|---|
+| `RISCQ_DDR_READOUT=1` | **block design** (`inc/config.tcl`) | adds the DDR4 MIG (`ddr4_0`), the S2MM `axi_dma_0`, the `smc_ddr`/`smc_dma`/`smc_ctrl` SmartConnects, the `ui_clk` reset tree and `ddr-timing.xdc` |
+| a `*-ddr.json` config | **RTL** (`SocParams.ddrReadout`) | instantiates `ReadoutDdrUplink` and exposes `ddrClk/ddrRst`, `m_axi_ddr`, `s_axi_ddr_ctrl`, `m_axis_rd` on the packaged IP |
+
+They are not auto-coupled on purpose: the JSON is the *design's* identity (it is what the software
+`SocMap` and every simulation read), the env var is the *flow's*. Setting only one is an error, not a
+degraded mode — BD-on/RTL-off aborts in `ddr-connect.tcl` because the ports do not exist, and
+RTL-on/BD-off ships an IP whose DDR ports are dangling.
+
+```bash
+cd vivado-scripts/riscvsoc-bd
+RISCQ_DDR_READOUT=1 RISCQ_CONFIG=../../software/configs/zcu216-14q-ddr.json ./build-riscvsoc-bd.sh
+```
+
+Ready-made configs: `zcu216-14q-ddr.json` (production, 14 qubits), `lbl-readout-emu-ddr.json` (the
+veneno BPF-loopback bench), `sim-2q-ddr.json` (fast smoke).
+
 ## Per-cone timing tracking — `report-cones.tcl`
 
 Both flows classify every failing endpoint of the routed design into the named logic cones of

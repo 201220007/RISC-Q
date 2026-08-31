@@ -193,6 +193,11 @@ case class RiscqRfWithPulseTableFiber(
   val readoutMemPort = posted.roChannel.io.memPort
   val demodMemPort   = posted.demodChannel.io.memPort
   val decoderRd      = posted.decoder
+  // qubic3: the pre-link result Flow, exported so the OPTIONAL readout->DDR uplink can tap it. This is
+  // a plain alias, not a new signal: if nothing consumes it, SpinalHDL emits nothing and the generated
+  // RTL keeps the baseline hash (gated by evidence/G0). A Flow has no back-pressure, so fanning it out
+  // cannot perturb the CPU path.
+  def readoutResult = posted.upSrc
   val startTime      = posted.gateChannel.startTime    // gate buffer's per-buffer startTime (sims observe it)
 
   // ── envelope-memory read ports (reconstruct the full `lanes`-lane batch from the interpolated line) ──

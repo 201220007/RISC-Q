@@ -16,3 +16,9 @@ ext/VexiiRiscv
 BASIC_MISTAKES.md
 /src/scratch
 .Xil/
+# process artifacts (never commit; see feedback_no_process_docs_in_repos)
+build_*.log
+__pycache__/
+*.pyc
+src/riscq/ddr/cocotb/**/results.xml
+src/riscq/ddr/cocotb/**/sim_build/

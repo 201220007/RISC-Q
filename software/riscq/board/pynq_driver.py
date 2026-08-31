@@ -73,12 +73,17 @@ class PynqDriver:
         else:
             self.mts_result = None
         log.info(f"mts: {self.mts_result}")
+        # Nyquist zones are opt-out the same way MTS is: board.json "dac_nyquist"/"adc_nyquist" = null
+        # skips them. A no-RF bring-up (the DDR injector self-test) must not write RF state on a board
+        # another project shares -- and every skipped write is one less thing to restore afterwards.
         zones = cfg["dac_nyquist"]
-        for tile in range(4):
-            for block in range(4):
-                self.dac_nyquist_zone(tile, block,
-                                      zones.get(f"{tile},{block}", zones.get("default", 2)))
-        self.adc_nyquist_zone(cfg["adc_nyquist"])
+        if zones is not None:
+            for tile in range(4):
+                for block in range(4):
+                    self.dac_nyquist_zone(tile, block,
+                                          zones.get(f"{tile},{block}", zones.get("default", 2)))
+        if cfg["adc_nyquist"] is not None:
+            self.adc_nyquist_zone(cfg["adc_nyquist"])
         for tileblock, uA in cfg["dac_current"].items():
             tile, block = (int(x) for x in tileblock.split(","))
             self.dacvop(tile, block, uA)

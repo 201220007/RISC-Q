@@ -6,7 +6,8 @@ import spinal.core.fiber.Fiber
 import spinal.lib._
 import spinal.lib.bus.tilelink
 import spinal.lib.bus.tilelink.fabric.{Node, MasterBus, WidthAdapter}
-import spinal.lib.bus.amba4.axi.Axi4ToTilelinkFiber
+import spinal.lib.bus.amba4.axi.{Axi4, Axi4ToTilelinkFiber}
+import riscq.misc.{Axi4VivadoHelper, Axi4StreamVivadoHelper, VivadoClkHelper}
 import spinal.lib.bus.misc.SizeMapping
 import riscq.dsp.{AdderTree, ComplexBatch}
 import riscq.riscv.RiscqParam
@@ -40,6 +41,7 @@ case class PulseTableSoc(
     adcNum: Int = 16,
     withTest: Boolean = false,
     vivado: Boolean = false,
+    ddrReadout: Boolean = false,
     // RISC-V core plugin config, replicated across all `qubitNum` cores. Defaults to the verified
     // timing-closure stack for the packed multi-core floorplan, every flag RVLS-bit-exact:
     //   - `gshareMem` moves the GShare 2-bit counter table from a flip-flop array + one-hot write decode
@@ -76,6 +78,8 @@ case class PulseTableSoc(
     // RAM and the B2 dcOffset MAX_FANOUT cap are baked into PulseParamBuffer; the B3 queue lean-pop into
     // TimedQueue; the C1 registered head is a TimedQueue-level option, no longer plumbed here).
     adcPipe: Int = 3,                   // C2: register stages on the ADC nets off the RFDC edge
+    // qubic3 readout->DDR uplink (JSON key `ddr_readout`). OFF by default, and when off NOTHING is
+    // elaborated: the generated RTL is byte-identical to the baseline (gated by evidence/G0's hash).
 ) extends Zcu216Top(dacNum = dacNum, adcNum = adcNum, dacBatch = 16, adcBatch = 4, dataWidth = 16, vivado = vivado) {
   val N        = 16    // DAC drive batch
   val adcBatch = 4
@@ -283,10 +287,71 @@ case class PulseTableSoc(
   val timeOffset = Reg(UInt(64 bit)) init 0
   riscqArea.timeOffset := dspCd(BufferCC(timeOffset))
 
+  // ── qubic3: optional readout → DDR uplink ────────────────────────────────────────────────────────
+  // Everything is `generate`-gated on `ddrReadout`, so with the feature off not one signal is created
+  // and the emitted RTL keeps the baseline hash (evidence/G0). Geometry is derived from `qubitNum`, so
+  // the same code builds for any config.
+  // The MIG's ui_clk on this board/config is 333.25 MHz (300 MHz input, CLKOUT0_DIVIDE=3) -- Vivado
+  // annotates exactly that, and a mismatched FREQ_HZ fails validate_bd_design. Mirrored by DDR_FREQ in
+  // vivado-scripts/riscvsoc-bd/inc/config.tcl.
+  def DdrClkFreqHz: Long = 333250000L
+
+  val ddrUplink = ddrReadout generate new Area {
+    val ddrClk = in Bool()
+    val ddrRst = in Bool()
+    ddrClk.setName("ddrClk"); ddrRst.setName("ddrRst")
+    val ddrCd  = ClockDomain(ddrClk, ddrRst)
+    val p      = riscq.ddr.ReadoutDdrUplinkParams(numCh = qubitNum, accWidth = 32)   // = READOUT_ACC_WIDTH (riscq.map); the decoder integral width
+    // Codex r19-B1: the MIG's `c0_init_calib_complete` is otherwise connected to NOTHING in the block
+    // design, so on the board a failed DDR4 calibration is indistinguishable from a wedged uplink -- an
+    // AXI transaction that never returns. Bring it in and publish it (see `ddrStatus` below).
+    val calibDone = in Bool();  calibDone.setName("ddrCalibDone")
+    val ctrl   = slave(Axi4(p.ctrlAxiConfig));  ctrl.setName("s_axi_ddr_ctrl")
+    val ddr    = master(Axi4(p.ddrAxiConfig));  ddr.setName("m_axi_ddr")
+    val rd     = master(Stream(Fragment(Bits(p.axiDataWidth bits)))); rd.setName("m_axis_rd")
+
+    val up = ddrCd(riscq.ddr.ReadoutDdrUplink(p, dspCd))
+    up.io.calibDone := calibDone
+    for (i <- 0 until qubitNum) up.io.results(i) << riscqArea.riscqCores(i).readoutResult
+    up.io.ctrl << ctrl
+    ddr << up.io.ddr
+    rd  << up.io.rd
+
+    if (vivado) {
+      VivadoClkHelper.addInference(ddrClk, ddrRst, DdrClkFreqHz)
+      Axi4VivadoHelper.addInference(ddr,  "M_AXI_DDR")
+      Axi4VivadoHelper.addInference(ctrl, "S_AXI_DDR_CTRL")
+      // r11-#10: this is a Stream[Fragment], so the generic helper (which tags the whole `payload` as
+      // TDATA) would give `last` both TDATA and TLAST. Tag the members explicitly.
+      def axis(d: Data, sig: String): Unit =
+        d.addAttribute("X_INTERFACE_INFO", s"xilinx.com:interface:axis:1.0 M_AXIS_RD $sig")
+      axis(rd.valid, "TVALID"); axis(rd.ready, "TREADY")
+      axis(rd.fragment, "TDATA"); axis(rd.last, "TLAST")
+    }
+  }
+
+  // Codex r19-#4: publishing calibration ONLY inside the uplink's own DIAG helps just while the ui_clk
+  // register path is clocked and out of reset -- exactly the condition that is NOT established when the
+  // symptom is "an AXI transaction that never returns". So the same two facts are also mirrored here, in
+  // the HOST clock domain, whose reset tree is independent of the DDR one: this register is readable
+  // even when the whole ui_clk side is dead, which is the case it exists to diagnose.
+  //   [31:16] magic 0xCA1B -- a positive capability marker. An older bitstream returns 0 for this
+  //           unmapped offset, so a newer driver can tell "no such register" from "calibration failed"
+  //           instead of refusing to run forever (Codex r19-B2).
+  //   [1]     ui_reset_released -- the DDR reset tree let go (Codex r19-B3): distinguishes
+  //           "MIG never calibrated" from "calibrated, but the downstream reset never released".
+  //   [0]     calib_done
+  val ddrStatusHost = ddrReadout generate hostCd(new Area {
+    val calib = BufferCC(ddrUplink.calibDone, init = False, bufferDepth = 3)
+    val rstOk = BufferCC(!ddrUplink.ddrRst,   init = False, bufferDepth = 3)
+    val word  = B(0xCA1B, 16 bits) ## B(0, 14 bits) ## rstOk ## calib
+  })
+
   val hostCtrlDriver = MemMapDriverFiber(addressWidth = 10, dataWidth = 32, driveProc = { factory =>
     factory.drive(riscqResetHostCd, 0)
     factory.write(timeOffset(0, 32 bits), 64)
     factory.write(timeOffset(32, 32 bits), 68)
+    if (ddrReadout) factory.read(ddrStatusHost.word, 0x50)   // see ddrStatusHost above
   })
   hostCtrlDriver.up.setUpConnection(a = StreamPipe.FULL, d = StreamPipe.FULL)
   hostCtrlDriver.up at SizeMapping(map.hostCtrlBase, map.regionSize) of hostBus

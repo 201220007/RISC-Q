@@ -105,6 +105,11 @@ class SocParams:
     # the core's demod ADC. Held as tuples (a frozen dataclass must stay hashable).
     dac_map: tuple | None = None
     adc_map: tuple | None = None
+    # Readout->DDR uplink (qubic3 C1). Hardware-and-software: the elaboration instantiates
+    # ReadoutDdrUplink, and software needs it to know whether the DDR status register exists. Kept OUT of
+    # _FIELDS deliberately -- it is optional, so every pre-existing config still round-trips byte-for-byte
+    # through to_json(). (Before this, loading any *-ddr.json raised "unknown SocParams fields".)
+    ddr_readout: bool = False
 
     @classmethod
     def load(cls, json_path: str | Path) -> "SocParams":
@@ -121,6 +126,7 @@ class SocParams:
         raw.setdefault("rob_depth", 1024)   # optional; readout-trace ROB depth default (PulseTableSoc)
         dac_map = raw.pop("dac_map", None)  # optional converter maps: kept (the channel-role mapping — the
         adc_map = raw.pop("adc_map", None)  # co-sim model needs them), unlike the hardware-only knobs below
+        ddr_readout = bool(raw.pop("ddr_readout", False))   # optional; software-visible (DDR status reg)
         raw.pop("queue_depth", None)        # hardware-only TimedQueue depth; software uses slot count, not depth
         unknown = set(raw) - set(_FIELDS)
         if unknown:
@@ -133,6 +139,7 @@ class SocParams:
             kwargs["dac_map"] = tuple(tuple(int(x) for x in row) for row in dac_map)
         if adc_map is not None:
             kwargs["adc_map"] = tuple(int(x) for x in adc_map)
+        kwargs["ddr_readout"] = ddr_readout
         return cls(**kwargs)
 
     def to_json(self) -> str:
@@ -141,6 +148,8 @@ class SocParams:
             out["dac_map"] = [list(row) for row in self.dac_map]
         if self.adc_map is not None:
             out["adc_map"] = list(self.adc_map)
+        if self.ddr_readout:
+            out["ddr_readout"] = True
         return json.dumps(out, indent=4)
 
 
@@ -207,6 +216,14 @@ class SocMap:
     HOST_FROM_HOST = 0x10           # legacy mailbox, unused by this framework
     HOST_TIME_OFF_LO = 0x40
     HOST_TIME_OFF_HI = 0x44
+    # ── DDR uplink status (read-only; present only when params.ddr_readout) ──
+    # Lives in the HOST clock domain on purpose: its reset tree is independent of the DDR one, so this
+    # register still answers when the whole ui_clk side is dead -- which is the failure it exists to
+    # diagnose. The uplink's own DIAG[9] mirrors bit 0, but DIAG is unreadable in exactly that case.
+    HOST_DDR_STATUS = 0x50
+    DDR_STATUS_MAGIC = 0xCA1B       # [31:16]; an older bitstream reads 0 here -> capability absent
+    DDR_STATUS_CALIB = 0            # MIG c0_init_calib_complete
+    DDR_STATUS_UI_RST_OK = 1        # the ui_clk reset tree released
 
     LEAD = LEAD
 
@@ -253,6 +270,12 @@ class SocMap:
         self.host_ctrl = 5 * self.region_size
 
     # ── host-AXI address helpers ──
+    def ddr_status(self) -> int:
+        """Absolute host-AXI address of the DDR uplink status register (see HOST_DDR_STATUS)."""
+        if not self.params.ddr_readout:
+            raise ValueError(f"{self.params.name} was not built with ddr_readout; there is no DDR status register")
+        return self.host_ctrl + self.HOST_DDR_STATUS
+
     def _core(self, core: int) -> int:
         if not 0 <= core < self.params.qubit_num:
             raise ValueError(f"core {core} out of range (qubit_num={self.params.qubit_num})")

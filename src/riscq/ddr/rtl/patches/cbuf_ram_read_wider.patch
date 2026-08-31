@@ -1,0 +1,34 @@
+--- /tmp/claude-1000/-home-yicheng-Desktop/aa87a57e-fa06-4135-a770-44c84fc503d5/scratchpad/vendor/orig/cbuf_ram_read_wider.v	2026-08-23 04:37:34.981000709 -0700
++++ src/riscq/ddr/rtl/cbuf_ram_read_wider.v	2026-08-23 13:53:29.509114831 -0700
+@@ -66,19 +66,17 @@
+ // 1-cycle read: doB = the registered BRAM output, NO extra pipeline stage (see contract above).
+ assign doB = readB;
+ 
+-generate
+-	if (INIT_FILE!="") begin
+-		initial
+-			$readmemh(INIT_FILE,RAM);//,0,SIZEA-1);
+-	end
+-	else begin
+-		integer i;
+-		initial begin
+-			for (i=0;i<=SIZEA;i=i+1)
+-				RAM[i]=32'h0;
+-
+-		end
+-	end
+-endgenerate
++// [qubic3 Fork B2] The upstream module had an `INIT_FILE!=""` branch that preloaded the array from a
++// hex file. INIT_FILE is a PARAMETER, not a string literal, so SpinalSim's memory-preload path-rewrite
++// pass (SimBootstraps.scala:1034, triggered by the mere substring of that system task on any line,
++// comments included) cannot resolve it and corrupts the generated Verilog. This RAM is always
++// instantiated with INIT_FILE="" (the circular buffer never preloads), so the branch is removed and the
++// array is unconditionally zero-initialised. INIT_FILE is kept for parameter compatibility.
++// NOTE: do not write that system-task name anywhere in this file, not even in a comment.
++integer i;
++initial begin
++	for (i=0;i<maxSIZE;i=i+1)   // [qubic3 Fork B] was i<=SIZEA (one past the array)
++		RAM[i]={minWIDTH{1'b0}};
++end
+ 
+ endmodule

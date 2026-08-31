@@ -1,6 +1,10 @@
 # ---- riscvsoc-bd configuration (script-scope; override any of these from the environment) -----------
 
 set PART          xczu49dr-ffvf1760-2-e
+set BOARD_PART    xilinx.com:zcu216:part0:2.0
+# MIG ui_clk (300 MHz input / CLKOUT0_DIVIDE 3). Must match PulseTableSoc.DdrClkFreqHz exactly, or
+# validate_bd_design fails on the FREQ_HZ annotation of every uplink bus.
+set DDR_FREQ      333250000
 set TOP_MODULE    PulseTableSoc
 set BD_NAME       riscq_bd
 set DSP_FREQ      500000000
@@ -12,12 +16,18 @@ set RUN_IMPL      0
 set RUN_BITSTREAM 0
 
 if {[info exists ::env(RISCQ_DEVICE)]}        { set PART          $::env(RISCQ_DEVICE) }
+if {[info exists ::env(RISCQ_BOARD_PART)]}    { set BOARD_PART    $::env(RISCQ_BOARD_PART) }
 if {[info exists ::env(RISCQ_TOP)]}           { set TOP_MODULE    $::env(RISCQ_TOP) }
 if {[info exists ::env(RISCQ_DSP_FREQ)]}      { set DSP_FREQ      $::env(RISCQ_DSP_FREQ) }
 if {[info exists ::env(RISCQ_HOST_FREQ)]}     { set HOST_FREQ     $::env(RISCQ_HOST_FREQ) }
 if {[info exists ::env(RISCQ_RUN_SYNTH)]}     { set RUN_SYNTH     $::env(RISCQ_RUN_SYNTH) }
 if {[info exists ::env(RISCQ_RUN_IMPL)]}      { set RUN_IMPL      $::env(RISCQ_RUN_IMPL) }
 if {[info exists ::env(RISCQ_RUN_BITSTREAM)]} { set RUN_BITSTREAM $::env(RISCQ_RUN_BITSTREAM) }
+
+# qubic3 readout->DDR uplink: adds the DDR4 MIG, an S2MM DMA and two SmartConnects, and requires the
+# RTL to have been generated from a config with `"ddr_readout": true`.
+set DDR_READOUT 0
+if {[info exists ::env(RISCQ_DDR_READOUT)]} { set DDR_READOUT $::env(RISCQ_DDR_READOUT) }
 
 # Bitstream implies implementation.
 if {$RUN_BITSTREAM} { set RUN_IMPL 1 }
@@ -30,8 +40,14 @@ set PROJ_NAME   riscvsoc-bd
 if {[info exists ::env(RISCQ_PROJ_NAME)]}     { set PROJ_NAME   $::env(RISCQ_PROJ_NAME) }
 set BUILD_DIR   [file normalize $SCRIPT_DIR/../../build/$PROJ_NAME]
 if {[info exists ::env(RISCQ_BUILD_DIR)]}     { set BUILD_DIR   $::env(RISCQ_BUILD_DIR) }
+# Windows portability: an env-supplied path arrives with BACKSLASHES, and `\` is an ESCAPE inside Tcl
+# glob patterns -- every `glob $SOURCE_PATH/*.bin` silently matches nothing (found by the memory-init
+# set gate refusing to package on computerG). `file normalize` canonicalises to forward slashes on all
+# platforms and is a no-op on Linux.
+set BUILD_DIR [file normalize $BUILD_DIR]
 set SOURCE_PATH $BUILD_DIR
 if {[info exists ::env(RISCQ_RTL_DIR)]}       { set SOURCE_PATH $::env(RISCQ_RTL_DIR) }
+set SOURCE_PATH [file normalize $SOURCE_PATH]   ;# same Windows-backslash trap as BUILD_DIR above
 set IP_REPO     $BUILD_DIR/ip
 # Vivado project name (the .xpr / .runs / .gen prefix) — sanitise the folder name to the underscore-safe
 # subset create_project accepts.

@@ -65,10 +65,10 @@ set_property -dict [list CONFIG.N {5000}] [get_bd_cells ddr_rst_stretch]
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 psr_ddr
 
 # ---- SmartConnects.
-# smc_ddr is a CORRECTNESS REQUIREMENT, not an optimisation: mmu2 emits arlen=255 (8 KiB) bursts that
-# cross 4 KiB boundaries (AXI A3.4.1), and the SmartConnect is what legalises them at the boundary --
-# exactly as QubiC documents at bd_ddr_streaming.tcl:122-123 ("Required, NOT a bare direct net").
-# See src/riscq/ddr/rtl/VENDORED.md "Known non-conformances" #1.
+# smc_ddr: the vendored QubiC mmu2 emitted arlen=255 (8 KiB) bursts that crossed 4 KiB boundaries
+# (AXI A3.4.1), and this SmartConnect legalised them (QubiC bd_ddr_streaming.tcl:122-123, "Required, NOT a
+# bare direct net"). Since the P3a SpinalHDL rewrite every uplink burst is page-bounded by construction
+# (src/riscq/ddr/CONTRACT.md F1), so smc_ddr is no longer needed for correctness; the BD keeps it unchanged.
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smc_ddr
 set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1} CONFIG.NUM_CLKS {1}] [get_bd_cells smc_ddr]
 # DMA M_AXI_S2MM (256-bit, ui_clk) -> PS HP0 (128-bit, ui_clk): width down-size.

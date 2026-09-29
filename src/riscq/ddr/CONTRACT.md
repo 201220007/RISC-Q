@@ -160,7 +160,7 @@ These may differ from the vendored implementation. Each one is recorded in the P
 Anything not listed here, or under the fixes, is a contract change. A contract change must be
 documented, and `ddr.py`, `ddr_regs.py` and G2 updated with it (plan r2 item 2).
 
-## 3. The four fixes (vendored non-conformances, `rtl/VENDORED.md` §"Known non-conformances")
+## 3. The four fixes (vendored non-conformances, `rtl/VENDORED.md` §"Known non-conformances" at dcf28ca)
 
 ### F1. 4 KiB crossing
 
@@ -232,8 +232,32 @@ documented, and `ddr.py`, `ddr_regs.py` and G2 updated with it (plan r2 item 2).
 - Test:
   - The cbuf_poller observation tests that pinned the old behaviour (`test_03`, `test_09`, `test_10`,
     and the post-reset one-shots in `setup()`) become positive tests of the new behaviour.
-  - G2 adds `rd_empty == 1 && able_to_read == 0` after every run.
-  - The complete uplink gets stopped-clock and unilateral-reset tests (plan r2 item 5).
+  - `sim/ReadoutDdrUplinkCdcSim.scala` checks `rd_empty == 1 && able_to_read == 0` (DIAG) and the exact
+    write-burst plan after every run. It also runs stopped-clock startup and unilateral-reset scenarios on the
+    complete uplink (plan r2 item 5). G2 itself is unchanged.
 
 `BUSY`/`DONE` keep their advertised semantics (I7). None of the fixes changes the register map, so
 `ddr.py` and `ddr_regs.py` need no change for them.
+
+## 4. Provenance
+
+The rewrite replaces these files, which were removed from the branch (they are in git history at dcf28ca):
+
+- `rtl/async_fifo_same.v`, `rtl/cbuf_ram_read_wider.v`, `rtl/circular_buffer3.v`,
+  `rtl/circular_buffer_axi_writer.v`, `rtl/mmu2.v`, `rtl/roll_poll_reader2.v`;
+- `rtl/patches/{cbuf_ram_read_wider,circular_buffer3,circular_buffer_axi_writer}.patch`, `rtl/VENDORED.md`;
+- `Vendored.scala` (the four BlackBoxes).
+
+Their source was QubiC gateware `git@gitlab.com:yguang1/gateware.git`, branch `ddr-cmd-v2` @ ae64a13
+(`top/src/mmu/`), with the qubic3 forks A, B, B2 and C to C4 recorded in the removed `VENDORED.md`. The
+SpinalHDL modules are ports of that code:
+
+| vendored | SpinalHDL |
+|---|---|
+| `roll_poll_reader2` | `RollPollReader` |
+| `circular_buffer3` + `cbuf_ram_read_wider` | `CircularBuffer` (a `Mem` with a lane-masked 64-bit write and a 256-bit read) |
+| `circular_buffer_axi_writer` | `CbufAxiWriter` |
+| `mmu2` + `async_fifo_same` | `DrainEngine` (+ `StreamFifo`) |
+
+The G1' cocotb suites run on these modules generated under the vendored names by
+`sim/GenUplinkUnits.scala`.

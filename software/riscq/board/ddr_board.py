@@ -245,8 +245,8 @@ class DdrBoard:
     def dma_recv_wait(self, buf, nbytes, timeout=5.0):
         """Block until the S2MM channel completes, then return the bytes.
 
-        Completion is `IDLE && !HALTED` (r27-#5), never the uplink's `rd_done` (see VENDORED.md
-        non-conformance 2). Any failure resets the channel before raising, so the next drain starts from
+        Completion is `IDLE && !HALTED` (r27-#5), never the uplink's `rd_done`, which rises before the
+        stream's TLAST (src/riscq/ddr/CONTRACT.md I7/F2). Any failure resets the channel before raising, so the next drain starts from
         a known state.
         """
         import time

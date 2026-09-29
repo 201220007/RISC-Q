@@ -86,10 +86,11 @@ object ReadoutDdrRegs {
  * Readout → DDR uplink (qubic3 PLAN_READOUT_DDR v2..v7, Codex-approved r07).
  *
  * dsp side: per-core result FIFOs (+ overflow/accepted/rejected accounting, injector arbiter) →
- * vendored `roll_poll_reader2` → skid FIFO (throttle) → vendored `circular_buffer3` (write side).
- * ddr side: `circular_buffer3` read side → vendored `circular_buffer_axi_writer` → `ddr` AXI master;
- * vendored `mmu2` drains DDR → `rd` AXI-Stream; control/status registers on the `ctrl` AXI4 slave;
- * run protocol (base_reset → start handshake → dsp_admit; flush → quiet → snapshot → write_done).
+ * [[RollPollReader]] → skid FIFO (throttle) → [[CircularBuffer]] (write side).
+ * ddr side: [[CircularBuffer]] read side → [[CbufAxiWriter]] → `ddr` AXI master (AW/W/B);
+ * [[DrainEngine]] drains DDR (AR/R) → `rd` AXI-Stream; control/status registers on the `ctrl` AXI4
+ * slave; run protocol (base_reset → start handshake → dsp_admit; flush → quiet → snapshot → write_done).
+ * All pure SpinalHDL (P3a); the external contract is `CONTRACT.md` in this directory.
  *
  * Must be instantiated with `ddrCd` as the current clock domain; `dspCd` is the converter/result domain.
  * Both domains use the SYMMETRIC uplink reset (own reset | synced peer reset), plan v6 §2.
@@ -124,7 +125,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
   val xStart = PulseCross(ddrU, dspU, withDstDone = true)
   val xFlush = PulseCross(ddrU, dspU, withDstDone = true)
   val xInj   = PulseCross(ddrU, dspU, withDstDone = true)
-  val xWfin  = PulseCross(dspU, ddrU, withDstDone = false)
+  // (P3a: no dsp→ddr flush pulse. The flush reaches the writer in band, as the cbuf's FINAL bank.)
 
   // injector payload: ddrU registers, static from inj_fire until the ack (valid multi-bit CDC)
   val injReal = ddrU(Reg(SInt(p.accWidth bits)) init 0)
@@ -132,7 +133,6 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
   val injCore = ddrU(Reg(UInt(8 bits)) init 0)
   // deliberate quasi-static crossings (handshake-held): tell the elaboration-time CDC checker
   Seq(injReal, injImag, injCore).foreach(_.addTag(crossClockDomain))
-  xWfin.io.dstDone := True
 
   // ───────────────────────────── dsp side ─────────────────────────────
   val dsp = new ClockingArea(dspU) {
@@ -209,43 +209,30 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     val anyPush     = fifos.map(_.fifo.io.push.fire).orR
     val anyFifoData = fifos.map(_.fifo.io.pop.valid).orR
 
-    // vendored round-robin poller (data_buffer contract: valid holds until rd_en, pops on rd_en)
-    val poller = RollPollReader2BB(p.numCh, p.wordWidth)
-    poller.io.clk   := dspU.readClockWire
-    poller.io.rst_n := !dspU.isResetActive
-    poller.io.write_almost_finished := False
-    poller.io.N_shot_finished       := False       // the poller's own flush is unused (plan v3 §B.3)
+    // round-robin poller (data_buffer contract: valid holds until rd_en, pops on rd_en)
+    val poller = RollPollReader(p.numCh, p.wordWidth)
     val throttle  = Bool()
-    val dataValid = Bits(p.numCh bits)
-    val dataIn    = Bits(p.numCh * p.wordWidth bits)
     for (i <- 0 until p.numCh) {
-      dataValid(i) := fifos(i).fifo.io.pop.valid && !throttle
-      dataIn(i * p.wordWidth, p.wordWidth bits) := fifos(i).word
-      fifos(i).fifo.io.pop.ready := poller.io.rd_en(i)
+      poller.io.dataValid(i) := fifos(i).fifo.io.pop.valid && !throttle
+      poller.io.dataIn(i)    := fifos(i).word
+      fifos(i).fifo.io.pop.ready := poller.io.rdEn(i)
     }
-    poller.io.data_valid := dataValid
-    poller.io.data_in    := dataIn
 
     // skid FIFO → cbuf write side (only when wr_ready)
     val skid = StreamFifo(Bits(p.wordWidth bits), p.skidDepth)
-    skid.io.push.valid   := poller.io.wr_en
-    skid.io.push.payload := poller.io.wr_data
+    skid.io.push.valid   := poller.io.wrEn
+    skid.io.push.payload := poller.io.wrData
     when(skid.io.push.valid && !skid.io.push.ready)(skidOvf := True)   // must never happen (throttle)
     throttle := skid.io.occupancy >= p.throttleLevel
 
-    val cbuf = CircularBuffer3BB(p.wordWidth, p.axiDataWidth, p.cbufAddrWidth)
-    cbuf.io.wr_clk   := dspU.readClockWire
-    cbuf.io.wr_rst_n := !dspU.isResetActive
-    // Mirror of the blackbox's Fork-A backpressure flag as a real signal of THIS component: Verilator
-    // inlines the blackbox, so a simPublic() on `cbuf.io.wr_ready` has no hierarchical path to bind to.
-    val cbufWrReady = CombInit(cbuf.io.wr_ready)
-    cbuf.io.wr_en    := skid.io.pop.valid && cbuf.io.wr_ready
-    cbuf.io.wr_data  := skid.io.pop.payload
-    skid.io.pop.ready := cbuf.io.wr_ready
+    val cbuf = CircularBuffer(p.wordWidth, p.axiDataWidth, p.cbufAddrWidth, wrCd = dspU, rdCd = ddrU)
+    // the Fork-A backpressure flag, kept under its G2 name (ReadoutDdrUplinkDut makes it simPublic)
+    val cbufWrReady = CombInit(cbuf.io.wrReady)
+    cbuf.io.wrEn    := skid.io.pop.valid && cbuf.io.wrReady
+    cbuf.io.wrData  := skid.io.pop.payload
+    skid.io.pop.ready := cbuf.io.wrReady
     val writeFinishedExt = False
-    cbuf.io.write_finished_ext := writeFinishedExt
-
-    xWfin.io.start := False
+    cbuf.io.writeFinishedExt := writeFinishedExt
     // run start: clear accounting, open admission, then ack
     when(xStart.io.fire) {
       // r11-#1: rejPend must be cleared too. At saturation `fire` stays low and credits accumulate, so a
@@ -258,7 +245,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     xStart.io.dstDone := startDone
 
     // flush: wait quiet × flushQuiet, then snapshot + commit (closes admission)
-    val quiet    = !anyPush && !anyFifoData && (skid.io.occupancy === 0) && !poller.io.wr_en && !injPending
+    val quiet    = !anyPush && !anyFifoData && (skid.io.occupancy === 0) && !poller.io.wrEn && !injPending
     val flushing = Reg(Bool()) init False
     val quietCnt = Reg(UInt(log2Up(p.flushQuiet + 1) bits)) init 0
     val flushDone = False
@@ -270,8 +257,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
         for (i <- 0 until p.numCh) accSnap(i) := acc(i)
         ovfSnap := ovf.asBits
         snapToggle := !snapToggle
-        writeFinishedExt := True
-        xWfin.io.start := True
+        writeFinishedExt := True     // closes the current cbuf bank as the run's FINAL bank
         flushing := False
         flushDone := True
       }
@@ -285,64 +271,54 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
 
   // ───────────────────────────── ddr side ─────────────────────────────
   val ddr = new ClockingArea(ddrU) {
-    // ---- vendored writer + cbuf read side ----
-    val writer = CbufAxiWriterBB(p.axiDataWidth, p.cbufAddrWidth, p.axiAddrWidth)
-    writer.io.clk   := ddrU.readClockWire
-    writer.io.rst_n := !ddrU.isResetActive
+    // ---- writer + cbuf read side ----
+    val writer = CbufAxiWriter(p.axiDataWidth, p.cbufAddrWidth, p.axiAddrWidth)
     val cb = dsp.cbuf.io
-    cb.rd_clk   := ddrU.readClockWire
-    cb.rd_rst_n := !ddrU.isResetActive
-    writer.io.able_to_read  := cb.able_to_read_out
-    writer.io.rd_empty      := cb.rd_empty
-    writer.io.rd_addr_valid := cb.rd_addr_valid_out
-    writer.io.rd_data       := cb.rd_data
-    cb.rd_en         := writer.io.rd_en
-    cb.rd_addr       := writer.io.rd_addr
-    cb.read_finished := writer.io.read_finished
-    writer.io.write_finished_ext := xWfin.io.fire
+    writer.io.ableToRead  := cb.ableToRead
+    writer.io.rdEmpty     := cb.rdEmpty
+    writer.io.rdFinal     := cb.rdFinal
+    writer.io.rdAddrValid := cb.rdAddrValid
+    writer.io.rdData      := cb.rdData
+    cb.rdAddr       := writer.io.rdAddr
+    cb.readFinished := writer.io.readFinished
 
-    // ---- vendored drain engine ----
-    val mmu = Mmu2BB(p.axiAddrWidth, p.axiDataWidth, p.axiIdWidth)
-    mmu.io.clk   := ddrU.readClockWire
-    mmu.io.rst_n := !ddrU.isResetActive
+    // ---- drain engine ----
+    val mmu = DrainEngine(p.axiAddrWidth, p.axiDataWidth, p.axiIdWidth, maxBytes = MAX_RD_SIZE)
 
-    // ---- AXI master: writer owns AW/W/B, mmu2 owns AR/R ----
+    // ---- AXI master: writer owns AW/W/B, the drain engine owns AR/R ----
     val a = io.ddr
-    a.aw.valid := writer.io.m_axi_awvalid
-    a.aw.addr  := writer.io.m_axi_awaddr.asUInt
-    a.aw.len   := writer.io.m_axi_awlen.asUInt
-    a.aw.size  := writer.io.m_axi_awsize.asUInt
-    a.aw.burst := writer.io.m_axi_awburst
+    a.aw.valid := writer.io.aw.valid
+    a.aw.addr  := writer.io.aw.addr
+    a.aw.len   := writer.io.aw.len
+    a.aw.size  := writer.io.aw.size
+    a.aw.burst := writer.io.aw.burst
     a.aw.id    := 0
     a.aw.region := 0; a.aw.lock := 0; a.aw.cache := 0; a.aw.qos := 0; a.aw.prot := 0
-    writer.io.m_axi_awready := a.aw.ready
-    a.w.valid  := writer.io.m_axi_wvalid
-    a.w.data   := writer.io.m_axi_wdata
-    a.w.strb   := writer.io.m_axi_wstrb
-    a.w.last   := writer.io.m_axi_wlast
-    writer.io.m_axi_wready := a.w.ready
-    writer.io.m_axi_bvalid := a.b.valid
-    writer.io.m_axi_bresp  := a.b.resp
-    a.b.ready  := writer.io.m_axi_bready
-    a.ar.valid := mmu.io.arvalid
-    a.ar.addr  := mmu.io.araddr.asUInt
-    a.ar.len   := mmu.io.arlen.asUInt
-    a.ar.size  := mmu.io.arsize.asUInt
-    a.ar.burst := mmu.io.arburst
-    a.ar.id    := mmu.io.arid.asUInt
+    writer.io.aw.ready := a.aw.ready
+    a.w.valid  := writer.io.w.valid
+    a.w.data   := writer.io.w.data
+    a.w.strb   := writer.io.w.strb
+    a.w.last   := writer.io.w.last
+    writer.io.w.ready := a.w.ready
+    writer.io.b.valid   := a.b.valid
+    writer.io.b.payload := a.b.resp
+    a.b.ready  := writer.io.b.ready
+    a.ar.valid := mmu.io.ar.valid
+    a.ar.addr  := mmu.io.ar.addr
+    a.ar.len   := mmu.io.ar.len
+    a.ar.size  := mmu.io.ar.size
+    a.ar.burst := mmu.io.ar.burst
+    a.ar.id    := mmu.io.ar.id
     a.ar.region := 0; a.ar.lock := 0; a.ar.cache := 0; a.ar.qos := 0; a.ar.prot := 0
-    mmu.io.arready := a.ar.ready
-    mmu.io.rvalid  := a.r.valid
-    mmu.io.rdata   := a.r.data
-    mmu.io.rresp   := a.r.resp
-    mmu.io.rlast   := a.r.last
-    mmu.io.rid     := a.r.id.asBits
-    a.r.ready  := mmu.io.rready
+    mmu.io.ar.ready := a.ar.ready
+    mmu.io.r.valid        := a.r.valid
+    mmu.io.r.payload.data := a.r.data
+    mmu.io.r.payload.resp := a.r.resp
+    mmu.io.r.payload.last := a.r.last
+    mmu.io.r.payload.id   := a.r.id
+    a.r.ready  := mmu.io.r.ready
     // AXIS out
-    io.rd.valid    := mmu.io.m_axis_tvalid
-    io.rd.fragment := mmu.io.m_axis_tdata
-    io.rd.last     := mmu.io.m_axis_tlast
-    mmu.io.m_axis_tready := io.rd.ready
+    io.rd << mmu.io.axis
 
     // ---- registers / run protocol ----
     val wrBase   = Reg(UInt(p.axiAddrWidth bits)) init 0
@@ -357,35 +333,26 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     // base_reset pulse and the start crossing are issued — no extra register between them.
     val writerBaseReset = startPend
     val rdBusy   = mmu.io.busy
-    // r10-#3: `mmu2.busy` falls when the last AXI-R beat enters its FIFO, while `size_bytes` is still
+    // r10-#3: the engine's `busy` falls when the last AXI-R beat enters its FIFO, while `size_bytes` is still
     // live in the AXIS valid/TLAST logic. The drain is only really over at TLAST, so the window during
     // which rd_base/rd_size are frozen extends to it.
     val drainInFlight = Reg(Bool()) init False
     when(io.rd.valid && io.rd.ready && io.rd.last)(drainInFlight := False)
-    val rdLocked = rdBusy || drainInFlight
+    // P3a F2: the engine itself also refuses a start until TLAST (`idle`); both locks agree.
+    val rdLocked = rdBusy || drainInFlight || !mmu.io.idle
     val dspAdmitSync = BufferCC(dsp.admit, init = False, bufferDepth = 2)
     val ovfAnySync   = BufferCC(dsp.ovf.asBits.orR, init = False, bufferDepth = 2)
     val earlyLateSync = BufferCC(dsp.earlyLate, init = False, bufferDepth = 2)
     val skidOvfSync  = BufferCC(dsp.skidOvf, init = False, bufferDepth = 2)
-    val rdEmptySync  = BufferCC(cb.rd_empty, init = True, bufferDepth = 2)
-    val ableSync     = BufferCC(cb.able_to_read_out, init = False, bufferDepth = 2)
-    // The writer starts a burst iff (able_to_read && !rd_empty); "no pending bank" is therefore the
-    // correct quiescence test. `rd_empty` ALONE is not: circular_buffer3 can leave the read side on an
-    // already-consumed bank whose `buffer_empty` was never re-asserted (evidence/G1 writer finding 2,
-    // evidence/G2 §2), which made every second run refuse to start.
-    val cbufNoPendingBank = !(ableSync && !rdEmptySync)
-    // NOTE: `rd_empty` is deliberately NOT part of the quiescence predicate. In circular_buffer3 the
-    // read side can be left pointing at an ALREADY-CONSUMED bank whose `buffer_empty` was never
-    // re-asserted (the bank-presentation state is timing-dependent — see evidence/G1 writer finding 2),
-    // so `rd_empty=0` after a completed run is a benign stale indication, not pending data. Quiescence
-    // is established by: the run is over (`write_done` => the writer's final BVALID landed), the writer
-    // is idle, no drain is running, and no crossing is in flight. `rdEmptySync` is kept in DIAG only.
+    // P3a F4: the cbuf presents a bank only when it is full or FINAL, and `rdEmpty` reads 1 whenever
+    // the writer owns no bank. `rdEmpty` alone is therefore the "no pending bank" predicate (the vendored
+    // buffer could leave a consumed bank looking non-empty, which forced `!(able && !rdEmpty)`). Both
+    // signals are already in this domain.
+    val cbufNoPendingBank = cb.rdEmpty
     // r11-#2: `drainInFlight` (up to AXIS TLAST) must gate a new run too -- otherwise a BASE_RESET could
-    // re-base the writer while the previous drain is still streaming out of mmu2.
-    val runIdle  = !runActive && !flushBusy && !rdBusy && !drainInFlight && writer.io.writer_idle && cbufNoPendingBank &&
+    // re-base the writer while the previous drain is still streaming out.
+    val runIdle  = !runActive && !flushBusy && !rdLocked && writer.io.writerIdle && cbufNoPendingBank &&
                    !startPend && !xStart.io.busy && !xFlush.io.busy && !xInj.io.busy
-    // (xWfin.busy is a DSP-domain signal and must not be read here; its delivery is implied by
-    //  write_done, which the writer only produces after it consumed write_finished_ext.)
 
     // snapshot capture (toggle handshake; bundle is static after the dsp commit)
     val snapTogSync = BufferCC(dsp.snapToggle, init = False, bufferDepth = 2)
@@ -408,17 +375,17 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     })
 
     // writer controls
-    writer.io.base_addr  := runBase.asBits
-    writer.io.base_reset := writerBaseReset
-    val wrapped = writer.io.addr_fault
-    val writeDonePulse = writer.io.current_user_done
+    writer.io.baseAddr  := runBase
+    writer.io.baseReset := writerBaseReset
+    val wrapped = writer.io.addrFault
+    val writeDonePulse = writer.io.currentUserDone
 
-    // mmu2 controls
+    // drain engine controls
     val rdStartReq = False
     val rdSizeOk = (rdSize >= 32) && (rdSize(4 downto 0) === 0) && (rdSize <= MAX_RD_SIZE) && (rdBase(4 downto 0) === 0)
-    mmu.io.start      := rdStartReq
-    mmu.io.base_addr  := rdBase.asBits
-    mmu.io.size_bytes := rdSize.resize(p.axiAddrWidth + 1).asBits
+    mmu.io.start     := rdStartReq
+    mmu.io.baseAddr  := rdBase
+    mmu.io.sizeBytes := rdSize.resize(p.axiAddrWidth + 1)
 
     // flush watchdog
     val wdog = Reg(UInt(p.flushTimeoutLog2 + 1 bits)) init 0
@@ -442,10 +409,12 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     def rise(x: Bool): Bool = x && !RegNext(x, False)
     when(rise(earlyLateSync))(set(S_EARLY_LATE))
     when(rise(skidOvfSync))(set(S_SKID_OVF))
+    // F2/F3 defence in depth: the register guard below already refuses these starts, so this only fires
+    // if the two ever disagree -- reported on the same bit as the guard.
+    when(mmu.io.startRejected)(set(S_ERR_BADSIZE))
     // xStart/xFlush/xInj have their SOURCE in this (ddr) domain, so `ackDropped` is readable here.
-    // xWfin runs dsp->ddr, so its source-side `ackDropped` is a DSP signal — use the DESTINATION-side
-    // `dropped` level, which is generated in this domain.
-    when(xStart.io.ackDropped || xFlush.io.ackDropped || xInj.io.ackDropped || xWfin.io.dropped)(set(S_CROSS_DROPPED))
+    // (P3a: the dsp->ddr xWfin crossing is gone -- the flush travels in band as the cbuf's FINAL bank.)
+    when(xStart.io.ackDropped || xFlush.io.ackDropped || xInj.io.ackDropped)(set(S_CROSS_DROPPED))
 
     // flush bookkeeping (declared before the handshakes that reference them — Scala evaluates in order)
     val flushCommitted = Reg(Bool()) init False
@@ -495,16 +464,17 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     }
     bus.read(runBase, RUN_BASE)
     bus.read(wrBase, WR_BASE)
-    // r09-#5: mmu2 consumes `base_addr`/`size_bytes` LIVE (they drive `done`, valid and TLAST), so a
-    // mid-drain write would move TLAST and reframe the stream. Writes are refused while `rd_busy`.
+    // r09-#5: writes are refused from RD_START until TLAST (contract I7). The vendored mmu2 consumed
+    // `base_addr`/`size_bytes` live; the DrainEngine latches them at start, and the lock is kept as the
+    // advertised register behaviour.
     val rdBaseW = bus.createAndDriveFlow(Bits(32 bits), RD_BASE)
     val rdSizeW = bus.createAndDriveFlow(Bits(32 bits), RD_SIZE)
     when(rdBaseW.valid) { when(!rdLocked)(rdBase := rdBaseW.payload.asUInt.resized) otherwise (set(S_ERR_BADSIZE)) }
     when(rdSizeW.valid) { when(!rdLocked)(rdSize := rdSizeW.payload.asUInt) otherwise (set(S_ERR_BADSIZE)) }
     bus.read(rdBase, RD_BASE)
     bus.read(rdSize, RD_SIZE)
-    bus.read(writer.io.final_addr, FINAL_ADDR)
-    bus.read(writer.io.cur_axi_addr_out, CUR_ADDR)
+    bus.read(writer.io.finalAddr, FINAL_ADDR)
+    bus.read(writer.io.curAxiAddr, CUR_ADDR)
     bus.onWrite(BASE_RESET) {
       when(runIdle) {
         runBase := wrBase; startPend := True; snapArrived := False; wdog := 0
@@ -554,9 +524,9 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     // diagnostics: why is a base_reset being refused? (also useful during board bring-up)
     val diag = Bits(32 bits)
     diag := 0
-    diag(0) := writer.io.writer_idle
-    diag(1) := rdEmptySync
-    diag(2) := BufferCC(cb.able_to_read_out, init = False, bufferDepth = 2)
+    diag(0) := writer.io.writerIdle
+    diag(1) := cb.rdEmpty
+    diag(2) := cb.ableToRead
     diag(3) := xStart.io.busy
     diag(4) := startPend
     diag(5) := xFlush.io.busy

@@ -69,8 +69,8 @@ def parse_words(words):
 class DdrReadout:
     """`drv` must provide `read32`/`write32` (the `riscq.board.PynqDriver` surface) and, for
     `drain()`, `dma_recv_prepare(nbytes)` / `dma_recv_wait(buf, nbytes)`. Drain completion MUST be the
-    DMA's own (TLAST), never the uplink's `rd_done` - see `src/riscq/ddr/rtl/VENDORED.md`
-    non-conformance 2."""
+    DMA's own (TLAST), never the uplink's `rd_done`, which is set when the last AXI R beat reaches the
+    drain engine, before TLAST - see `src/riscq/ddr/CONTRACT.md` I7 and F2."""
 
     def __init__(self, drv, m=None, soc_map=None, legacy_no_ddr_status=False):
         """`soc_map` is the SoC's own `riscq.map.SocMap`, used to find the host-domain DDR status

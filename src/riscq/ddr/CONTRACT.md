@@ -138,7 +138,10 @@ against `ddr_regs.py`. In particular:
 
 - `ddr`, the AXI4 master to the MIG: 32-bit address, 256-bit data, 4-bit id (always 0), INCR,
   `size = 5`, full `WSTRB`, `WLAST` on the last beat of each burst, AXI A3.2.1 valid/payload
-  stability.
+  stability. (r2) It holds in every case short of a reset of the DDR half itself, including a DSP reset
+  during a burst: WDATA is registered from the first stalled cycle, and the circular buffer keeps the bank
+  the writer owns until the writer returns it. `sim/AxiProtocolMonitor.scala` checks it on every channel and on
+  the AXIS drain in G2 and in the CDC sim.
   - At most one write burst is outstanding. Each burst's B is checked (`BRESP != 0` sets
     `bresp_err`).
   - Reads are issued one burst at a time. `RRESP != 0` on any accepted beat sets `rresp_err`, and the

@@ -15,6 +15,9 @@ import spinal.lib._
  *     burst per bank; an unaligned base splits the bank into two bursts, each waiting for its own B.
  *   - WLAST is stable while WVALID && !WREADY (Fork C); `rdAddr` runs one row ahead of an accepted beat
  *     against the 1-cycle RAM read.
+ *   - r2: WDATA is registered from the first cycle of a W stall (WVALID && !WREADY) until the handshake, so the
+ *     payload cannot follow the RAM output while stalled, whatever happens to the buffer behind it (resets included).
+ *     WSTRB is constant and WLAST changes only on a handshake.
  *   - The last bank of a run is the one the buffer presents with `rdFinal` (fix F4): its B (or its empty
  *     presentation) sets `finalAddr`, pulses `currentUserDone` and re-bases the pointer.
  *   - `baseReset` is honoured only in IDLE and has priority over a burst start in that cycle (Fork C3).
@@ -117,7 +120,11 @@ case class CbufAxiWriter(rdWidth: Int, addrWidth: Int, axiAddrWidth: Int,
   io.aw.payload.size  := axiSize
   io.aw.payload.burst := B"01"
   io.w.valid          := wValid
-  io.w.payload.data   := io.rdData
+  val wStall    = io.w.valid && !io.w.ready
+  val wStallD   = RegNext(wStall) init False
+  val wDataHold = Reg(Bits(rdWidth bits))
+  when(wStall && !wStallD)(wDataHold := io.rdData)
+  io.w.payload.data   := wStallD ? wDataHold | io.rdData
   io.w.payload.strb   := B((BigInt(1) << (rdWidth / 8)) - 1, rdWidth / 8 bits)
   io.w.payload.last   := wValid && segLeft === 1
   io.b.ready          := True

@@ -317,6 +317,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     writer.io.rdData      := cb.rdData
     cb.rdAddr       := writer.io.rdAddr
     cb.readFinished := writer.io.readFinished
+    cb.rdFreeze     := quiesce          // r2: no presentation taken during the reset hold
 
     // ---- drain engine ----
     val mmu = DrainEngine(p.axiAddrWidth, p.axiDataWidth, p.axiIdWidth, maxBytes = MAX_RD_SIZE)

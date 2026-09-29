@@ -22,6 +22,8 @@ import scala.util.Random
  *     burst's W beats are still flowing, while a read burst's R beats are stalled behind a full FIFO, and while a B is
  *     delayed beyond the hold bound. The DDR half's reset must be applied only at AXI quiescence (or, on timeout,
  *     with the sticky axi_rst_fault), and a retry started immediately afterwards must be exact.
+ *   - r2 `reset_dsp_in_w_backpressure`: a lone dsp reset in the middle of a write burst while WREADY is held low for
+ *     60 cycles. Every scenario also runs the generic valid/ready monitor (AxiProtocolMonitor) on AW/W/B/AR/R and AXIS.
  *   - `reset_dsp_mid_run`, `reset_ddr_mid_run`: a lone reset of either domain while the writer waits for the B of
  *     the first bank, with a partial bank and results pending; `reset_dsp_second_bank`: the same during the SECOND
  *     bank's B wait (the other parity of the cbuf's hand-over toggles) with a flush pending on the dsp side.
@@ -60,6 +62,8 @@ object ReadoutDdrUplinkCdcSim extends App {
     for (i <- 0 until NCH) { dut.io.results(i).valid #= false; dut.io.results(i).payload.res #= false
       dut.io.results(i).payload.real #= 0; dut.io.results(i).payload.imag #= 0 }
     dut.io.rd.ready #= true
+    dut.io.wStall #= false
+    var mons: Seq[ValidReadyMonitor] = Nil
     val axi = mutable.ArrayBuffer[AxiEvent]()
     var mem: AxiMemorySim = null
     var ctrl: Axi4Master = null
@@ -75,6 +79,7 @@ object ReadoutDdrUplinkCdcSim extends App {
       mem = AxiMemorySim(dut.io.ddr, ddrCd, AxiMemorySimConfig(maxOutstandingReads = 2, maxOutstandingWrites = 2,
         readResponseDelay = memDelay, writeResponseDelay = memDelay))
       mem.start()
+      mons = AxiProtocolMonitor(dut.up.io.ddr, dut.io.rd, ddrCd, () => dut.up.ddrURst.toBoolean)   // r2
       ctrl = Axi4Master(dut.io.ctrl, ddrCd, "ctrl")
       fork {
         while (true) {
@@ -241,7 +246,8 @@ object ReadoutDdrUplinkCdcSim extends App {
         SimTimeout(40000000)
         val b = new Bench(dut, new Random(seed), memDelay)
         body(b)
-        println(s"[P3a-CDC] PASS $name")
+        AxiProtocolMonitor.check(b.mons, name)
+        println(s"[P3a-CDC] PASS $name (AXI protocol monitor clean; stall cycles ${AxiProtocolMonitor.summary(b.mons)})")
       }
   }
 
@@ -554,6 +560,42 @@ object ReadoutDdrUplinkCdcSim extends App {
     b.ddrCd.waitSampling(40)
     assert(!b.bit(b.status(), S_AXI_RST_FAULT), "the DDR reset must clear axi_rst_fault")
     fullRun(b, 0xC0000L, 70, 52)
+  }
+
+  // 12. r2 dsp reset in the middle of a write burst while the memory side holds WREADY low: the stalled beat's payload
+  //     must not move (the monitor), the bank the writer owns and its data are kept until the burst completes (the
+  //     DDR image), the DDR half resets only afterwards, and an immediate retry is exact
+  run("reset_dsp_in_w_backpressure", 12) { b =>
+    normalStart(b)
+    b.startRun(0xD0000L)
+    var stallAt = -1
+    val ctl = fork {
+      while (b.nAw == 0) b.ddrCd.waitSampling()
+      while (b.wSinceAw < 5) b.ddrCd.waitSampling()
+      stallAt = b.wSinceAw
+      b.dut.io.wStall #= true
+      b.dut.io.dspRst #= true
+      b.ddrCd.waitSampling(27); b.dut.io.dspRst #= false     // ~40 dsp cycles
+      b.ddrCd.waitSampling(33); b.dut.io.wStall #= false     // WREADY low for 60 ddr cycles in total
+    }
+    val exp = b.push(64, 60)
+    ctl.join()
+    var m = 0
+    while (b.applyEvents.isEmpty && m < 20000) { b.ddrCd.waitSampling(); m += 1 }
+    val wm = b.mons.find(_.name == "W").get
+    println(s"[P3a-CDC] reset_dsp_in_w_backpressure: W stalled after $stallAt of 16 beats, ${wm.stalls} W stall cycles; " +
+            s"applied at ${b.applyEvents}")
+    assert(wm.stalls >= 55, s"the W stall was not exercised (${wm.stalls} cycles)")
+    assert(b.applyEvents.size == 1 && b.applyEvents.head._2 == 0 && b.applyEvents.head._3 == 0 && !b.applyEvents.head._4,
+      s"DDR half reset with a write outstanding: ${b.applyEvents}")
+    assert(b.wSinceAw == 16 && b.nB == b.nAw, "the stalled burst did not complete")
+    // the burst carried bank 0's own data, in order, although the DSP side was reset under it
+    val perTag = b.ddrWords(0xD0000L, 64).groupBy(w => ((w >> 56) & 0xff).toInt)
+    for (i <- 0 until NCH)
+      assert(perTag.getOrElse(i, Nil) == exp(i).map { case (r, im) => tagWord(i, r, im) }, s"core $i: the cut burst's data")
+    AxiProtocolMonitor.check(b.mons, "before the retry")
+    b.ddrCd.waitSampling(40)
+    fullRun(b, 0xE0000L, 70, 61)
   }
 
   println("[P3a-CDC] all scenarios PASS")

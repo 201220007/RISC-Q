@@ -43,14 +43,18 @@ object ReadoutDdrUplinkSim extends App {
         for (i <- 0 until nch) { dut.io.results(i).valid #= false; dut.io.results(i).payload.res #= false
           dut.io.results(i).payload.real #= 0; dut.io.results(i).payload.imag #= 0 }
         dut.io.rd.ready #= true
+        dut.io.wStall #= false
         val mem = AxiMemorySim(dut.io.ddr, ddrCd, AxiMemorySimConfig(
           maxOutstandingReads = 2, maxOutstandingWrites = 2,
           readResponseDelay = memDelay, writeResponseDelay = memDelay))
         mem.start()
+        // P3a r2: generic AXI4/AXIS valid-ready protocol monitor on the uplink's DDR master and AXIS drain
+        val mons = AxiProtocolMonitor(dut.up.io.ddr, dut.io.rd, ddrCd, () => dut.up.ddrURst.toBoolean)
         val ctrl = Axi4Master(dut.io.ctrl, ddrCd, "ctrl")
         ddrCd.waitSampling(20); dspCd.waitSampling(20)
         body(dut, new Helper(dut, ddrCd, dspCd, ctrl, mem, new Random(seed), nch))
-        println(s"[G2] PASS $name")
+        AxiProtocolMonitor.check(mons, name)
+        println(s"[G2] PASS $name (AXI protocol monitor clean; stall cycles ${AxiProtocolMonitor.summary(mons)})")
       }
   }
 

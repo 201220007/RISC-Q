@@ -22,6 +22,9 @@ case class ReadoutDdrUplinkDut(p: ReadoutDdrUplinkParams) extends Component {
     val ddr     = master(Axi4(p.ddrAxiConfig))
     val rd      = master(Stream(Fragment(Bits(p.axiDataWidth bits))))
     val dspAdmit = out Bool()
+    // r2 (test only): hold the memory side's WREADY low towards the uplink, so a sim can stall W beats
+    // (AxiMemorySim cannot back-pressure W). Undriven it is 0 and the W channel passes straight through.
+    val wStall  = in Bool()
   }
   noIoPrefix()
   val dspCd = ClockDomain(io.dspClk, io.dspRst)
@@ -47,7 +50,15 @@ case class ReadoutDdrUplinkDut(p: ReadoutDdrUplinkParams) extends Component {
   for (i <- 0 until p.numCh) up.io.results(i) << io.results(i)
   up.io.calibDone := True          // the MIG is calibrated in every G2 scenario
   up.io.ctrl  << io.ctrl
-  io.ddr      << up.io.ddr
+  io.ddr.aw << up.io.ddr.aw
+  io.ddr.ar << up.io.ddr.ar
+  up.io.ddr.b << io.ddr.b
+  up.io.ddr.r << io.ddr.r
+  io.ddr.w.payload  := up.io.ddr.w.payload
+  io.ddr.w.valid    := up.io.ddr.w.valid && !io.wStall
+  up.io.ddr.w.ready := io.ddr.w.ready && !io.wStall
+  // r2: the AXI4 protocol monitor watches the uplink's OWN master interface (upstream of the test stall)
+  up.io.ddr.flatten.foreach(_.simPublic())
   io.rd       << up.io.rd
   io.dspAdmit := up.io.dspAdmit
 }

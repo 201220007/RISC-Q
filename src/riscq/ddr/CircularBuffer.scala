@@ -30,6 +30,11 @@ import spinal.lib._
  * The metadata of a presented bank is not touched by the write side until the credit is back, so the
  * capture is of quasi-static data. Toggles work at any clock ratio (the vendored 1-cycle pulse did not).
  *
+ * r2: a presentation is taken only while the reader owns NO bank (one arriving while it owns one is deferred until
+ * `readFinished`), and none at all while `rdFreeze` is high (the uplink's reset hold). The DSP-side reset clears
+ * `presTog` while the DDR side is still finishing a burst; without these gates that edge looked like a new
+ * presentation and switched `rd_bank_sel` (hence `rdData`) under the writer's open burst.
+ *
  * Reset/power-up: every register resets to 0 (credit is encoded as `readerHolds`, 0 = credit present),
  * so an FPGA power-up (INIT = 0) is the reset state even if one clock is still dead.
  */
@@ -58,6 +63,7 @@ case class CircularBuffer(wrWidth: Int, rdWidth: Int, addrWidth: Int,
     val rdAddrValid      = out UInt(addrWidth bits)
     val rdEmpty          = out Bool()
     val rdFinal          = out Bool()
+    val rdFreeze         = in  Bool() default(False)   // rdCd: take no new presentation (reset hold)
   }
 
   // 2 banks x rdDepth rows of rdWidth bits, written one wrWidth lane at a time (lane-masked write:
@@ -142,7 +148,7 @@ case class CircularBuffer(wrWidth: Int, rdWidth: Int, addrWidth: Int,
     val rd_final     = Reg(Bool()) init False
     val retTog       = Reg(Bool()) init False
 
-    when(presSync =/= presPrev) {
+    when(presSync =/= presPrev && !own && !io.rdFreeze) {
       // a new presentation: the presented bank is the one the write side just left
       presPrev    := presSync
       own         := True

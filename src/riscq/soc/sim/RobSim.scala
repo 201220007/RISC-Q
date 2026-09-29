@@ -85,7 +85,7 @@ object RobSim extends App {
     hostCd.waitSampling(10)
 
     // ── read rob row 0 back over AXI (lane k at byte offset k*4) and check == the per-lane ADC sum ──
-    val robBase = BigInt(dut.map.readoutBufBase)
+    val robBase = BigInt(dut.map.robBase)
     val got     = (0 until adcN).map(k => leToBig(axi.read(robBase + k * 4, 4)))
     for (k <- 0 until adcN)
       assert(got(k) == BigInt(expected(k)), s"[rob] lane $k: got ${got(k)} != expected ${expected(k)}")

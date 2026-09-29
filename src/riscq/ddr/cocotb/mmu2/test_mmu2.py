@@ -1,4 +1,13 @@
-"""G1 unit tests for the vendored mmu2.v (+ async_fifo_same.v): AXI4 read master (256-bit) -> AXI-Stream (256-bit, TLAST).
+"""G1' unit tests for the drain engine (`mmu2`): AXI4 read master (256-bit) -> AXI-Stream (256-bit, TLAST).
+
+P3a: the DUT is the SpinalHDL `riscq.ddr.DrainEngine`, generated under the vendored module/port names by
+`riscq.ddr.sim.GenUplinkUnits` (+ outputs `start_rejected`, `idle`, `dbg_fifo_used`; maxBytes = 32 MiB). The
+bench and the scoreboard are the vendored-RTL suite's. What changed is the oracle for the three fixed
+non-conformances (see src/riscq/ddr/CONTRACT.md):
+  F1  bursts are page-bounded: min(remaining, 256, beats to the next 4 KiB boundary) -> ref_bursts();
+  F2  base/size are latched at start and a start is accepted only after the previous chunk's TLAST;
+  F3  size 0 / not a multiple of 32 / > maxBytes, or an unaligned base, is rejected (no busy, no AR).
+The two former expect_fail cases are positive tests of F1 and F2.
 
 Bench:
   * AXI read side  -> Mmu2AxiSlave (cocotbext-axi AxiRamRead fork: records every AR burst, counts 4 KiB crossings
@@ -6,7 +15,7 @@ Bench:
                       with random ARREADY / RVALID stalls (cocotbext pause generators).
   * AXIS side      -> cocotbext-axi AxiStreamSink with random TREADY back-pressure, plus a falling-edge beat monitor
                       (per-beat TLAST, AXIS/AR stability while stalled, done/busy protocol).
-  * Reference model in Python: expected bursts (min(256, remaining) beats, contiguous, no 4 KiB split) and expected
+  * Reference model in Python: expected bursts (page-bounded, see ref_bursts) and expected
     stream bytes = preloaded memory[base : base + (size//32)*32].
 All random stimulus comes from Python `random` seeded through ddrtb.seed (SEED env var, default 20260823); every
 test re-seeds, so each test is reproducible on its own.
@@ -33,11 +42,11 @@ FIFO_AFULL = FIFO_DEPTH - 4   # async_fifo_same almost_full = used >= DEPTH-4
 # Reference model
 # ----------------------------------------------------------------------------------------------------------------
 def ref_bursts(base, size):
-    """mmu2 burst plan: min(256, remaining) beats per AR, contiguous INCR, no 4 KiB splitting."""
+    """Burst plan (F1): min(256, remaining, beats to the next 4 KiB boundary) per AR, contiguous INCR."""
     words = size // BEAT
     addr, out = base, []
     while words > 0:
-        n = min(MAX_BURST_BEATS, words)
+        n = min(MAX_BURST_BEATS, words, (0x1000 - (addr & 0xFFF)) // BEAT)
         out.append((addr, n - 1))
         addr += n * BEAT
         words -= n
@@ -306,6 +315,7 @@ class Bench:
         plan = [(a[0], a[1]) for a in ar]
         assert plan == ref_bursts(base, size), f"burst plan {plan[:4]}... != ref {ref_bursts(base, size)[:4]}..."
         assert all(a[1] <= 255 for a in ar)
+        assert not any(crosses_4k(a[0], a[1] + 1) for a in ar), "F1: an AR crosses a 4 KiB boundary"
         assert all(a[2] == 5 and a[3] == 1 and a[4] == 0 for a in ar), "arsize/arburst/arid wrong"
         assert sum(a[1] + 1 for a in ar) == words
         slave_plan = [(b[0], b[1]) for b in self.slave.bursts[tx['na0']:tx['na0'] + len(ar)]]
@@ -445,90 +455,106 @@ async def test_no_stalls_throughput(dut):
 # ================================================================================================================
 @cocotb.test()
 async def test_burst_split_over_256_beats(dut):
-    """257 / 512 / 2048 / 300 beats: arlen <= 255, contiguous plan, sum == beats, data exact; crossings counted."""
+    """257 / 512 / 2048 / 300 beats: arlen <= 127 (a 4 KiB page is 128 beats), page-bounded contiguous plan, sum ==
+    beats, data exact, no crossing recorded by the slave."""
     b = await make_bench(dut, 'light')
     for size in (8192 + 32, 16384, 65536, 300 * BEAT):
         n0 = len(b.slave.crossings)
         tx = await b.read(b.rand_base(size), size)
         b.check_chunk(tx)
-        assert max(a[1] for a in tx['ar']) <= 255
-        assert len(tx['ar']) == -(-size // (MAX_BURST_BEATS * BEAT))
-        dut._log.info(f"size={size}: {len(tx['ar'])} bursts, {len(b.slave.crossings) - n0} crossed a 4 KiB boundary")
+        assert max(a[1] for a in tx['ar']) <= 127
+        assert len(tx['ar']) == len(ref_bursts(tx['base'], size))
+        assert len(b.slave.crossings) == n0, "F1: the slave saw a 4 KiB crossing"
+        dut._log.info(f"size={size}: {len(tx['ar'])} bursts, none crossed a 4 KiB boundary")
 
 
 @cocotb.test()
 async def test_burst_crossing_4k_small(dut):
-    """Single short burst straddling a 4 KiB boundary (base = n*4 KiB - 128, 8 beats): data exact, one AR."""
+    """A short read straddling a 4 KiB boundary (base = n*4 KiB - 128, 8 beats): F1 splits it at the page into
+    two ARs of 4 beats, neither crossing; data exact. (Vendored: one AR that crossed the boundary.)"""
     b = await make_bench(dut, 'light')
     for _ in range(3):
         base = (random.randrange(1, MEM_SIZE // 0x1000) * 0x1000) - 4 * BEAT
         size = 8 * BEAT
         tx = await b.read(base, size)
         b.check_chunk(tx)
-        assert len(tx['ar']) == 1
-        assert (base, 7) in b.slave.crossings, "expected this burst to be recorded as a 4 KiB crossing"
-    dut._log.info(f"4 KiB crossings recorded: {[(hex(a), n) for a, n in b.slave.crossings]}")
+        assert [(a[0], a[1]) for a in tx['ar']] == [(base, 3), (base + 4 * BEAT, 3)]
+        assert not b.slave.crossings, f"4 KiB crossings recorded: {b.slave.crossings}"
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def test_axi_no_4k_crossing_strict(dut):
-    """STRICT AXI rule (A3.4.1): a burst must not cross a 4 KiB boundary. mmu2 issues 256-beat x 32 B = 8 KiB bursts
-    and never splits at 4 KiB, so this test FAILS by construction -> documented RTL finding (expect_fail)."""
+    """STRICT AXI rule (A3.4.1): a burst must not cross a 4 KiB boundary. Positive test of F1 (the vendored mmu2 issued
+    one 8 KiB burst here and this case was expect_fail): 8 KiB aligned -> exactly two 128-beat bursts; plus 20 random
+    unaligned bases/sizes, none of whose bursts may cross."""
     b = await make_bench(dut, 'none')
     tx = await b.read(0x10000, 8192)
     b.check_chunk(tx)
+    assert [(a[0], a[1]) for a in tx['ar']] == [(0x10000, 127), (0x11000, 127)]
+    for _ in range(20):
+        size = random.randint(1, 1024) * BEAT
+        tx = await b.read(b.rand_base(size), size)
+        b.check_chunk(tx)
     assert not b.slave.crossings, f"AXI 4 KiB boundary crossed by bursts {b.slave.crossings}"
 
 
 # ================================================================================================================
-# (3) size handling: aligned sizes OK; size=0 / size=16 hang; size=48 truncates
+# (3) size handling (F3): invalid requests are rejected explicitly; the engine stays usable without a reset
 # ================================================================================================================
-async def _size_hang(dut, size, watch=3000):
-    b = await make_bench(dut, 'none', salt=size + 1)
-    base = b.rand_base(4096)
+async def _size_rejected(dut, size, base=None, watch=300, b=None):
+    if b is None:
+        b = await make_bench(dut, 'none', salt=size + 1)
+    if base is None:
+        base = b.rand_base(4096)
+    rej = {"n": 0}
+    nd0, na0, nb0 = len(b.rec.done_cycles), len(b.rec.ar), len(b.rec.beats)
+
+    async def count_rej():
+        while True:
+            await FallingEdge(dut.clk)
+            rej["n"] += int(dut.start_rejected.value)
+    t = cocotb.start_soon(count_rej())
     c0 = await b.pulse_start(base, size)
     await b.wait_cycles(watch)
+    t.cancel()
     r = b.rec
-    rises = r.busy_rises(c0, r.cycle)
-    assert len(rises) == 1, "busy did not rise exactly once on start"
-    assert all(v == 1 for v in r.busy[rises[0]:]), "busy dropped (expected permanent hang)"
-    assert not r.done_cycles, "done fired for an invalid size"
-    assert not r.ar, "an AR burst was issued for an invalid size"
-    assert not r.beats, "AXIS beats for an invalid size"
-    assert int(dut.m_axis_tvalid.value) == 0 and int(dut.arvalid.value) == 0
+    assert rej["n"] == 1, f"start_rejected pulsed {rej['n']} times (expected exactly once)"
+    assert not r.busy_rises(c0, r.cycle) and not any(r.busy[c0:]), "busy rose for an invalid request"
+    assert len(r.done_cycles) == nd0, "done fired for an invalid request"
+    assert len(r.ar) == na0, "an AR burst was issued for an invalid request"
+    assert len(r.beats) == nb0, "AXIS beats for an invalid request"
+    assert int(dut.idle.value) == 1 and int(dut.m_axis_tvalid.value) == 0 and int(dut.arvalid.value) == 0
     assert not r.errors
-    dut._log.info(f"size={size}: busy stuck at 1 for {watch} cycles, no AR, no beats, no done (hang confirmed)")
-    # a start while hung is ignored (busy) ...
-    await b.pulse_start(base, 4096)
-    await b.wait_cycles(50)
-    assert not r.ar and not r.done_cycles, "start accepted while hung?"
-    # ... only reset recovers
-    await reset_dut(b)
-    assert int(dut.busy.value) == 0
-    tx = await b.read(base, 4096)
+    dut._log.info(f"size={size} base=0x{base:x}: rejected (1 start_rejected pulse), no busy/AR/beats/done")
+    # the engine is immediately usable again -- no reset needed (the vendored mmu2 hung until rst_n)
+    tx = await b.read(b.rand_base(4096), 4096)
     b.check_chunk(tx)
+    return b
 
 
 @cocotb.test()
 async def test_size0_hangs_busy(dut):
-    """size_bytes=0: total_words=0 -> busy=1 forever, no AR/data/done. Recovery only via rst_n. (RTL finding)"""
-    await _size_hang(dut, 0)
+    """F3: size_bytes=0 is rejected (vendored: busy=1 forever, recovery only via rst_n)."""
+    await _size_rejected(dut, 0)
 
 
 @cocotb.test()
 async def test_size16_hangs_busy(dut):
-    """size_bytes=16 (<32): size[..:5]=0 -> identical hang to size 0. (RTL finding)"""
-    await _size_hang(dut, 16)
+    """F3: size_bytes=16 (< 32) is rejected (vendored: the same hang as size 0)."""
+    await _size_rejected(dut, 16)
 
 
 @cocotb.test()
 async def test_size48_truncates_to_one_beat(dut):
-    """size_bytes=48 (not a multiple of 32): low 5 bits dropped -> exactly 1 beat (32 B) + TLAST + done. (RTL finding)"""
-    b = await make_bench(dut, 'light')
-    base = b.rand_base(4096)
-    tx = await b.read(base, 48)
-    b.check_chunk(tx, expect_bytes=ref_stream(b.mem, base, 32))
-    assert len(tx['beats']) == 1 and [(a[0], a[1]) for a in tx['ar']] == [(base, 0)]
+    """F3: size_bytes=48 (not a multiple of 32) is rejected (vendored: silently truncated to one 32-B beat)."""
+    await _size_rejected(dut, 48)
+
+
+@cocotb.test()
+async def test_size_over_max_and_unaligned_base_rejected(dut):
+    """F3: size > maxBytes (32 MiB + 32) and a base that is not 32-B aligned are rejected too."""
+    b = await _size_rejected(dut, 0x200_0000 + BEAT)
+    await _size_rejected(dut, 4 * BEAT, base=0x1010, b=b)
 
 
 @cocotb.test()
@@ -562,98 +588,111 @@ async def test_chunk_sequence_4(dut):
     assert_idle_after(b, 50)
 
 
+class RejCounter:
+    """Counts `start_rejected` pulses (sampled at falling edges)."""
+    def __init__(self, dut):
+        self.n = 0
+        self.cycles = []
+        self.task = cocotb.start_soon(self._run(dut))
+
+    async def _run(self, dut):
+        c = 0
+        while True:
+            await FallingEdge(dut.clk)
+            c += 1
+            if int(dut.start_rejected.value):
+                self.n += 1
+                self.cycles.append(c)
+
+
 @cocotb.test()
 async def test_chunk_sequence_start_right_after_done(dut):
-    """8 chunks, next start driven in the very cycle after `done` (not waiting for TLAST), TREADY always 1,
-    random AR/R stalls, SAME size every chunk (size_bytes is sampled live, see the *_not_latched test) and a new
-    base each time. With no AXIS back-pressure the FIFO holds exactly 1 beat at done, so this is still exact."""
+    """F2: 8 chunks with a different base AND size each, TREADY always 1, random AR/R stalls. A start driven in the
+    cycle after `done` -- while the chunk's last beat is still in the FIFO -- is REJECTED (start_rejected, no second
+    busy, no AR); the next chunk is then started right after the TLAST handshake and is exact. (Vendored: the early
+    start was accepted and only happened to be exact because the FIFO held one beat and the size was unchanged.)"""
     b = await make_bench(dut, 'none')
     b.slave.ar_channel.set_pause_generator(pause_gen(0.3, 4))
     b.slave.r_channel.set_pause_generator(pause_gen(0.3, 4))
-    size = 6 * BEAT
+    rej = RejCounter(dut)
     txs = []
     for k in range(8):
+        size = random.randint(2, 12) * BEAT
         base = b.rand_base(size)
         nb0, na0 = len(b.rec.beats), len(b.rec.ar)
         c0 = await b.pulse_start(base, size, immediate=(k > 0))
         await b.wait_done(2000)
+        n_rej = rej.n
+        # the last beat entered the FIFO at the edge that raised done and leaves at the next one, so this start,
+        # sampled at that next edge, arrives before the TLAST handshake has completed: it must be refused
+        await b.pulse_start(b.rand_base(size), BEAT, immediate=True)
+        await FallingEdge(dut.clk)
+        assert rej.n == n_rej + 1, "a start between done and TLAST was not rejected"
+        for _ in range(100):                             # idle again right after the TLAST handshake
+            if int(dut.idle.value):
+                break
+            await FallingEdge(dut.clk)
+        assert int(dut.idle.value) == 1
         txs.append(dict(base=base, size=size, c0=c0, nb0=nb0, na0=na0))
     await b.wait_cycles(100)
-    assert len(b.rec.done_cycles) == 8
+    assert len(b.rec.done_cycles) == 8 and rej.n == 8
     for i, tx in enumerate(txs):
         tx['done'] = b.rec.done_cycles[i]
         words = tx['size'] // BEAT
         tx['beats'] = b.rec.beats[tx['nb0']:tx['nb0'] + words]
         tx['ar'] = b.rec.ar[tx['na0']:txs[i + 1]['na0'] if i + 1 < len(txs) else len(b.rec.ar)]
         b.check_chunk(tx)
-    assert len(b.rec.beats) == 8 * (size // BEAT)
-    assert max(t['start'] - t0['done'] for t0, t in zip(txs, txs[1:])) <= 2, "starts were not back-to-back"
+    assert len(b.rec.beats) == sum(t['size'] for t in txs) // BEAT
 
 
 async def _start_before_drain(dut):
     """Shared stimulus: chunk 1 (8 beats) fully parked in the FIFO with TREADY low; chunk 2 (6 beats) started the
-    cycle after chunk 1's done; TREADY released only then."""
+    cycle after chunk 1's done; TREADY released only then. F2: that start is rejected."""
     b = await make_bench(dut, 'none')
+    rej = RejCounter(dut)
     b.hold_axis(True)                                   # TREADY = 0: nothing drains
     base1, size1 = b.rand_base(4096), 8 * BEAT          # 8 beats < FIFO almost-full (12): done can fire
     base2, size2 = b.rand_base(4096), 6 * BEAT
     await b.pulse_start(base1, size1)
     await b.wait_done(500)
     assert not b.rec.beats, "no beat may have been delivered with TREADY low"
-    assert int(dut.u_fifo.used.value) == 8
+    assert int(dut.dbg_fifo_used.value) == 8
+    na0 = len(b.rec.ar)
     await b.pulse_start(base2, size2, immediate=True)   # start sampled at the very next posedge after done
     b.hold_axis(False)
-    await b.wait_done(500)
     await b.wait_cycles(100)
-    return b, base1, size1, base2, size2
+    return b, rej, na0, base1, size1, base2, size2
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def test_chunk_start_at_done_before_drain_strict(dut):
-    """STRICT: start chunk 2 right after chunk 1's `done` while chunk 1's beats are still in the FIFO. mmu2 resets
-    beats_sent and samples the new size_bytes live, so chunk 1's TLAST moves and its leftover beats are emitted as
-    chunk 2 -> FAILS by construction (documented RTL finding; the wrapper must wait for TLAST, not done)."""
-    b, base1, size1, base2, size2 = await _start_before_drain(dut)
+    """STRICT (positive test of F2; was expect_fail on the vendored mmu2): start chunk 2 right after chunk 1's `done`
+    while chunk 1's beats are still in the FIFO. Chunk 1 must come out whole: exactly 8 beats, byte-exact, TLAST
+    on beat 7 and nowhere else."""
+    b, rej, na0, base1, size1, base2, size2 = await _start_before_drain(dut)
     beats = b.rec.beats
     lasts = [i for i, x in enumerate(beats) if x[1]]
-    assert len(beats) >= 8 and beats_bytes(beats[:8]) == ref_stream(b.mem, base1, size1) and lasts[:1] == [7], \
-        f"chunk 1 corrupted: {len(beats)} beats out, TLAST at {lasts} (expected beat 7)"
+    assert len(beats) == 8 and beats_bytes(beats) == ref_stream(b.mem, base1, size1) and lasts == [7], \
+        f"chunk 1 corrupted: {len(beats)} beats out, TLAST at {lasts} (expected 8 beats, TLAST at beat 7)"
 
 
 @cocotb.test()
 async def test_chunk_start_at_done_before_drain_mechanism(dut):
-    """Characterises the leak of the strict test above (same stimulus). Observed: only 6 beats come out (chunk-1
-    data, TLAST on the 6th because the live size is now 6), then tvalid is gated (beats_sent == total_words) and
-    8 beats (chunk-1 tail 2 + all 6 of chunk 2) stay stuck in the FIFO with busy=0. They come out at the head of
-    the next transaction, i.e. every later chunk is shifted by 8 beats until reset."""
-    b, base1, size1, base2, size2 = await _start_before_drain(dut)
-    beats = b.rec.beats
-    exp1 = ref_stream(b.mem, base1, size1)
-    exp2 = ref_stream(b.mem, base2, size2)
-    assert len(beats) == 6, f"expected 6 beats out, got {len(beats)}"
-    assert beats_bytes(beats) == exp1[:6 * BEAT], "leak pattern differs from the documented mechanism"
-    assert [i for i, x in enumerate(beats) if x[1]] == [5], "TLAST expected exactly once, on beat index 5"
-    assert int(dut.m_axis_tvalid.value) == 0 and int(dut.busy.value) == 0
-    assert int(dut.u_fifo.used.value) == 8, "8 beats expected to be stuck in the FIFO"
-    assert len(b.rec.done_cycles) == 2
-    # the stuck beats come out at the head of the NEXT transaction (4 beats requested -> chunk1[6:8] + chunk2[0:2])
-    base3, size3 = b.rand_base(4096), 4 * BEAT
-    nb0 = len(beats)
-    await b.pulse_start(base3, size3)
-    await b.wait_done(500)
-    await b.wait_cycles(50)
-    assert len(b.rec.done_cycles) == 3
-    got3 = beats_bytes(b.rec.beats[nb0:])
-    assert got3 == exp1[6 * BEAT:] + exp2[:2 * BEAT], "stuck beats not at the head of chunk 3"
-    assert [i for i, x in enumerate(b.rec.beats[nb0:]) if x[1]] == [3]
-    assert int(dut.u_fifo.used.value) == 8, "shift persists: still 8 beats stuck"
+    """F2 mechanism (same stimulus): the early start pulses start_rejected exactly once, raises no busy and issues no
+    AR; the FIFO drains to empty and the engine returns to idle; chunk 2 re-issued after the TLAST and a third chunk
+    are exact, with no reset. (Vendored: 6 beats out with a misplaced TLAST, 8 beats stuck in the FIFO and every
+    later chunk shifted by 8 beats until reset.)"""
+    b, rej, na0, base1, size1, base2, size2 = await _start_before_drain(dut)
+    assert rej.n == 1, f"start_rejected pulsed {rej.n} times"
+    assert len(b.rec.ar) == na0, "the rejected start issued an AR"
+    assert len(b.rec.done_cycles) == 1, "the rejected start produced a done"
+    assert int(dut.busy.value) == 0 and int(dut.idle.value) == 1 and int(dut.dbg_fifo_used.value) == 0
+    assert int(dut.m_axis_tvalid.value) == 0
+    b.sink.recv_nowait()                               # chunk 1's frame (checked by the strict test)
+    for base, size in ((base2, size2), (b.rand_base(4096), 4 * BEAT)):
+        tx = await b.read(base, size)
+        b.check_chunk(tx)
     assert not b.rec.errors
-    # reset clears it
-    await reset_dut(b)
-    assert int(dut.u_fifo.used.value) == 0
-    b.sink.clear()
-    tx = await b.read(b.rand_base(4096), 4096)
-    b.check_chunk(tx)
 
 
 @cocotb.test()
@@ -667,7 +706,7 @@ async def test_done_precedes_stream_drain(dut):
     c0 = await b.pulse_start(base, size)
     await b.wait_done(500)
     assert not b.rec.beats and int(dut.busy.value) == 0 and int(dut.m_axis_tvalid.value) == 1
-    assert int(dut.u_fifo.used.value) == 8
+    assert int(dut.dbg_fifo_used.value) == 8
     await b.wait_cycles(20)
     b.hold_axis(False)
     await b.wait_tlast(200)
@@ -698,7 +737,7 @@ async def test_rresp_slverr_ignored(dut):
     tx = await b.read(base, size)
     b.check_chunk(tx, expect_bytes=exp)
     assert len(b.slave.err_beats) == 256 and b.rec.rerr == 256
-    assert len(tx['ar']) == 3
+    assert len(tx['ar']) == len(ref_bursts(base, size))
     # and a clean read afterwards is unaffected
     b.slave.err_ranges = []
     tx = await b.read(b.rand_base(4096), 4096)
@@ -724,9 +763,10 @@ async def test_rresp_slverr_single_beat(dut):
 # ================================================================================================================
 @cocotb.test()
 async def test_start_while_busy_ignored(dut):
-    """Extra start pulses (different base, same size) while busy are ignored: one transaction, one done, AR plan
-    and data of the FIRST start only; a start after completion works normally."""
+    """Extra start pulses (different base, same size) while busy are ignored (and, F2, reported on start_rejected):
+    one transaction, one done, AR plan and data of the FIRST start only; a start after completion works normally."""
     b = await make_bench(dut, 'heavy')
+    rej = RejCounter(dut)
     base, size = b.rand_base(4096), 4096
     nb0, na0 = len(b.rec.beats), len(b.rec.ar)
     c0 = await b.pulse_start(base, size)
@@ -741,7 +781,7 @@ async def test_start_while_busy_ignored(dut):
     t = [x[2] for x in b.rec.beats if x[1]][0]
     tx = dict(base=base, size=size, c0=c0, done=d, tlast=t, beats=b.rec.beats[nb0:], ar=b.rec.ar[na0:], na0=na0)
     b.check_chunk(tx)
-    assert len(b.rec.done_cycles) == 1
+    assert len(b.rec.done_cycles) == 1 and rej.n == 3
     assert_idle_after(b, 100)
     tx = await b.read(b.rand_base(8192), 8192)
     b.check_chunk(tx)
@@ -749,10 +789,9 @@ async def test_start_while_busy_ignored(dut):
 
 @cocotb.test()
 async def test_size_bytes_not_latched(dut):
-    """size_bytes is sampled live (only base_addr is latched at start): growing it mid-transfer (4096 -> 8192 after
-    ~20 beats) leaves the AR plan at 128 beats (beats_remaining was loaded at start) but the done/TLAST comparators
-    now wait for 256 -> 128 beats stream out with NO TLAST, busy stays 1 forever. (RTL finding: wrapper must hold
-    rd_size stable from start until TLAST.) Reset recovers."""
+    """F2: base_addr AND size_bytes are latched at start. Growing size_bytes mid-transfer (4096 -> 8192 after ~20
+    beats) and moving base_addr change nothing: 128 beats, TLAST on the 128th, one done, busy falls. (Vendored:
+    size_bytes was sampled live -> 128 beats with NO TLAST and busy stuck at 1 until reset.)"""
     b = await make_bench(dut, 'none')
     base = b.rand_base(8192)
     nb0 = len(b.rec.beats)
@@ -760,15 +799,17 @@ async def test_size_bytes_not_latched(dut):
     while b.rec.rbeats < 20:
         await FallingEdge(dut.clk)
     dut.size_bytes.value = 8192
+    dut.base_addr.value = b.rand_base(8192)
     await b.wait_cycles(1500)
     r = b.rec
     assert [(a[0], a[1]) for a in r.ar] == ref_bursts(base, 4096), "AR plan should follow the size at start"
     assert len(r.beats[nb0:]) == 128, f"expected 128 beats streamed, got {len(r.beats[nb0:])}"
-    assert not any(x[1] for x in r.beats), "no TLAST expected (comparator now targets 256 beats)"
+    assert [i for i, x in enumerate(r.beats[nb0:]) if x[1]] == [127], "TLAST must sit on beat 127 only"
     rises = r.busy_rises(c0, r.cycle)
-    assert not r.done_cycles and len(rises) == 1 and all(v == 1 for v in r.busy[rises[0]:]), "expected busy hang"
+    assert len(r.done_cycles) == 1 and len(rises) == 1 and r.busy[-1] == 0, "expected one done and busy low"
     assert beats_bytes(r.beats[nb0:]) == ref_stream(b.mem, base, 4096)
-    await reset_dut(b)
+    assert int(dut.idle.value) == 1
+    b.sink.recv_nowait()
     tx = await b.read(b.rand_base(4096), 4096)
     b.check_chunk(tx)
 
@@ -783,7 +824,7 @@ async def test_reset_mid_transfer_recovers(dut):
     while b.rec.rbeats < 700:
         await FallingEdge(dut.clk)
     await reset_dut(b)
-    assert int(dut.busy.value) == 0 and int(dut.m_axis_tvalid.value) == 0 and int(dut.u_fifo.used.value) == 0
+    assert int(dut.busy.value) == 0 and int(dut.m_axis_tvalid.value) == 0 and int(dut.dbg_fifo_used.value) == 0
     c0 = b.rec.cycle
     await b.wait_cycles(50)
     assert not [x for x in b.rec.beats if x[2] >= c0] and not [a for a in b.rec.ar if a[5] >= c0]

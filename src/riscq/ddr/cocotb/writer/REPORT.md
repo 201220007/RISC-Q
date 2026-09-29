@@ -1,3 +1,8 @@
+> **P3a note (2026-09-29).** This report describes the suite as run on the vendored Verilog, which has
+> since been replaced by the SpinalHDL `CbufAxiWriter`/`CircularBuffer` (see `../../CONTRACT.md`). The suite
+> now runs on the generated RTL (`riscq.ddr.sim.GenUplinkUnits`, 15 tests: sub-cases 4b/4c(ii) ported, F1/F4
+> tests added). The current results are in the qubic3 evidence directory, P3a.
+
 # G1 suite `writer` — `circular_buffer_axi_writer.v` (forks C, C2, C3, C4)
 
 Date 2026-08-23 · cocotb 2.0.1 + Verilator 5.040 + cocotbext-axi 0.1.28 (conda env `qubic_clean`) ·

@@ -1,5 +1,8 @@
 `timescale 1ns/1ps
-// cbuf_poller_tb — G1(b) unit-test wrapper: roll_poll_reader2 -> skid FIFO -> circular_buffer3 (+cbuf_ram_read_wider).
+// cbuf_poller_tb — G1'(b) unit-test wrapper: roll_poll_reader2 -> skid FIFO -> circular_buffer3.
+// P3a: both are the SpinalHDL RollPollReader / CircularBuffer generated under the vendored names
+// (riscq.ddr.sim.GenUplinkUnits, NUM_CH=14, 64 -> 256 bit, ADDR_WIDTH=4); the debug taps come from the
+// generated module's dbg_* ports instead of hierarchical references into the vendored internals.
 //
 // Models the SpinalHDL glue of PLAN_READOUT_DDR (v2 §2.2 / v3 §B.2) in RTL so that the gating under test is the
 // gating the SoC will use:
@@ -73,7 +76,10 @@ module cbuf_poller_tb #(
     output wire                         dbg_empty0,
     output wire                         dbg_empty1,
     output wire                         dbg_ram_we_d,       // RAM write strobe (registered stage inside cbuf_ram_read_wider)
-    output wire                         dbg_rd_bank_sel     // rd_clk domain: bank the reader is looking at
+    output wire                         dbg_rd_bank_sel,    // rd_clk domain: bank the reader is looking at
+    output wire                         rd_final_out,       // P3a F4: the presented bank is the FINAL one
+    output wire                         dbg_final0,
+    output wire                         dbg_final1
 );
 
     // ------------------------------------------------------------------
@@ -82,7 +88,7 @@ module cbuf_poller_tb #(
     assign throttle          = (skid_count >= THROTTLE_AT);
     assign poller_data_valid = ch_valid & {NUM_CH{~throttle}};
 
-    roll_poll_reader2 #(.NUM_CH(NUM_CH), .DATA_WIDTH(DATA_WIDTH)) u_poller (
+    roll_poll_reader2 u_poller (
         .clk                     (wr_clk),
         .rst_n                   (wr_rst_n),
         .data_valid              (poller_data_valid),
@@ -129,11 +135,7 @@ module cbuf_poller_tb #(
     assign cbuf_wr_en   = tb_ovr_sel ? tb_ovr_wr_en   : skid_pop;
     assign cbuf_wr_data = tb_ovr_sel ? tb_ovr_wr_data : skid_mem[skid_rp];
 
-    circular_buffer3 #(
-        .WR_DATA_WIDTH (DATA_WIDTH),
-        .RD_DATA_WIDTH (RD_DATA_WIDTH),
-        .ADDR_WIDTH    (ADDR_WIDTH)
-    ) u_cbuf (
+    circular_buffer3 u_cbuf (
         .wr_clk                    (wr_clk),
         .wr_rst_n                  (wr_rst_n),
         .rd_clk                    (rd_clk),
@@ -151,21 +153,24 @@ module cbuf_poller_tb #(
         .able_to_read_out          (able_to_read_out),
         .rd_addr_valid_out         (rd_addr_valid_out),
         .rd_empty                  (rd_empty),
-        .wr_ready                  (wr_ready)
+        .wr_ready                  (wr_ready),
+        .rd_final_out              (rd_final_out),
+        // ------------------------------------------------------------------
+        // Debug taps (write-side metadata; dbg_bank_sel_rd: the vendored bank_sel_rd always equalled
+        // bank_sel_wr -- the reader's bank is its complement -- so it maps onto bank_sel_wr)
+        // ------------------------------------------------------------------
+        .dbg_wr_addr               (dbg_wr_addr),
+        .dbg_bank_sel_wr           (dbg_bank_sel_wr),
+        .dbg_credit                (dbg_credit),
+        .dbg_lva0                  (dbg_lva0),
+        .dbg_lva1                  (dbg_lva1),
+        .dbg_empty0                (dbg_empty0),
+        .dbg_empty1                (dbg_empty1),
+        .dbg_final0                (dbg_final0),
+        .dbg_final1                (dbg_final1),
+        .dbg_ram_we_d              (dbg_ram_we_d),
+        .dbg_rd_bank_sel           (dbg_rd_bank_sel)
     );
-
-    // ------------------------------------------------------------------
-    // Debug taps
-    // ------------------------------------------------------------------
-    assign dbg_wr_addr     = u_cbuf.wr_addr;
-    assign dbg_bank_sel_wr = u_cbuf.bank_sel_wr;
-    assign dbg_bank_sel_rd = u_cbuf.bank_sel_rd;
-    assign dbg_credit      = u_cbuf.read_finished_reg_wr;
-    assign dbg_lva0        = u_cbuf.last_valid_addr[0];
-    assign dbg_lva1        = u_cbuf.last_valid_addr[1];
-    assign dbg_empty0      = u_cbuf.buffer_empty[0];
-    assign dbg_empty1      = u_cbuf.buffer_empty[1];
-    assign dbg_ram_we_d    = u_cbuf.u_ram.weA_d;
-    assign dbg_rd_bank_sel = u_cbuf.rd_bank_sel;
+    assign dbg_bank_sel_rd = dbg_bank_sel_wr;
 
 endmodule

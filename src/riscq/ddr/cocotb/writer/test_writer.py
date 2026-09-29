@@ -1,4 +1,14 @@
-"""G1 'writer' suite -- circular_buffer_axi_writer (forks C, C2, C3, C4).
+"""G1' 'writer' suite -- circular_buffer_axi_writer (forks C, C2, C3, C4).
+
+P3a: the DUT is the SpinalHDL `riscq.ddr.CbufAxiWriter` (+ `CircularBuffer`), generated under the vendored names
+by riscq.ddr.sim.GenUplinkUnits. Scoreboard and protocol checker are the vendored-RTL suite's, extended for two
+fixes (src/riscq/ddr/CONTRACT.md):
+  F1  every AW is checked not to cross a 4 KiB boundary; a bank that straddles a page is written as two bursts
+      (continuation AWs are followed by the scoreboard), see test_f1_bank_split_at_4k;
+  F4  the run's last bank is the cbuf presentation flagged rd_final; the writer has no write_finished_ext input
+      any more (the harness still drives wr_write_finished_ext, which the wrapper ignores). The two C4 sub-cases
+      that used an early writer-side finish to mark a FULL bank as last are ported to multi-bank runs whose final
+      partial burst sits at the same boundary, and test_f4_writer_side_finish_has_no_effect pins the change.
 
 DUT           : circular_buffer_axi_writer (inside writer_tb_top.sv together with the REAL
                 circular_buffer3 + cbuf_ram_read_wider, so the read-side contract is the board RTL).
@@ -102,6 +112,7 @@ class Scoreboard:
         self.fault_rise_cycles = []
         self.n_presentations = 0  # read_finished pulses
         self.placement = []       # (bank, addr) the RAM used for every accepted word, in order
+        self.cont = None          # F1: remaining bursts of a bank that straddles a 4 KiB page
 
     def load_ram_image(self, image):
         """Seed the model with the BRAM contents present at test start (stale words from earlier tests in the
@@ -120,9 +131,25 @@ class Scoreboard:
         self.seq[bank][addr] = idx
 
     # -- read side
-    def on_aw(self, addr, awlen, rd_bank, t, t_issue):
+    def on_aw(self, addr, awlen, rd_bank, t, t_issue, bank_beats=None):
         nbeats = awlen + 1
-        nwords = nbeats * WORDS_PER_BEAT
+        if self.cont is not None:
+            # F1: continuation burst of a bank split at a 4 KiB boundary: the next beats of the same snapshot
+            c = self.cont
+            assert rd_bank == c["bank"] and nbeats <= c["left"], f"continuation burst {nbeats} beats vs {c}"
+            exp_beats = c["beats"][c["done"]:c["done"] + nbeats]
+            c["done"] += nbeats
+            c["left"] -= nbeats
+            if c["left"] == 0:
+                self.cont = None
+            b = Burst(addr, awlen, rd_bank, exp_beats, [], t, t_issue)
+            self.bursts.append(b)
+            self.run_bursts.append(b)
+            return b
+        if bank_beats is None:
+            bank_beats = nbeats
+        assert nbeats <= bank_beats
+        nwords = bank_beats * WORDS_PER_BEAT
         words = self.ram[rd_bank][:nwords]
         seqs = self.seq[rd_bank][:nwords]
         fresh_pos = [a for a in range(nwords) if seqs[a] > self.max_consumed_seq]
@@ -131,8 +158,8 @@ class Scoreboard:
         assert fresh_pos == list(range(len(fresh_pos))), \
             f"fresh words not contiguous from word 0 of bank {rd_bank}: {fresh_pos}"
         nf = len(fresh_pos)
-        assert nbeats == math.ceil(nf / WORDS_PER_BEAT), \
-            f"awlen+1={nbeats} but {nf} fresh words need {math.ceil(nf/WORDS_PER_BEAT)} beats"
+        assert bank_beats == math.ceil(nf / WORDS_PER_BEAT), \
+            f"bank of {bank_beats} beats but {nf} fresh words need {math.ceil(nf/WORDS_PER_BEAT)} beats"
         fresh = words[:nf]
         expect = self.stream[self.consumed:self.consumed + nf]
         assert fresh == expect, (f"word-order mismatch at stream index {self.consumed}: "
@@ -140,8 +167,10 @@ class Scoreboard:
                                  f"{[hex(w) for w in expect[:6]]}...")
         self.consumed += nf
         self.max_consumed_seq = max(seqs[:nf])
-        exp_beats = [beat_int(words[4 * k:4 * k + 4]) for k in range(nbeats)]
-        b = Burst(addr, awlen, rd_bank, exp_beats, fresh, t, t_issue)
+        exp_all = [beat_int(words[4 * k:4 * k + 4]) for k in range(bank_beats)]
+        if nbeats < bank_beats:
+            self.cont = dict(bank=rd_bank, beats=exp_all, done=nbeats, left=bank_beats - nbeats)
+        b = Burst(addr, awlen, rd_bank, exp_all[:nbeats], fresh, t, t_issue)
         self.bursts.append(b)
         self.run_bursts.append(b)
         return b
@@ -232,6 +261,7 @@ class WriterTB:
             cur=int(d.cur_axi_addr_out.value), final=int(d.final_addr.value),
             rd_bank=int(d.dbg_rd_bank.value), read_finished=int(d.read_finished.value),
             able=int(d.able_to_read.value), rd_empty=int(d.rd_empty.value),
+            rd_addr_valid=int(d.rd_addr_valid.value),
             base_reset=int(d.base_reset.value),
         )
 
@@ -274,8 +304,18 @@ class WriterTB:
             if s["awvalid"] and s["awready"]:
                 assert self.open_burst is None, f"t={t}: AW issued while a burst is still open"
                 assert s["awsize"] == 5 and s["awburst"] == 1, f"t={t}: awsize/awburst {s['awsize']}/{s['awburst']}"
-                assert s["awaddr"] == s["cur"], f"t={t}: AWADDR 0x{s['awaddr']:x} != cur_axi_addr 0x{s['cur']:x}"
-                self.open_burst = self.sb.on_aw(s["awaddr"], s["awlen"], s["rd_bank"], t, self.idle_fall_cycles[-1])
+                # F1: no burst crosses a 4 KiB page
+                assert (0x1000 - (s["awaddr"] & 0xFFF)) >= (s["awlen"] + 1) * BEAT_BYTES, \
+                    f"t={t}: AW 0x{s['awaddr']:x} len {s['awlen'] + 1} crosses a 4 KiB boundary"
+                if self.sb.cont is not None:
+                    # continuation of a split bank: starts where the previous burst ended, on a page boundary
+                    prev_b = self.sb.run_bursts[-1]
+                    assert s["awaddr"] == prev_b.end and (s["awaddr"] & 0xFFF) == 0, \
+                        f"t={t}: continuation AW 0x{s['awaddr']:x} (previous burst ended at 0x{prev_b.end:x})"
+                else:
+                    assert s["awaddr"] == s["cur"], f"t={t}: AWADDR 0x{s['awaddr']:x} != cur_axi_addr 0x{s['cur']:x}"
+                self.open_burst = self.sb.on_aw(s["awaddr"], s["awlen"], s["rd_bank"], t, self.idle_fall_cycles[-1],
+                                                bank_beats=s["rd_addr_valid"] + 1)
                 self.beats_seen = 0
                 self.log.debug(f"t={t}: AW addr=0x{s['awaddr']:08x} len={s['awlen']} bank={s['rd_bank']}")
             # ---- W handshake
@@ -619,8 +659,9 @@ async def test_c4a_wrap_branch_nonfinal_fault(dut):
 async def test_c4b_final_burst_overrun_fault(dut):
     """(4b) Fork C4: the FINAL burst ends past WRAP_LIMIT (the last-burst path bypasses the wrap branch) ->
     addr_fault=1 from the IDLE-time check at burst issue.  Sub-case 1: flushed partial bank (2 beats)
-    starting 32 B before the limit.  Sub-case 2: a full bank marked last (writer write_finished_ext
-    latched before the bank is presented) starting 32 B too high."""
+    starting 32 B before the limit.  Sub-case 2 (P3a port): a full bank followed by a 2-beat final bank that
+    starts 32 B before the limit. (Vendored sub-case 2 marked a FULL bank as last by latching the writer's own
+    write_finished_ext early; with F4 the last bank is the cbuf's rd_final presentation, which is never full.)"""
     tb, s = await setup(dut)
     rng = random.Random(s + 6)
     d = dut
@@ -637,36 +678,38 @@ async def test_c4b_final_burst_overrun_fault(dut):
     assert tb.sb.fault_rise_cycles == [b.t_issue], \
         f"fault rose at {tb.sb.fault_rise_cycles}, expected at burst issue t={b.t_issue}"
     assert b.end == WRAP_LIMIT + 1 + BEAT_BYTES
-    # sub-case 2: full bank as last burst, 0xF820..0xFA1F
-    base2 = WRAP_SIZE - BANK_BYTES + BEAT_BYTES
+    # sub-case 2: full non-final bank 0xF7E0..0xF9DF (no fault), then the final 2 beats 0xF9E0..0xFA1F
+    base2 = WRAP_SIZE - BANK_BYTES - BEAT_BYTES
     await tb.base_reset(base2)                          # also clears the sticky (4d)
     assert int(d.addr_fault.value) == 0
-    await tb.flush(quiet=0, cbuf_ext=False)             # writer-side finish latched early -> first bank is 'last'
-    words2 = words_gen(rng, WORDS_PER_BANK, tag=7)
-    await tb.write_words(words2)
+    n_rise = len(tb.sb.fault_rise_cycles)
+    await tb.write_words(words_gen(rng, WORDS_PER_BANK + 5, tag=7))
+    await tb.wait_bursts_done(1)
+    assert int(d.addr_fault.value) == 0, "the full bank ends inside the ring: no fault yet"
+    await tb.flush()
     await tb.wait_done()
-    tb.check_run(base2, expect_final=base2 + BANK_BYTES, expect_aw=[(base2, 15)], expect_fault=1)
-    b2 = tb.sb.run_bursts[0]
-    assert tb.sb.fault_rise_cycles[-1] == b2.t_issue
+    tb.check_run(base2, expect_final=WRAP_LIMIT + 1 + BEAT_BYTES,
+                 expect_aw=[(base2, 15), (base2 + BANK_BYTES, 1)], expect_fault=1)
+    b2 = tb.sb.run_bursts[1]
+    assert tb.sb.fault_rise_cycles[n_rise:] == [b2.t_issue]
     assert tb.sb.done_cycles[-1] == b2.t_b + 1          # done from the last-burst path, not the empty-bank path
 
 
 @cocotb.test()
 async def test_c4c_boundary_exact_no_fault(dut):
     """(4c) Fork C4 boundary: a final burst ending EXACTLY at WRAP_LIMIT -> addr_fault stays 0 and
-    final_addr == WRAP_LIMIT+1.  Sub-case 1: partial 2-beat bank at 0xF9C0; sub-case 2: full bank marked
-    last at 0xF800 (it must NOT take the wrap branch: last_burst re-bases instead)."""
+    final_addr == WRAP_LIMIT+1.  Sub-case 1: partial 2-beat bank at 0xF9C0; sub-case 2 (P3a port): a full bank
+    at 0xF7C0 followed by the final 2-beat bank ending exactly at the limit (it must NOT take the wrap branch:
+    last_burst re-bases instead). The vendored sub-case 2 marked a full bank at 0xF800 as last, which F4 makes
+    impossible; a full NON-final bank ending at the limit takes the wrap branch, see 4a."""
     tb, s = await setup(dut)
     rng = random.Random(s + 8)
     d = dut
     base = WRAP_SIZE - 2 * BEAT_BYTES
     await tb.run(base, words_gen(rng, 5, tag=8), expect_final=WRAP_LIMIT + 1, expect_aw=[(base, 1)], expect_fault=0)
-    base2 = WRAP_SIZE - BANK_BYTES
-    await tb.base_reset(base2)
-    await tb.flush(quiet=0, cbuf_ext=False)
-    await tb.write_words(words_gen(rng, WORDS_PER_BANK, tag=9))
-    await tb.wait_done()
-    tb.check_run(base2, expect_final=WRAP_LIMIT + 1, expect_aw=[(base2, 15)], expect_fault=0)
+    base2 = WRAP_SIZE - BANK_BYTES - 2 * BEAT_BYTES
+    await tb.run(base2, words_gen(rng, WORDS_PER_BANK + 5, tag=9), expect_final=WRAP_LIMIT + 1,
+                 expect_aw=[(base2, 15), (base2 + BANK_BYTES, 1)], expect_fault=0)
     assert tb.sb.fault_rise_cycles == []
     assert int(d.cur_axi_addr_out.value) == base2       # re-based by last_burst, not wrapped to 0
 
@@ -808,3 +851,44 @@ async def test_random_mixed_runs(dut):
         dut._log.info(f"run {r}: {len(tb.sb.run_bursts)} bursts, {nbeats} beats, final=0x{int(dut.final_addr.value):x}, "
                       f"presentations so far={tb.sb.n_presentations}")
     assert tb.n_w_stall > 0 and tb.n_aw_stall > 0 and tb.n_b_wait > 0
+
+
+# ================================================================ P3a fixes
+@cocotb.test()
+async def test_f1_bank_split_at_4k(dut):
+    """F1: a bank that straddles a 4 KiB page is written as two page-bounded bursts (each with its own WLAST and B);
+    the pointer, final_addr and the DDR image are those of one contiguous bank. Run 1: base 0x1F00 -> the first
+    bank splits 8+8 beats at 0x2000, the second (0x2100) and the final 2-beat bank do not. Run 2: a final partial
+    bank of 5 beats at 0x2FC0 splits 2+3 at 0x3000. (A 512-B aligned base, as the uplink enforces, never splits.)"""
+    tb, s = await setup(dut, p_aw=0.4, p_w=0.4, p_b=0.4)
+    rng = random.Random(s + 20)
+    base = 0x1F00
+    await tb.run(base, words_gen(rng, 2 * WORDS_PER_BANK + 5, tag=20), expect_final=base + 2 * BANK_BYTES + 2 * BEAT_BYTES,
+                 expect_aw=[(0x1F00, 7), (0x2000, 7), (0x2100, 15), (0x2300, 1)])
+    base = 0x2FC0
+    await tb.run(base, words_gen(rng, 20, tag=21), expect_final=base + 5 * BEAT_BYTES,
+                 expect_aw=[(0x2FC0, 1), (0x3000, 2)])
+    assert tb.sb.cont is None
+    assert len(tb.sb.done_cycles) == 2
+
+
+@cocotb.test()
+async def test_f4_writer_side_finish_has_no_effect(dut):
+    """F4: the writer takes the run's end from the cbuf's in-band rd_final only. A writer-side finish pulse alone
+    (the vendored write_finished_ext, still driven by the harness, ignored by the wrapper) marks nothing: the next
+    full bank is written as a NON-final bank (no done, pointer advances), and the run ends only when the cbuf
+    flush presents the (here empty) final bank. Vendored: that pulse made the next presented bank the last one."""
+    tb, s = await setup(dut)
+    rng = random.Random(s + 22)
+    d = dut
+    base = 0xA000
+    await tb.base_reset(base)
+    await tb.flush(quiet=0, cbuf_ext=False)            # writer-side finish only
+    await tb.write_words(words_gen(rng, WORDS_PER_BANK, tag=22))
+    await tb.wait_bursts_done(1)
+    await tb.wait_cycles(50)
+    assert tb.sb.run_done_count == 0, "a writer-side finish pulse ended the run"
+    assert int(d.cur_axi_addr_out.value) == base + BANK_BYTES and int(d.rd_empty.value) == 1
+    await tb.flush()                                   # the real (cbuf) flush: empty final bank
+    await tb.wait_done()
+    tb.check_run(base, expect_final=base + BANK_BYTES, expect_aw=[(base, 15)])

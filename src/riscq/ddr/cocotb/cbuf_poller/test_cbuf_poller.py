@@ -1,5 +1,14 @@
-"""G1(b) suite 'cbuf_poller': roll_poll_reader2 (NUM_CH=14, 64b) -> skid(8)/throttle(>=5) -> circular_buffer3 Fork A
-(+ cbuf_ram_read_wider Fork B), two clocks (wr_clk 2 ns / rd_clk 3 ns, co-prime).
+"""G1'(b) suite 'cbuf_poller': roll_poll_reader2 (NUM_CH=14, 64b) -> skid(8)/throttle(>=5) -> circular_buffer3 Fork A,
+two clocks (wr_clk 2 ns / rd_clk 3 ns, co-prime).
+
+P3a: both DUT modules are the SpinalHDL RollPollReader / CircularBuffer generated under the vendored names
+(riscq.ddr.sim.GenUplinkUnits). The scoreboard, the reference bank model and the monitors are the vendored-RTL
+suite's. What changed is fix F4 (src/riscq/ddr/CONTRACT.md): a bank is presented only when it is full or when a
+flush closes it (then it carries rd_final), so the vendored observations -- the post-reset empty one-shots, the
+empty "phantom" presentation after a full bank followed by a pause, and a late write cancelling a pending flush --
+are now positive tests of the opposite behaviour (setup(), test_03, test_09, test_10, test_08 allow_phantom=False).
+New: test_11 (rd_final in band + rd_empty after every run), test_12 (inverted clock ratio), test_13 (poller
+saturation: 1 word / 3 cycles, fairness, throttle-in-flight capacity).
 
 Wrapper: cbuf_poller_tb.sv (skid FIFO + throttle + glue gating live in the wrapper, see its header).
 Python side (this file):
@@ -186,6 +195,7 @@ class Reader:
         self.beat_gap = lambda: 0     # idle rd cycles between beats
         self.finish_count = 0
         self.beats = 0
+        self.finals = []              # rd_final_out of each presentation, in event order (P3a F4)
 
     async def finish(self):
         d = self.dut
@@ -202,9 +212,11 @@ class Reader:
             if not int(d.able_to_read_out.value):
                 continue
             phys = int(d.dbg_rd_bank_sel.value)
+            fin = int(d.rd_final_out.value)
             if int(d.rd_empty.value):
                 # real writer: empty bank -> immediate one-shot read_finished (never delayed)
                 self.events.append(("empty", phys))
+                self.finals.append(fin)
                 await self.finish()
                 continue
             if self.hold:
@@ -223,6 +235,7 @@ class Reader:
                     await FallingEdge(d.rd_clk)
             d.cbuf_rd_en.value = 0; d.rd_addr.value = 0
             self.events.append(("bank", n - 1, rows, phys))
+            self.finals.append(fin)
             await self.finish()
 
 
@@ -241,7 +254,7 @@ def describe(ev):
 RAM_MODEL = [[0] * WORDS_PER_BANK, [0] * WORDS_PER_BANK]
 
 
-def check_events(actual, words, closes, allow_phantom=False, initial=(("empty", 1),)):
+def check_events(actual, words, closes, allow_phantom=False, initial=()):
     """actual: Reader.events. words: ordered list of words accepted by the cbuf. closes: sorted word indices at which an
     explicit bank close happens (flush pulse, or an expected empty recovery switch). A bank also closes by itself
     after 64 words (seamless switch). allow_phantom: accept an OPTIONAL ('empty') event right after a full bank
@@ -405,7 +418,7 @@ class Env:
         return left
 
 
-async def setup(dut, wr_clk=True):
+async def setup(dut, wr_clk=True, wr_period=WR_PERIOD_NS, rd_period=RD_PERIOD_NS):
     seed(dut)
     env = Env(dut)
     d = dut
@@ -415,9 +428,9 @@ async def setup(dut, wr_clk=True):
     d.rd_addr.value = 0; d.cbuf_rd_en.value = 0; d.read_finished.value = 0
     d.wr_rst_n.value = 1; d.rd_rst_n.value = 1
     d.wr_clk.value = 0
-    cocotb.start_soon(Clock(d.rd_clk, RD_PERIOD_NS, unit="ns").start())
+    cocotb.start_soon(Clock(d.rd_clk, rd_period, unit="ns").start())
     if wr_clk:
-        cocotb.start_soon(Clock(d.wr_clk, WR_PERIOD_NS, unit="ns").start())
+        cocotb.start_soon(Clock(d.wr_clk, wr_period, unit="ns").start())
     await Timer(1, unit="ns")
     d.rd_rst_n.value = 0                 # negedge -> async reset branch
     if wr_clk:
@@ -431,10 +444,10 @@ async def setup(dut, wr_clk=True):
         cocotb.start_soon(env.wr.run())
     cocotb.start_soon(env.rd.run())
     await env.rd_cycles(12)
-    # rd reset leaves rd_bank_sel_sync at 0 for 2 cycles, so the writer's empty-bank one-shot fires on phys 0 first
-    # and again on phys 1 once the synchronizer settles (vendored behaviour, harmless: credit is already 1)
-    assert tuple(env.rd.events) in ((("empty", 0), ("empty", 1)), (("empty", 1),)), env.rd.events
-    assert env.rd.finish_count == len(env.rd.events)
+    # F4: the reader owns no bank after reset (able_to_read=0, rd_empty=1), so there is nothing to return. (The
+    # vendored buffer presented its empty initial bank(s) and the reader answered with one or two one-shots.)
+    assert tuple(env.rd.events) == (), env.rd.events
+    assert env.rd.finish_count == 0 and int(d.able_to_read_out.value) == 0 and int(d.rd_empty.value) == 1
     env.init_events = tuple(env.rd.events)
     env.n_init = len(env.rd.events)
     return env
@@ -574,7 +587,8 @@ async def test_02_wr_accept_gating(dut):
 
 
 # ================================================================================================================
-# (3) seamless switch: reader keeps up -> zero stall, banks alternate, contents exact
+# (3) seamless switch: reader keeps up -> zero stall, banks alternate, contents exact; F4: the pause after the last
+#     full bank does NOT produce an empty presentation (vendored: a write_finished-driven EMPTY recovery switch)
 # ================================================================================================================
 @cocotb.test(timeout_time=200, timeout_unit="us")
 async def test_03_seamless_switch_zero_stall(dut):
@@ -582,11 +596,10 @@ async def test_03_seamless_switch_zero_stall(dut):
     NB = 5
     ws = env.load_round_robin(NB * WORDS_PER_BANK)
     await env.wait_until(lambda: len(env.wr.accepted) == NB * WORDS_PER_BANK, what="all words accepted")
-    # traffic now pauses right after a seamless switch: the reader's credit returns with nothing to write and the
-    # cbuf performs its write_finished-driven EMPTY recovery switch (RTL finding, pinned explicitly here)
-    env.closes.append(NB * WORDS_PER_BANK)
-    await env.wait_events(env.n_init + NB + 1)
-    await env.rd_cycles(20)
+    await env.wait_events(env.n_init + NB)
+    await env.rd_cycles(400)                      # traffic pauses: nothing more may be presented
+    assert len(env.ev()) == NB, f"unexpected presentation(s) after the pause: {[describe(e) for e in env.ev()[NB:]]}"
+    assert env.rd.finals == [0] * NB and int(dut.write_finished_out.value) == 0
     assert env.wr.wr_ready_min == 1, "wr_ready dropped although the reader kept up"
     assert env.wr.stall_episodes == 0
     assert env.wr.max_skid <= 1, f"skid accumulated ({env.wr.max_skid}) with a fast reader"
@@ -594,7 +607,7 @@ async def test_03_seamless_switch_zero_stall(dut):
     env.finish_check()
     banks = [e for e in env.rd.events if e[0] == "bank"]
     assert [b[3] for b in banks] == [i % 2 for i in range(NB)], "banks did not alternate"
-    assert int(dut.dbg_bank_sel_wr.value) == 0
+    assert int(dut.dbg_bank_sel_wr.value) == NB % 2 and int(dut.rd_empty.value) == 1
 
 
 # ================================================================================================================
@@ -718,8 +731,9 @@ async def test_08_coprime_random_2000(dut):
     await env.flush()
     assert len(env.wr.accepted) == TOTAL
     await env.wait_flushed()
-    env.finish_check(allow_phantom=True)
+    env.finish_check(allow_phantom=False)         # F4: no phantom empty presentation, ever
     banks = sum(1 for e in env.rd.events if e[0] == "bank")
+    assert len(env.rd.events) == banks and env.rd.finals == [0] * (banks - 1) + [1]
     assert banks == TOTAL // WORDS_PER_BANK + 1
     assert env.wr.stall_episodes >= 2 and len(env.wr.slips) >= 1, "random run did not exercise stall + throttle"
     dut._log.info(f"stall episodes={env.wr.stall_episodes}, throttle episodes={len(env.wr.slips)}, "
@@ -727,30 +741,32 @@ async def test_08_coprime_random_2000(dut):
 
 
 # ================================================================================================================
-# (9) observation: empty recovery switch after a full bank followed by a traffic pause (vendored behaviour)
+# (9) F4: a full bank followed by a traffic pause is NOT followed by an empty presentation; the write bank stays put
+#     and the next words land in it (vendored: an EMPTY recovery switch, and the words went to the other bank)
 # ================================================================================================================
 @cocotb.test(timeout_time=200, timeout_unit="us")
 async def test_09_obs_empty_switch_after_full_bank_pause(dut):
     env = await setup(dut)
     env.load_round_robin(WORDS_PER_BANK)
     await env.wait_until(lambda: len(env.wr.accepted) == WORDS_PER_BANK, what="switch")
-    assert int(dut.dbg_bank_sel_wr.value) == 1 and int(dut.write_finished_out.value) == 1
-    await env.wait_events(env.n_init + 2)         # bank 0, then ('empty', 1): credit returned with no write pending
-    assert env.ev()[1] == ("empty", 1)
-    await env.wait_until(lambda: int(dut.dbg_bank_sel_wr.value) == 0, what="write bank back to 0")
-    assert int(dut.write_finished_out.value) == 0
-    env.closes.append(WORDS_PER_BANK)
-    env.load_round_robin(10)                      # lands in physical bank 0 again (just read, safe)
+    assert int(dut.dbg_bank_sel_wr.value) == 1 and int(dut.write_finished_out.value) == 0
+    await env.wait_events(env.n_init + 1)         # bank 0
+    await env.rd_cycles(400)
+    assert len(env.ev()) == 1, f"presentation after the pause: {[describe(e) for e in env.ev()]}"
+    assert int(dut.dbg_bank_sel_wr.value) == 1 and int(dut.dbg_credit.value) == 1
+    assert int(dut.rd_empty.value) == 1 and int(dut.able_to_read_out.value) == 0
+    env.load_round_robin(10)                      # lands in physical bank 1, the current write bank
     await env.flush()
     await env.wait_flushed()
     env.finish_check()
-    assert env.ev()[2][3] == 0 and env.ev()[2][1] == 2
+    assert env.ev()[1][3] == 1 and env.ev()[1][1] == 2
+    assert env.rd.finals == [0, 1]
 
 
 # ================================================================================================================
-# (10) observation: a write accepted while a flush is pending (no credit yet) cancels the flush (Case C clears
-#      write_finished). The plan's flush FSM closes admission (dsp_admit:=0) in the same cycle it pulses
-#      write_finished_ext, which is exactly what makes this unreachable in the SoC.
+# (10) F4: a write accepted while a flush is pending (no credit yet) does NOT cancel the flush: it joins the FINAL
+#      bank. (Vendored: the Case C write cleared write_finished and a second flush was needed. In the SoC the flush
+#      FSM closes admission when it pulses write_finished_ext, so no such write exists there anyway.)
 # ================================================================================================================
 @cocotb.test(timeout_time=200, timeout_unit="us")
 async def test_10_obs_late_write_cancels_pending_flush(dut):
@@ -761,16 +777,115 @@ async def test_10_obs_late_write_cancels_pending_flush(dut):
     env.load_round_robin(20)
     await env.flush()                             # pending: write_finished=1, credit=0
     assert int(dut.write_finished_out.value) == 1
-    env.closes.pop()                              # ...but it will be cancelled by the late words below
     env.load_round_robin(5)
     await env.wait_until(lambda: len(env.wr.accepted) == WORDS_PER_BANK + 25, what="late words")
+    env.closes[-1] = WORDS_PER_BANK + 25          # the late words close with the pending flush
     await env.wr_cycles(3)
-    assert int(dut.write_finished_out.value) == 0, "Case C write did not clear the pending flush (behaviour changed?)"
+    assert int(dut.write_finished_out.value) == 1, "the late write cancelled the pending flush"
     env.rd.hold = False
-    await env.wait_events(env.n_init + 1)         # bank 0 only; the 25-word bank stays unreadable
-    await env.rd_cycles(200)
-    assert len(env.ev()) == 1 and int(dut.dbg_bank_sel_wr.value) == 1
-    await env.flush()                             # a second flush publishes all 25 words in one bank
+    await env.wait_flushed()                      # bank 0, then ONE final bank with all 25 words
+    env.finish_check()
+    assert len(env.ev()) == 2 and env.ev()[1][1] == 6 and len(env.ev()[1][2]) == 7
+    assert env.rd.finals == [0, 1]
+
+
+# ================================================================================================================
+# (11) F4: rd_final is in band -- exactly the flush-closed presentation of each run carries it -- and after every run
+#      the reader owns no bank (rd_empty=1, able_to_read=0), so rd_empty alone is the quiescence predicate
+# ================================================================================================================
+@cocotb.test(timeout_time=400, timeout_unit="us")
+async def test_11_final_flag_and_quiescence_after_every_run(dut):
+    env = await setup(dut)
+    exp_finals = []
+    for n in (0, 1, 63, 64, 65, 128, 130, 37):
+        env.load_round_robin(n)
+        await env.wait_until(lambda: env.wr.queues_empty() and int(dut.skid_count.value) == 0, what="drain")
+        await env.flush()
+        await env.wait_flushed()
+        exp_finals += [0] * (n // WORDS_PER_BANK) + [1]
+        assert env.rd.finals == exp_finals, f"run of {n} words: finals {env.rd.finals} != {exp_finals}"
+        for _ in range(60):                       # quiescent: nothing owned, nothing pending
+            await FallingEdge(dut.rd_clk)
+            assert int(dut.rd_empty.value) == 1 and int(dut.able_to_read_out.value) == 0 \
+                and int(dut.rd_final_out.value) == 0, f"after a run of {n} words the reader still owns a bank"
+    env.finish_check()
+    assert [e[0] for e in env.ev()].count("empty") == 3     # the n=0, n=64 and n=128 runs end on an empty final
+
+
+# ================================================================================================================
+# (12) CDC at an inverted clock ratio: wr (DSP) side 7 ns, rd (DDR) side 2 ns. The reader's return is a toggle, so a
+#      one-rd-cycle read_finished cannot be lost in the slower wr domain (the vendored 2-FF pulse sync would miss it).
+# ================================================================================================================
+@cocotb.test(timeout_time=2000, timeout_unit="us")
+async def test_12_inverted_clock_ratio(dut):
+    env = await setup(dut, wr_period=7, rd_period=2)
+    env.rd.start_delay = lambda: random.choice([0, 0, 1, random.randint(0, 30)])
+    TOTAL = 700
+    n = 0
+    while n < TOTAL:
+        for ch in random.sample(range(NUM_CH), random.randint(1, NUM_CH)):
+            k = min(random.randint(1, 3), TOTAL - n)
+            if k <= 0:
+                break
+            env.wr.load(ch, k); n += k
+        await env.wr_cycles(random.randint(0, 30))
+    await env.wait_until(lambda: env.wr.queues_empty() and int(dut.skid_count.value) == 0,
+                         timeout_wr_cycles=200000, what="drain")
+    await env.flush()
     await env.wait_flushed()
     env.finish_check()
-    assert env.ev()[1][1] == 6 and len(env.ev()[1][2]) == 7
+    assert len(env.wr.accepted) == TOTAL and len(env.ev()) == TOTAL // WORDS_PER_BANK + 1
+    assert env.rd.finals == [0] * (TOTAL // WORDS_PER_BANK) + [1]
+
+
+# ================================================================================================================
+# (13) poller saturation (plan r2 item 3): all 14 channels continuously valid.
+#   A: fast reader -> sustained service of exactly 1 word / 3 wr cycles, strict round-robin (per-channel fairness);
+#   B: reader held -> the cbuf stalls, the skid fills to the throttle level and the throttle engages while every
+#      channel is valid: words already in the BARREL/ENCODE/CONSUME pipeline when the mask rises still land (the
+#      throttle-in-flight capacity), at most MAX_SLIP per episode, and the skid never overflows.
+# ================================================================================================================
+@cocotb.test(timeout_time=2000, timeout_unit="us")
+async def test_13_poller_saturation(dut):
+    env = await setup(dut)
+    K = 100
+    ws = env.load_round_robin(NUM_CH * K)
+    await env.wait_until(lambda: env.wr.queues_empty() and int(dut.skid_count.value) == 0,
+                         timeout_wr_cycles=200000, what="phase A drain")
+    consA = list(env.wr.consumed)
+    chs = [c for c, _, _ in consA]
+    cyc = [c for _, _, c in consA]
+    gaps = [b - a for a, b in zip(cyc, cyc[1:])]
+    assert chs == list(range(NUM_CH)) * K, "not strictly round-robin under saturation"
+    assert [w for _, w, _ in consA] == ws
+    assert set(gaps) == {3}, f"service interval under saturation not exactly 3 cycles: {sorted(set(gaps))}"
+    rate = len(consA) / (cyc[-1] - cyc[0] + 3)
+    assert rate == 1 / 3, rate
+    per_ch = [chs.count(c) for c in range(NUM_CH)]
+    assert per_ch == [K] * NUM_CH
+    assert env.wr.wr_ready_min == 1 and not env.wr.slips, "phase A should never stall or throttle"
+    dut._log.info(f"saturation A: {len(consA)} words in {cyc[-1] - cyc[0] + 3} cycles = {rate:.4f} word/cycle, "
+                  f"per-channel {per_ch[0]} each, max_skid={env.wr.max_skid}")
+    # phase B: stall the reader; all channels still saturated
+    env.rd.hold = True
+    nA = len(env.wr.consumed)
+    wsB = env.load_round_robin(NUM_CH * K)
+    await env.wait_until(lambda: int(dut.throttle.value) == 1 and int(dut.wr_ready.value) == 0, what="throttle")
+    await env.wr_cycles(300)
+    assert int(dut.throttle.value) == 1 and int(dut.wr_ready.value) == 0
+    assert int(dut.poller_data_valid.value) == 0 and int(dut.ch_valid.value) == (1 << NUM_CH) - 1, \
+        "saturated channels must all be valid and all masked"
+    held = int(dut.skid_count.value)
+    env.rd.hold = False
+    await env.wait_until(lambda: env.wr.queues_empty() and int(dut.skid_count.value) == 0,
+                         timeout_wr_cycles=400000, what="phase B drain")
+    consB = env.wr.consumed[nA:]
+    assert [c for c, _, _ in consB] == list(range(NUM_CH)) * K, "round-robin lost across throttle episodes"
+    assert [w for _, w, _ in consB] == wsB
+    await env.flush()
+    await env.wait_flushed()
+    env.finish_check()                            # MAX_SLIP per episode, max_skid <= THROTTLE_AT + MAX_SLIP, exact data
+    assert len(env.wr.slips) >= 1 and env.wr.stall_episodes >= 1
+    dut._log.info(f"saturation B: throttle episodes={len(env.wr.slips)}, slips per episode={sorted(set(env.wr.slips))}, "
+                  f"skid while stalled={held}, max_skid={env.wr.max_skid} of {SKID_DEPTH} "
+                  f"(throttle at {THROTTLE_AT}, in-flight capacity {SKID_DEPTH - THROTTLE_AT})")

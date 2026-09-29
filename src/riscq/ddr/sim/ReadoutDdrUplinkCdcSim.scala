@@ -589,11 +589,11 @@ object ReadoutDdrUplinkCdcSim extends App {
     assert(b.applyEvents.size == 1 && b.applyEvents.head._2 == 0 && b.applyEvents.head._3 == 0 && !b.applyEvents.head._4,
       s"DDR half reset with a write outstanding: ${b.applyEvents}")
     assert(b.wSinceAw == 16 && b.nB == b.nAw, "the stalled burst did not complete")
-    // the burst carried bank 0's own data, in order, although the DSP side was reset under it
+    AxiProtocolMonitor.check(b.mons, "W under backpressure and reset")   // first: payload stability (I8)
+    // then: the burst carried bank 0's own data, in order, although the DSP side was reset under it
     val perTag = b.ddrWords(0xD0000L, 64).groupBy(w => ((w >> 56) & 0xff).toInt)
     for (i <- 0 until NCH)
       assert(perTag.getOrElse(i, Nil) == exp(i).map { case (r, im) => tagWord(i, r, im) }, s"core $i: the cut burst's data")
-    AxiProtocolMonitor.check(b.mons, "before the retry")
     b.ddrCd.waitSampling(40)
     fullRun(b, 0xE0000L, 70, 61)
   }

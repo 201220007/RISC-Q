@@ -631,9 +631,11 @@ async def test_c3_base_reset_same_cycle_as_bank_ready(dut):
 
 @cocotb.test()
 async def test_c4a_wrap_branch_nonfinal_fault(dut):
-    """(4a) Fork C4: a NON-final bank whose cur_axi_addr_plus_bank > WRAP_LIMIT takes the ring-wrap branch
-    -> addr_fault=1 at its B handshake (the IDLE-time check stays silent because the bank ends exactly at
-    the limit), the pointer wraps to (end - WRAP_SIZE) and the next (partial, final) bank lands there."""
+    """(4a) Fork C4, as fixed in P3a r1: a NON-final bank that ends exactly at WRAP_LIMIT parks the pointer at
+    WRAP_LIMIT+1 without a fault (the run could still end there legally, see test_r1_ring_end_exact_multiple).
+    The next bank carries data, so this is a real wrap: in the cycle it is presented the pointer wraps to
+    (WRAP_LIMIT+1 - WRAP_SIZE) = 0 and addr_fault rises, and the bank is issued at 0 one cycle later.
+    (Vendored: the wrap and the fault happened at the first bank's B, before it was known whether data followed.)"""
     tb, s = await setup(dut)
     rng = random.Random(s + 5)
     d = dut
@@ -644,13 +646,14 @@ async def test_c4a_wrap_branch_nonfinal_fault(dut):
     await tb.wait_bursts_done(1)
     b0 = tb.sb.run_bursts[0]
     assert b0.addr == base and b0.awlen == 15
-    assert int(d.addr_fault.value) == 1, "addr_fault not set after the wrap-branch B handshake"
-    assert tb.sb.fault_rise_cycles == [b0.t_b + 1], \
-        f"fault rose at {tb.sb.fault_rise_cycles}, expected exactly at B+1 = {b0.t_b + 1} (IDLE check must stay silent)"
-    assert int(d.cur_axi_addr_out.value) == 0, f"pointer did not wrap: 0x{int(d.cur_axi_addr_out.value):x}"
+    assert int(d.addr_fault.value) == 0, "r1: no fault until a bank really has to wrap"
+    assert int(d.cur_axi_addr_out.value) == WRAP_SIZE, f"pointer not parked at the ring end: 0x{int(d.cur_axi_addr_out.value):x}"
     await tb.flush()
     await tb.wait_done()
     tb.check_run(base, expect_final=0 + 2 * BEAT_BYTES, expect_aw=[(base, 15), (0, 1)], expect_fault=1, wrapped=True)
+    b1 = tb.sb.run_bursts[1]
+    assert tb.sb.fault_rise_cycles == [b1.t_issue - 1], \
+        f"fault rose at {tb.sb.fault_rise_cycles}, expected in the wrap cycle {b1.t_issue - 1} (one before the issue)"
     assert tb.axi_ram.read(base, BANK_BYTES) == b0.exp_bytes
     assert tb.axi_ram.read(0, 2 * BEAT_BYTES) == tb.sb.run_bursts[1].exp_bytes
 
@@ -892,3 +895,18 @@ async def test_f4_writer_side_finish_has_no_effect(dut):
     await tb.flush()                                   # the real (cbuf) flush: empty final bank
     await tb.wait_done()
     tb.check_run(base, expect_final=base + BANK_BYTES, expect_aw=[(base, 15)])
+
+
+@cocotb.test()
+async def test_r1_ring_end_exact_multiple(dut):
+    """P3a r1 (Codex audit): a run whose full banks end EXACTLY at the ring limit is legal. 64 words at 0xF800 and 128
+    words at 0xF600: the last full bank parks the pointer at WRAP_LIMIT+1, the flush presents the empty FINAL bank, and
+    the run ends with final_addr = WRAP_LIMIT+1, addr_fault = 0, the pointer re-based. (Vendored: the pointer wrapped
+    at the full bank's B, so final_addr = 0 and addr_fault = 1 for a footprint the host driver allows.)"""
+    tb, s = await setup(dut, p_aw=0.3, p_w=0.3, p_b=0.3)
+    rng = random.Random(s + 24)
+    for nb in (1, 2):
+        base = WRAP_SIZE - nb * BANK_BYTES
+        await tb.run(base, words_gen(rng, nb * WORDS_PER_BANK, tag=24 + nb), expect_final=WRAP_LIMIT + 1,
+                     expect_aw=[(base + k * BANK_BYTES, 15) for k in range(nb)], expect_fault=0)
+        assert tb.sb.fault_rise_cycles == []

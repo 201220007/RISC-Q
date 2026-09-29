@@ -28,7 +28,7 @@ from .ddr_regs import (  # noqa: F401  (re-exported for callers/tests)
     OVERFLOW, INJ_REAL, INJ_IMAG, INJ_CORE, INJ_FIRE, NUM_CH, GEOMETRY, DIAG, ACCEPTED, REJECTED,
     MAX_RD_SIZE, WR_BASE_ALIGN, RD_BASE_ALIGN, WORD_BYTES, BEAT_BYTES, RING_LIMIT,
     STATUS_NAMES, FATAL_BITS, STICKY_MASK, DIAG_NAMES, status_str,
-    S_RD_DONE, S_WRITE_DONE, S_FLUSH_BUSY, S_INJ_BUSY, S_OVF_ANY, S_RUN_ACTIVE, S_DSP_ADMIT,
+    S_RD_DONE, S_WRITE_DONE, S_FLUSH_BUSY, S_INJ_BUSY, S_OVF_ANY, S_RUN_ACTIVE, S_DSP_ADMIT, S_AXI_RST_FAULT,
     S_ERR_BADSIZE, S_ERR_BASE_BUSY, S_ERR_FLUSH_REFUSED, S_ERR_START_DROPPED, S_ERR_INJ_BUSY,
     S_ERR_INJ_RANGE,
 )
@@ -280,6 +280,12 @@ class DdrReadout:
             if end > RING_LIMIT:
                 raise ValueError("run would reach 0x%x, past the ring limit 0x%x "
                                  "(ring wrap is forbidden in v1)" % (end, RING_LIMIT))
+        # r1: after a forced reset with AXI transactions outstanding, stale responses may still be in the fabric;
+        # no run can be certified until the DDR-domain (fabric) reset has cleared the fault.
+        s0 = self._status()
+        if s0 >> S_AXI_RST_FAULT & 1:
+            raise DdrUplinkError("axi_rst_fault: the uplink was force-reset with AXI transactions outstanding; "
+                                 "a DDR-domain reset is required before the next run: %s" % status_str(s0))
         self._clear_sticky()
         self._wr(WR_BASE, wr_base)
         if self._rd(WR_BASE) != wr_base:

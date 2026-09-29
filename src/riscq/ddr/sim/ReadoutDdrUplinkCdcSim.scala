@@ -14,6 +14,14 @@ import scala.util.Random
  *     bursts plus one burst for a non-empty final bank (F4), and afterwards DIAG reads rd_empty=1, able_to_read=0,
  *     run_idle=1. The same run at a base whose data and drain cross a 4 KiB page: no AW/AR crosses one (F1).
  *   - `start_dsp_dead_reset_held`, `start_dsp_dead_no_reset`, `start_ddr_dead`: stopped-clock startup of one side.
+ *   - r1 `ring_end`: runs whose footprint ends exactly at the 2 GiB ring limit (63/64 words at 0x7FFFFE00, 128 at
+ *     0x7FFFFC00) certify with final_addr = 0x8000_0000; runs that really wrap (65 at 0x7FFFFE00, 130 at 0x7FFFFC00)
+ *     raise `wrapped`. Each run's registers and drained DDR image are written to build/p3a-sim-fixtures/<name>.json and
+ *     replayed through the real `ddr.py::DdrReadout.drain` by software/tests/test_ddr_uplink_sim_fixtures.py.
+ *   - r1 `reset_dsp_in_w_burst` / `reset_dsp_in_r_burst` / `reset_dsp_hold_timeout`: a lone dsp reset while a write
+ *     burst's W beats are still flowing, while a read burst's R beats are stalled behind a full FIFO, and while a B is
+ *     delayed beyond the hold bound. The DDR half's reset must be applied only at AXI quiescence (or, on timeout,
+ *     with the sticky axi_rst_fault), and a retry started immediately afterwards must be exact.
  *   - `reset_dsp_mid_run`, `reset_ddr_mid_run`: a lone reset of either domain while the writer waits for the B of
  *     the first bank, with a partial bank and results pending; `reset_dsp_second_bank`: the same during the SECOND
  *     bank's B wait (the other parity of the cbuf's hand-over toggles) with a flush pending on the dsp side.
@@ -57,6 +65,10 @@ object ReadoutDdrUplinkCdcSim extends App {
     var ctrl: Axi4Master = null
     var wOpen = false                  // last W beat of a burst accepted, its B not yet
     var nB = 0
+    var nAw = 0; var nAr = 0; var nRlast = 0
+    var wSinceAw = 0                   // W beats accepted since the last AW
+    var onAw: () => Unit = () => ()
+    var applyEvents = mutable.ArrayBuffer[(Long, Int, Int, Boolean)]()   // (t, writes open, reads open, fault)
 
     def now: Long = simTime()
     def startMonitors(): Unit = {
@@ -68,11 +80,23 @@ object ReadoutDdrUplinkCdcSim extends App {
         while (true) {
           ddrCd.waitRisingEdge()
           val d = dut.io.ddr
-          if (d.aw.valid.toBoolean && d.aw.ready.toBoolean) axi += AxiEvent(now, "AW", d.aw.addr.toLong, d.aw.len.toInt + 1)
-          if (d.ar.valid.toBoolean && d.ar.ready.toBoolean) axi += AxiEvent(now, "AR", d.ar.addr.toLong, d.ar.len.toInt + 1)
+          if (d.aw.valid.toBoolean && d.aw.ready.toBoolean) {
+            axi += AxiEvent(now, "AW", d.aw.addr.toLong, d.aw.len.toInt + 1); nAw += 1; wSinceAw = 0; onAw() }
+          if (d.ar.valid.toBoolean && d.ar.ready.toBoolean) { axi += AxiEvent(now, "AR", d.ar.addr.toLong, d.ar.len.toInt + 1); nAr += 1 }
           if (d.w.valid.toBoolean && d.w.ready.toBoolean && d.w.last.toBoolean) wOpen = true
           if (d.b.valid.toBoolean && d.b.ready.toBoolean) { wOpen = false; nB += 1 }
-          if (d.w.valid.toBoolean && d.w.ready.toBoolean) axi += AxiEvent(now, "W", 0, 0)
+          if (d.w.valid.toBoolean && d.w.ready.toBoolean) { axi += AxiEvent(now, "W", 0, 0); wSinceAw += 1 }
+          if (d.r.valid.toBoolean && d.r.ready.toBoolean) { axi += AxiEvent(now, "R", 0, 0); if (d.r.last.toBoolean) nRlast += 1 }
+        }
+      }
+      // r1: every time the DDR half's reset (the real `ddrURst` net) rises, record what was still outstanding on the bus
+      fork {
+        var prevRst = dut.up.ddrURst.toBoolean
+        while (true) {
+          ddrCd.waitRisingEdge()
+          val r = dut.up.ddrURst.toBoolean
+          if (r && !prevRst) applyEvents += ((now, nAw - nB, nAr - nRlast, dut.up.rstHold.fault.toBoolean))
+          prevRst = r
         }
       }
     }
@@ -209,9 +233,10 @@ object ReadoutDdrUplinkCdcSim extends App {
     def waitNs(ns: Long): Unit = sleep(ns)
   }
 
-  def run(name: String, seed: Int, memDelay: Int = 0)(body: Bench => Unit): Unit = {
+  def run(name: String, seed: Int, memDelay: Int = 0, params: ReadoutDdrUplinkParams = ReadoutDdrUplinkParams(numCh = NCH))
+         (body: Bench => Unit): Unit = {
     SimConfig.withConfig(SpinalConfig()).addSimulatorFlag("-Wno-MULTIDRIVEN").addSimulatorFlag("--x-initial 0")
-      .compile(ReadoutDdrUplinkDut(ReadoutDdrUplinkParams(numCh = NCH)))
+      .compile(ReadoutDdrUplinkDut(params))
       .doSim(name, seed = seed) { dut =>
         SimTimeout(40000000)
         val b = new Bench(dut, new Random(seed), memDelay)
@@ -336,18 +361,31 @@ object ReadoutDdrUplinkCdcSim extends App {
     val t0 = b.now
     if (dsp) { b.dut.io.dspRst #= true; b.waitNs(160); b.dut.io.dspRst #= false }
     else     { b.dut.io.ddrRst #= true; b.waitNs(240); b.dut.io.ddrRst #= false }
-    b.ddrCd.waitSampling(20)
+    if (dsp) {
+      // r1: the DDR half is reset only once the burst's B has been taken (the hold), never before
+      var m = 0
+      while (b.applyEvents.isEmpty && m < 20000) { b.ddrCd.waitSampling(); m += 1 }
+      assert(b.applyEvents.nonEmpty, s"hold never applied: ${b.applyEvents}")
+      val (_, wOpenAt, rOpenAt, flt) = b.applyEvents.head
+      assert(wOpenAt == 0 && rOpenAt == 0 && !flt, s"DDR half reset with transactions outstanding: ${b.applyEvents.head}")
+      assert(b.nB - nb == 1, "the in-flight B must be taken BEFORE the reset")
+    } else {
+      // A raw DDR reset is psr_ddr's, which resets the AXI fabric too (ddr-connect.tcl). This memory model cannot be
+      // reset, so the sim lets it deliver the B it still owes; on the board that B no longer exists.
+      var m = 0
+      while (b.wOpen && m < 20000) { b.ddrCd.waitSampling(); m += 1 }
+    }
+    b.ddrCd.waitSampling(40)
     // the reset hit both halves (symmetric uplink reset): the run is gone, no write_done, nothing pending
     val s = b.status()
-    assert(!b.bit(s, S_RUN_ACTIVE) && !b.bit(s, S_WRITE_DONE), f"run survived a lone ${if (dsp) "dsp" else "ddr"} reset: 0x$s%x")
-    var m = 0
-    while (b.wOpen && m < 20000) { b.ddrCd.waitSampling(); m += 1 }   // the stray B of the cut burst drains
-    b.waitNs(5000)
+    assert(!b.bit(s, S_RUN_ACTIVE) && !b.bit(s, S_WRITE_DONE) && !b.bit(s, S_AXI_RST_FAULT),
+      f"run survived a lone ${if (dsp) "dsp" else "ddr"} reset: 0x$s%x")
+    b.waitNs(2000)
     assert(b.events("AW", t0).isEmpty && b.events("W", t0).isEmpty, s"AXI writes after the reset: ${b.events("AW", t0)}")
     val d = b.rd(DIAG)
     assert(((d >> 1) & 1) == 1 && ((d >> 7) & 1) == 1, f"not quiescent after the reset: diag=0x$d%x")
     println(s"[P3a-CDC] ${if (dsp) "dsp" else "ddr"} reset in the B wait: status=0x${s.toString(16)} diag=0x${d.toString(16)} " +
-            s"strayB=${b.nB - nb}")
+            s"B responses after the reset request=${b.nB - nb}")
     // the next run is exact and carries none of the pre-reset words
     fullRun(b, 0x30000L, 130, 8)
   }
@@ -370,12 +408,152 @@ object ReadoutDdrUplinkCdcSim extends App {
     val t0 = b.now
     b.dut.io.dspRst #= true; b.waitNs(160); b.dut.io.dspRst #= false
     var m = 0
-    while (b.wOpen && m < 20000) { b.ddrCd.waitSampling(); m += 1 }
+    while (b.applyEvents.isEmpty && m < 20000) { b.ddrCd.waitSampling(); m += 1 }
+    assert(b.applyEvents.size == 1 && b.applyEvents.head._2 == 0 && b.applyEvents.head._3 == 0 && !b.applyEvents.head._4,
+      s"hold: ${b.applyEvents}")
     b.waitNs(8000)
     assert(b.events("AW", t0).isEmpty, s"a stale bank was written after the reset: ${b.events("AW", t0)}")
     val s = b.status()
     assert(!b.bit(s, S_FLUSH_BUSY) && !b.bit(s, S_RUN_ACTIVE) && !b.bit(s, S_WRITE_DONE), f"status 0x$s%x")
     fullRun(b, 0x50000L, 90, 12)
+  }
+
+  // ───────────────────────────── r1 ─────────────────────────────
+  /** A JSON record of one finished run, as the host would read it, for the ddr.py replay test. */
+  def dumpFixture(b: Bench, name: String, base: Long, exp: Map[Int, Seq[(Int, Int)]], expect: String): Unit = {
+    val s = b.status(); val fa = b.rd(FINAL_ADDR).toLong; val rb = b.rd(RUN_BASE).toLong
+    val acc = (0 until NCH).map(i => b.rd(ACCEPTED + 4 * i)); val rej = (0 until NCH).map(i => b.rd(REJECTED + 4 * i))
+    val nbytes = fa - rb
+    val image = if (nbytes > 0) b.drain(rb, nbytes.toInt) else Seq()
+    val hex = image.map(w => (0 until 8).map(k => f"${((w >> (8 * k)) & 0xff).toInt}%02x").mkString).mkString
+    val expJ = (0 until NCH).map(i => "\"" + i + "\": [" + exp.getOrElse(i, Nil).map { case (r, im) => s"[$r, $im]" }.mkString(", ") + "]").mkString(", ")
+    val js = s"""{"name": "$name", "expect": "$expect", "base": $base, "status": $s, "run_base": $rb, "final_addr": $fa,
+                |  "num_ch": $NCH, "accepted": [${acc.mkString(", ")}], "rejected": [${rej.mkString(", ")}],
+                |  "image_hex": "$hex", "expected": {$expJ}}
+                |""".stripMargin
+    val dir = new java.io.File("build/p3a-sim-fixtures"); dir.mkdirs()
+    val w = new java.io.PrintWriter(new java.io.File(dir, s"$name.json")); w.write(js); w.close()
+  }
+  /** ddr.py::drain's certification rules, restated (the fixtures replay them through ddr.py itself). */
+  def certifies(b: Bench, base: Long, exp: Map[Int, Seq[(Int, Int)]]): Boolean = {
+    val s = b.status()
+    val fatal = Seq(S_BRESP_ERR, S_RRESP_ERR, S_WRAPPED, S_OVF_ANY, S_CROSS_DROPPED, S_EARLY_LATE, S_ERR_BADSIZE,
+      S_ERR_BADBASE, S_ERR_FLUSH_TIMEOUT, S_ERR_START_DROPPED, S_ERR_FLUSH_DROPPED, S_SKID_OVF, S_ERR_INJ_RANGE, S_AXI_RST_FAULT)
+    val S = exp.values.map(_.size).sum
+    val nbytes = b.rd(FINAL_ADDR).toLong - b.rd(RUN_BASE).toLong
+    !fatal.exists(f => b.bit(s, f)) && b.bit(s, S_WRITE_DONE) && b.rd(RUN_BASE).toLong == base &&
+      (0 until NCH).forall(i => b.rd(ACCEPTED + 4 * i) == exp.getOrElse(i, Nil).size && b.rd(REJECTED + 4 * i) == 0) &&
+      nbytes >= 0 && nbytes % 32 == 0 && (nbytes / 8 - S) >= 0 && (nbytes / 8 - S) <= 3
+  }
+
+  // 8. r1 ring end: exactly-at-the-limit footprints certify; one word more really wraps and is refused
+  run("ring_end", 8) { b =>
+    normalStart(b)
+    val limit = 0x80000000L
+    for ((base, n, legal, k) <- Seq((0x7FFFFE00L, 63, true, 0), (0x7FFFFE00L, 64, true, 1), (0x7FFFFE00L, 65, false, 2),
+                                   (0x7FFFFC00L, 128, true, 3), (0x7FFFFC00L, 130, false, 4))) {
+      val t0 = b.now
+      b.startRun(base)
+      val exp = b.push(n, 20 + k)
+      val s = b.flushRun()
+      val fa = b.rd(FINAL_ADDR).toLong
+      println(f"[P3a-CDC] ring_end: base=0x$base%x words=$n -> final_addr=0x$fa%x wrapped=${b.bit(s, S_WRAPPED)} " +
+              s"AW=${b.events("AW", t0).map(e => (e.addr.toHexString, e.len))}")
+      if (legal) {
+        assert(fa == limit - (if (n % 64 == 0) 0 else 32L * ((64 - n % 64) / 4)) , f"final_addr 0x$fa%x")
+        b.checkRun(base, exp, s, t0)                   // contract incl. no `wrapped`, exact AW plan, quiescence
+        assert(certifies(b, base, exp), "a legal ring-end run is not certifiable")
+        dumpFixture(b, s"ring_end_${n}w_0x${base.toHexString}", base, exp, "ok")
+      } else {
+        assert(b.bit(s, S_WRAPPED), "a run past the ring end must raise `wrapped`")
+        val tailWords = n % 64
+        // vendored C4 semantics kept for a real wrap: the tail bank is written at the ring start
+        assert(b.events("AW", t0).last.addr == 0L && fa == 32L * ((tailWords + 3) / 4), f"wrap tail at 0x$fa%x")
+        assert(!certifies(b, base, exp), "a wrapping run must not certify")
+        dumpFixture(b, s"ring_wrap_${n}w_0x${base.toHexString}", base, exp, "reject")
+      }
+    }
+  }
+
+  // 9. r1 dsp reset while the first bank's W beats are still flowing: the burst (W + B) completes before the DDR
+  //    half resets, and an immediate retry is exact
+  run("reset_dsp_in_w_burst", 9) { b =>
+    normalStart(b)
+    b.startRun(0x60000L)
+    var fired = false; var wAtReset = -1
+    b.onAw = () => { if (!fired) { fired = true; wAtReset = b.wSinceAw; b.dut.io.dspRst #= true } }
+    b.push(64, 30)
+    var n = 0
+    while (!fired && n < 100000) { b.ddrCd.waitSampling(); n += 1 }
+    assert(fired, "no AW")
+    val wBeforePending = { var m = 0; while (!b.dut.up.rstHold.pending.toBoolean && m < 100) { b.ddrCd.waitSampling(); m += 1 }; b.wSinceAw }
+    // (with AW accepted and 0..15 W beats transferred, a reset now would orphan the burst)
+    b.waitNs(160); b.dut.io.dspRst #= false
+    var m = 0
+    while (b.applyEvents.isEmpty && m < 20000) { b.ddrCd.waitSampling(); m += 1 }
+    println(s"[P3a-CDC] reset_dsp_in_w_burst: hold began after $wBeforePending of 16 W beats; applied at ${b.applyEvents}")
+    assert(wBeforePending < 16, "the hold did not start inside the W burst")
+    assert(b.applyEvents.size == 1 && b.applyEvents.head._2 == 0 && b.applyEvents.head._3 == 0 && !b.applyEvents.head._4,
+      s"DDR half reset with a write outstanding: ${b.applyEvents}")
+    assert(b.wSinceAw == 16 && b.nB == b.nAw, "the cut burst did not complete on the bus")
+    b.ddrCd.waitSampling(40)
+    fullRun(b, 0x70000L, 70, 31)                     // retried at once: no stale W/B may leak into it
+  }
+
+  // 10. r1 dsp reset while a read burst's R beats are stalled behind a full FIFO (AXIS held off): the R burst is drained
+  //     and discarded to RLAST before the DDR half resets; the retried drain and a new run are exact
+  run("reset_dsp_in_r_burst", 10) { b =>
+    normalStart(b)
+    fullRun(b, 0x80000L, 200, 40, drainToo = false)
+    b.wr(RD_BASE, BigInt(0x80000L)); b.wr(RD_SIZE, BigInt(4096))
+    b.dut.io.rd.ready #= false
+    val ar0 = b.nAr
+    b.wr(RD_START, BigInt(1))
+    var n = 0
+    while (!(b.nAr > ar0 && b.events("R").size > 0) && n < 10000) { b.ddrCd.waitSampling(); n += 1 }
+    b.ddrCd.waitSampling(200)                       // the FIFO fills, RREADY drops: most of the 128 R beats owed
+    val rBefore = b.events("R").size
+    b.dut.io.dspRst #= true; b.waitNs(160); b.dut.io.dspRst #= false
+    var m = 0
+    while (b.applyEvents.isEmpty && m < 20000) { b.ddrCd.waitSampling(); m += 1 }
+    println(s"[P3a-CDC] reset_dsp_in_r_burst: ${b.events("R").size - rBefore} stalled R beats drained after the reset request; " +
+            s"applied at ${b.applyEvents}")
+    assert(b.applyEvents.size == 1 && b.applyEvents.head._3 == 0 && !b.applyEvents.head._4, s"reset with a read open: ${b.applyEvents}")
+    assert(b.nRlast == b.nAr, "the stalled R burst did not complete")
+    b.dut.io.rd.ready #= true
+    b.ddrCd.waitSampling(40)
+    val words = b.ddrWords(0x80000L, 200)
+    assert(b.drain(0x80000L, 1600).take(200) == words, "the retried drain carries stale R data")
+    fullRun(b, 0x90000L, 70, 41)
+  }
+
+  // 11. r1 dsp reset while a B is delayed beyond the hold bound (2^8 cycles here): the reset is forced, axi_rst_fault
+  //     is raised, survives W1C, BASE_RESET and a new run, blocks certification, and only the DDR (fabric) reset clears it
+  run("reset_dsp_hold_timeout", 11, memDelay = 3000, params = ReadoutDdrUplinkParams(numCh = NCH, rstHoldLog2 = 8)) { b =>
+    normalStart(b)
+    b.startRun(0xA0000L)
+    b.push(64, 50)
+    var n = 0
+    while (!b.wOpen && n < 100000) { b.ddrCd.waitSampling(); n += 1 }
+    b.dut.io.dspRst #= true; b.waitNs(160); b.dut.io.dspRst #= false
+    var m = 0
+    while (b.applyEvents.isEmpty && m < 20000) { b.ddrCd.waitSampling(); m += 1 }
+    println(s"[P3a-CDC] reset_dsp_hold_timeout: applied at ${b.applyEvents}")
+    assert(b.applyEvents.size == 1 && b.applyEvents.head._2 == 1 && b.applyEvents.head._4, "the forced reset was not flagged")
+    b.ddrCd.waitSampling(40)
+    assert(b.bit(b.status(), S_AXI_RST_FAULT))
+    b.wr(STATUS, BigInt("FFFFFFFF", 16))
+    assert(b.bit(b.status(), S_AXI_RST_FAULT), "axi_rst_fault must not be W1C")
+    while (b.wOpen) b.ddrCd.waitSampling()          // the model's stale B arrives long after the reset
+    val exp = { b.startRun(0xB0000L); b.push(5, 51) }
+    b.flushRun()
+    assert(b.bit(b.status(), S_AXI_RST_FAULT), "axi_rst_fault must survive BASE_RESET and a run")
+    assert(!certifies(b, 0xB0000L, exp), "a run after a forced reset must not certify")
+    dumpFixture(b, "axi_rst_fault_run", 0xB0000L, exp, "reject")
+    b.dut.io.ddrRst #= true; b.waitNs(240); b.dut.io.ddrRst #= false   // the fabric reset (psr_ddr)
+    b.ddrCd.waitSampling(40)
+    assert(!b.bit(b.status(), S_AXI_RST_FAULT), "the DDR reset must clear axi_rst_fault")
+    fullRun(b, 0xC0000L, 70, 52)
   }
 
   println("[P3a-CDC] all scenarios PASS")

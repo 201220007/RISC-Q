@@ -21,7 +21,8 @@ case class ReadoutDdrUplinkParams(
     axiIdWidth: Int = 4,
     ctrlIdWidth: Int = 2,
     flushTimeoutLog2: Int = 22,       // flush watchdog (v5 §1): 2^22 ui cycles ≈ 12 ms @ 333 MHz
-    rejectedWidth: Int = 16           // per-core saturating Gray counters (v7 §2)
+    rejectedWidth: Int = 16,          // per-core saturating Gray counters (v7 §2)
+    rstHoldLog2: Int = 16             // r1: bound of the dsp-reset hold, 2^16 ui cycles ≈ 197 µs @ 333 MHz
 ) {
   // tag is 8 bits, but the register map bounds this harder: OVERFLOW is a single 32-bit word and the
   // ACCEPTED array (0x100 + 4i) must not reach REJECTED (0x180).  (r09-#8)
@@ -63,6 +64,8 @@ object ReadoutDdrRegs {
                            //     [8]snap_arrived [9]ddr_calib_done (MIG c0_init_calib_complete; the
                            //     authoritative copy is the SoC's HOST-domain status register, which is
                            //     readable even when this whole ui_clk block is dead -- r19-#4)
+  // r1 (plan r2 #6): RESERVED for the future host STOP word. No hardware: reads 0, writes are ignored.
+  val STOP        = 0x5C
   val ACCEPTED    = 0x100  // RO  + 4*i (snapshot)
   val REJECTED    = 0x180  // RO  + 4*i (live, Gray-crossed)
   val MAX_RD_SIZE = 0x2000000 // 32 MiB
@@ -73,6 +76,10 @@ object ReadoutDdrRegs {
   val S_ERR_INJ_BUSY = 14; val S_ERR_BASE_BUSY = 15; val S_ERR_FLUSH_REFUSED = 16; val S_ERR_FLUSH_TIMEOUT = 17
   val S_DSP_IN_RESET = 18; val S_DSP_ADMIT = 19; val S_DDR_IN_RESET = 20; val S_ERR_START_DROPPED = 21
   val S_ERR_FLUSH_DROPPED = 22; val S_SKID_OVF = 23; val S_ERR_INJ_RANGE = 24
+  // r1: the uplink's DDR half had to be FORCED into reset (dsp-side reset request, hold timed out) while AXI
+  // transactions were still outstanding. Not W1C and not cleared by BASE_RESET: only the raw DDR reset, which
+  // also resets the AXI fabric (psr_ddr), clears it. A run cannot be certified while it is set.
+  val S_AXI_RST_FAULT = 25
   val STICKY_MASK: Long = Seq(S_RD_DONE, S_WRITE_DONE, S_BRESP_ERR, S_RRESP_ERR, S_ERR_BADSIZE, S_ERR_BADBASE,
     S_WRAPPED, S_CROSS_DROPPED, S_ERR_INJ_BUSY, S_ERR_BASE_BUSY, S_ERR_FLUSH_REFUSED,
     S_ERR_FLUSH_TIMEOUT, S_ERR_START_DROPPED, S_ERR_FLUSH_DROPPED, S_EARLY_LATE, S_SKID_OVF,
@@ -112,13 +119,41 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
   }
 
   // ───────────────────────────── symmetric uplink resets ─────────────────────────────
+  // A raw DDR reset (psr_ddr peripheral_reset) also resets the AXI fabric behind `ddr` (smc_ddr, the MIG's AXI
+  // port, the DMA: vivado-scripts/riscvsoc-bd/inc/ddr-connect.tcl), so it may cut the DDR half at once. A raw DSP
+  // reset does not reset that fabric, so its effect on the DDR half is HELD (r1) until the AXI master is quiescent:
+  // no bank burst started, and no AR pending or R beat due. While held (`quiesce`) nothing new starts and the R
+  // beats of an issued burst are drained and discarded. If the master is still busy after 2^rstHoldLog2 cycles the
+  // reset is forced anyway and the sticky `axi_rst_fault` (STATUS bit 25) is raised. When the DDR half resets, the
+  // DSP half is reset again with it, so both restart from the same state.
   val dspRstRaw = dspCd.isResetActive
   val ddrRstRaw = ddrCd.isResetActive
-  val ddrRstInDsp = dspCd(BufferCC(ddrRstRaw, init = True, bufferDepth = 2))
   val dspRstInDdr = ddrCd(BufferCC(dspRstRaw, init = True, bufferDepth = 2))
-  val dspU = ClockDomain(dspCd.readClockWire, dspRstRaw | ddrRstInDsp,
+  val axiBusy = Bool()                                   // driven by the ddr side below (same clock)
+  val rstHold = new ClockingArea(ddrCd) {
+    val pending = Reg(Bool()) init False                 // dsp reset requested, waiting for AXI quiescence
+    val applied = Reg(Bool()) init True                  // the DDR half is in reset because of the dsp side
+    val cnt     = Reg(UInt(p.rstHoldLog2 + 1 bits)) init 0
+    val minCnt  = Reg(UInt(3 bits)) init 0               // keep it applied >= 8 cycles (the dsp side re-syncs it)
+    val fault   = Reg(Bool()) init False                 // cleared only by the raw DDR (= fabric) reset
+    when(applied) {
+      when(minCnt =/= 7)(minCnt := minCnt + 1)
+      when(!dspRstInDdr && minCnt === 7)(applied := False)
+    } elsewhen (pending) {
+      cnt := cnt + 1
+      when(!axiBusy) { applied := True; pending := False; minCnt := 0 }
+        .elsewhen(cnt.msb) { applied := True; pending := False; minCnt := 0; fault := True }
+    } elsewhen (dspRstInDdr) {
+      pending := True; cnt := 0
+    }
+  }
+  val quiesce = rstHold.pending
+  val ddrURst = ddrRstRaw | rstHold.applied
+  val ddrRstInDsp = dspCd(BufferCC(ddrRstRaw, init = True, bufferDepth = 2))
+  val holdInDsp   = dspCd(BufferCC(rstHold.applied, init = True, bufferDepth = 2))
+  val dspU = ClockDomain(dspCd.readClockWire, dspRstRaw | ddrRstInDsp | holdInDsp,
                          config = dspCd.config.copy(resetKind = SYNC, resetActiveLevel = HIGH))
-  val ddrU = ClockDomain(ddrCd.readClockWire, ddrRstRaw | dspRstInDdr,
+  val ddrU = ClockDomain(ddrCd.readClockWire, ddrURst,
                          config = ddrCd.config.copy(resetKind = SYNC, resetActiveLevel = HIGH))
 
   // ───────────────────────────── clock crossings ─────────────────────────────
@@ -273,6 +308,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
   val ddr = new ClockingArea(ddrU) {
     // ---- writer + cbuf read side ----
     val writer = CbufAxiWriter(p.axiDataWidth, p.cbufAddrWidth, p.axiAddrWidth)
+    writer.io.quiesce := quiesce
     val cb = dsp.cbuf.io
     writer.io.ableToRead  := cb.ableToRead
     writer.io.rdEmpty     := cb.rdEmpty
@@ -284,6 +320,9 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
 
     // ---- drain engine ----
     val mmu = DrainEngine(p.axiAddrWidth, p.axiDataWidth, p.axiIdWidth, maxBytes = MAX_RD_SIZE)
+    mmu.io.quiesce := quiesce
+    // AXI master quiescence for the reset hold: a started bank burst (AW, W or B due) or an AR/R in flight
+    axiBusy := !writer.io.writerIdle || mmu.io.axiBusy
 
     // ---- AXI master: writer owns AW/W/B, the drain engine owns AR/R ----
     val a = io.ddr
@@ -352,7 +391,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     // r11-#2: `drainInFlight` (up to AXIS TLAST) must gate a new run too -- otherwise a BASE_RESET could
     // re-base the writer while the previous drain is still streaming out.
     val runIdle  = !runActive && !flushBusy && !rdLocked && writer.io.writerIdle && cbufNoPendingBank &&
-                   !startPend && !xStart.io.busy && !xFlush.io.busy && !xInj.io.busy
+                   !startPend && !xStart.io.busy && !xFlush.io.busy && !xInj.io.busy && !quiesce
 
     // snapshot capture (toggle handshake; bundle is static after the dsp commit)
     val snapTogSync = BufferCC(dsp.snapToggle, init = False, bufferDepth = 2)
@@ -501,6 +540,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     // the bit could only ever read 0. The host detects an interrupted run through `write_done == 0`
     // (plan v7 §3). The bit is kept reserved-zero for ABI stability.
     status(S_DDR_IN_RESET) := False
+    status(S_AXI_RST_FAULT) := rstHold.fault
     bus.read(status, STATUS)
     val statusW = bus.createAndDriveFlow(Bits(32 bits), STATUS)
     when(statusW.valid)(stickyClr := statusW.payload & B(STICKY_MASK, 32 bits))
@@ -518,7 +558,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
         .otherwise(injCore := injCoreW.payload(7 downto 0).asUInt)
     }
     bus.onWrite(INJ_FIRE) {
-      when(!injBusy && runActive && injCore < p.numCh)(xInj.io.start := True) otherwise (set(S_ERR_INJ_BUSY))
+      when(!injBusy && runActive && injCore < p.numCh && !quiesce)(xInj.io.start := True) otherwise (set(S_ERR_INJ_BUSY))
     }
     bus.read(U(p.numCh, 32 bits), NUM_CH)
     // diagnostics: why is a base_reset being refused? (also useful during board bring-up)
@@ -535,6 +575,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     diag(8) := snapArrived
     diag(9) := BufferCC(io.calibDone, init = False, bufferDepth = 2)   // MIG calibration (r19-B1)
     bus.read(diag, DIAG)
+    bus.read(B(0, 32 bits), STOP)      // r1: reserved STOP word, no hardware
     bus.read(U(p.flushQuiet, 8 bits) ## U(p.cbufAddrWidth, 8 bits) ## U(p.skidDepth, 8 bits) ## U(p.fifoDepth, 8 bits), GEOMETRY)
     for (i <- 0 until p.numCh) {
       bus.read(accSnapDdr(i), ACCEPTED + 4 * i)

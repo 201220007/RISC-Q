@@ -81,6 +81,11 @@ not specified: they are stale RAM contents, or zeros.
   `RD_START`; a violation raises `err_badsize` and starts nothing.
 - The writer writes only inside `[run_base, final_addr)`. The ring limit is `WRAP_LIMIT + 1 =
   0x8000_0000` (`ddr_regs.RING_LIMIT`). Crossing it, or a burst ending past it, sets `wrapped`.
+- Ring end (r1). A run whose footprint ends exactly at the ring limit is legal, including a run whose last
+  full bank ends there and whose final bank is empty: `final_addr = 0x8000_0000`, `wrapped = 0`. This is
+  the footprint `ddr.py::prepare` admits (`end <= RING_LIMIT`). Only data beyond the limit wraps: the bank is
+  written at the ring start (address 0) and `wrapped` is set, so `drain()` refuses the run. Between banks
+  of such a run `CUR_ADDR` may read `0x8000_0000`.
 - Depends: `ddr_regs.py` (`WR_BASE_ALIGN`, `RD_BASE_ALIGN`, `MAX_RD_SIZE`, `RING_LIMIT`),
   `ddr.py::prepare` / `_read_ddr`, `test_ddr_contract.py`, G2 `regvalidate` and `geometry`.
 
@@ -94,7 +99,8 @@ against `ddr_regs.py`. In particular:
   their synchronised source.
 - `rd_busy` (bit 0) rises when `RD_START` is accepted and falls when the last AXI R beat of the chunk
   is accepted by the drain engine. That is before the AXIS TLAST handshake.
-  `rd_done` (bit 1) is set in the same cycle as the fall.
+  `rd_done` (bit 1) is sticky from the next DDR cycle: the engine's one-cycle `done` pulse coincides with
+  the fall of `rd_busy`, and the STATUS sticky register captures it one cycle later (as the vendored design did).
 - `RD_BASE`/`RD_SIZE` writes, and `RD_START`, are refused (`err_badsize`) from an accepted `RD_START`
   until the TLAST handshake of that chunk, not only while `rd_busy`. G2 `rd_regs_frozen` depends on
   `rd_busy` falling before TLAST.
@@ -109,6 +115,24 @@ against `ddr_regs.py`. In particular:
   cbuf_able_to_read, `[3]` start_busy, `[4]` start_pend, `[5]` flush_cross_busy, `[6]`
   write_done_seen, `[7]` run_idle, `[8]` snap_arrived, `[9]` ddr_calib_done.
 - `ddr_in_reset` (bit 20) stays reserved-zero.
+- `axi_rst_fault` (bit 25, r1, a contract change): the DDR half had to be forced into reset with AXI transactions
+  still outstanding (see the reset rule below). Not W1C and not cleared by `BASE_RESET`; only the raw DDR reset
+  clears it. `ddr.py` lists it in `FATAL_BITS` and `prepare()` refuses to start a run while it is set.
+- `STOP` (0x5C, r1): RESERVED for the future host STOP word (plan r2 #6). No hardware: reads 0, writes are
+  ignored. Mirrored in `ddr_regs.STOP`.
+
+### Reset rule (r1)
+
+- A raw DDR reset (`ddrRst`, from `psr_ddr`) resets the AXI fabric behind the `ddr` master with it (the
+  MIG's AXI port, `smc_ddr`, the DMA and `smc_ctrl`; `vivado-scripts/riscvsoc-bd/inc/ddr-connect.tcl`). It
+  resets both uplink halves at once; no transaction can outlive it.
+- A raw DSP reset does not reset that fabric. Its effect on the DDR half is held until the `ddr` master is
+  quiescent: no bank burst started (AW, W or B still due) and no AR pending or R beat due. While it is held,
+  no new bank or AR starts, the R beats of an issued read burst are accepted and discarded up to RLAST,
+  and `BASE_RESET`/`INJ_FIRE` are refused. The DDR half then resets, and the DSP half is reset again with it.
+- The hold is bounded (`rstHoldLog2`, default 2^16 DDR cycles). On timeout the reset is forced and
+  `axi_rst_fault` is raised; it stays up until a raw DDR reset. It is never silent.
+- A reset of either kind ends the current run: `write_done` stays 0, and `drain()` refuses the run.
 
 ### I8. Interfaces
 
@@ -156,6 +180,12 @@ These may differ from the vendored implementation. Each one is recorded in the P
    `circular_buffer3.write_almost_finished_out`. Each one is listed in the report.
 8. Values after a run. DIAG `[1]`/`[2]` read `rd_empty = 1`, `able_to_read = 0` after every
    completed run. The vendored module could leave `rd_empty = 0` behind (F4).
+9. Ring end (r1). A run whose last full bank ends exactly at the ring limit now ends legally with
+   `final_addr = 0x8000_0000`. The vendored writer, and the first P3a version, wrapped the pointer at that
+   bank's B, reporting `final_addr = 0` and `wrapped = 1` for a footprint the driver admits (Codex P3a audit #1).
+10. Reset timing (r1). After a DSP reset request the DDR half resets only at AXI quiescence (bounded); a new
+    STATUS bit `axi_rst_fault` reports a forced reset. This is a contract change, mirrored in `ddr_regs.py`
+    and `ddr.py` (Codex P3a audit #2).
 
 Anything not listed here, or under the fixes, is a contract change. A contract change must be
 documented, and `ddr.py`, `ddr_regs.py` and G2 updated with it (plan r2 item 2).

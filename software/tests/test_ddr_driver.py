@@ -261,6 +261,14 @@ def test_prepare_rejects_a_run_that_would_wrap(drv):
         drv.prepare(R.RING_LIMIT - 4096, expected=huge)
 
 
+def test_prepare_refuses_after_a_forced_axi_reset(fake, drv):
+    """r1: axi_rst_fault (not W1C) blocks the next run until the DDR-domain reset clears it."""
+    fake.status_extra = 1 << R.S_AXI_RST_FAULT
+    with pytest.raises(DdrUplinkError, match="axi_rst_fault"):
+        drv.prepare(0x1000)
+    assert R.S_AXI_RST_FAULT in R.FATAL_BITS
+
+
 def test_inject_rejects_a_bad_core(drv):
     with pytest.raises(ValueError, match="out of range"):
         drv.inject(99, 1, 2)

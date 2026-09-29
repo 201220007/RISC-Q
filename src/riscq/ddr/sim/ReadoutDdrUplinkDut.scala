@@ -39,6 +39,11 @@ case class ReadoutDdrUplinkDut(p: ReadoutDdrUplinkParams) extends Component {
   // that claim to exercise them are vacuous.
   up.dsp.rejPend.foreach(_.simPublic())
   up.dsp.injPending.simPublic()
+  // r1: the dsp-reset hold must be observable to prove the DDR half resets only at AXI quiescence
+  up.rstHold.pending.simPublic()
+  up.rstHold.applied.simPublic()
+  up.rstHold.fault.simPublic()
+  up.ddrURst.simPublic()
   for (i <- 0 until p.numCh) up.io.results(i) << io.results(i)
   up.io.calibDone := True          // the MIG is calibrated in every G2 scenario
   up.io.ctrl  << io.ctrl

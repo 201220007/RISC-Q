@@ -18,8 +18,13 @@ import spinal.lib._
  *   - The last bank of a run is the one the buffer presents with `rdFinal` (fix F4): its B (or its empty
  *     presentation) sets `finalAddr`, pulses `currentUserDone` and re-bases the pointer.
  *   - `baseReset` is honoured only in IDLE and has priority over a burst start in that cycle (Fork C3).
- *   - `addrFault` (Fork C4, sticky until an IDLE `baseReset`): a non-final bank advance that wraps the
- *     ring, or any bank whose last byte lies past `wrapLimit`.
+ *   - `addrFault` (Fork C4, sticky until an IDLE `baseReset`): a bank written past the ring end (the pointer
+ *     wraps to 0 for it), or any bank whose last byte lies past `wrapLimit`.
+ *   - Ring end (r1 fix): a non-final bank that ends exactly at the ring limit does NOT wrap the pointer yet.
+ *     The pointer is parked at `wrapLimit + 1` (`pendingWrap`); if the next presentation is the empty FINAL
+ *     bank, the run ends legally with `finalAddr = wrapLimit + 1` and no fault. Only a further non-empty bank
+ *     wraps the pointer to 0, raises `addrFault` and is then written at the wrapped address.
+ *   - `quiesce` (r1 reset hold): no new bank is started while it is high; a bank already started completes.
  *   - `writerIdle` = IDLE (Fork C2).
  * `wrapLimit` replaces the vendored `SIM_WRAP_LIMIT` define (production 0x7FFF_FFFF, ring size limit+1).
  */
@@ -30,7 +35,7 @@ case class CbufAxiWriter(rdWidth: Int, addrWidth: Int, axiAddrWidth: Int,
   val pageBeats = 4096 / beatBytes
   require(isPow2(beatBytes) && pageBeats >= 1)
   val wrapSize  = wrapLimit + 1
-  require(wrapLimit < (BigInt(1) << axiAddrWidth))
+  require(wrapSize < (BigInt(1) << axiAddrWidth), "the parked ring-end pointer (wrapLimit + 1) must fit the address")
 
   val io = new Bundle {
     val baseAddr        = in  UInt(axiAddrWidth bits)
@@ -48,6 +53,7 @@ case class CbufAxiWriter(rdWidth: Int, addrWidth: Int, axiAddrWidth: Int,
     val writerIdle      = out Bool()
     val addrFault       = out Bool()
     val currentUserDone = out Bool()
+    val quiesce         = in  Bool() default(False)
     val aw = master(Stream(new Bundle {
       val addr  = UInt(axiAddrWidth bits)
       val len   = UInt(8 bits)
@@ -79,6 +85,7 @@ case class CbufAxiWriter(rdWidth: Int, addrWidth: Int, axiAddrWidth: Int,
   val awAddr     = Reg(UInt(axiAddrWidth bits)) init 0
   val awLen      = Reg(UInt(8 bits)) init 0
   val wValid     = Reg(Bool()) init False
+  val pendingWrap = Reg(Bool()) init False                 // pointer parked at the ring end (wrapLimit + 1)
   done := False; readFin := False; rdEn := False
 
   val wrapLimitU    = U(wrapLimit, axiAddrWidth + 1 bits)
@@ -121,6 +128,7 @@ case class CbufAxiWriter(rdWidth: Int, addrWidth: Int, axiAddrWidth: Int,
     curAxiAddr := io.baseAddr
     lastBurst  := False
     addrFault  := False
+    pendingWrap := False
   }
   // C4 (b): a bank whose last byte lies past the ring limit
   when(state === St.IDLE && io.ableToRead && !io.rdEmpty && !io.baseReset &&
@@ -130,8 +138,14 @@ case class CbufAxiWriter(rdWidth: Int, addrWidth: Int, axiAddrWidth: Int,
 
   switch(state) {
     is(St.IDLE) {
-      when(io.ableToRead && !io.baseReset) {
-        when(!io.rdEmpty) {
+      when(io.ableToRead && !io.baseReset && !io.quiesce) {
+        when(!io.rdEmpty && pendingWrap) {
+          // data beyond the ring end: a real wrap. Re-base the parked pointer to the ring start, flag it,
+          // and issue the bank from there in the next cycle.
+          curAxiAddr  := (curAxiAddr.resize(axiAddrWidth + 1) - wrapSizeU).resize(axiAddrWidth)
+          addrFault   := True
+          pendingWrap := False
+        } elsewhen(!io.rdEmpty) {
           lastBurst := io.rdFinal
           bankLen   := newBankLen
           beatCount := 0
@@ -146,6 +160,7 @@ case class CbufAxiWriter(rdWidth: Int, addrWidth: Int, axiAddrWidth: Int,
             finalAddr  := curAxiAddr
             curAxiAddr := io.baseAddr
             lastBurst  := False
+            pendingWrap := False
           }
           readFin := True
         }
@@ -177,12 +192,10 @@ case class CbufAxiWriter(rdWidth: Int, addrWidth: Int, axiAddrWidth: Int,
             lastBurst  := False
             curAxiAddr := io.baseAddr
           } otherwise {
-            when(curPlusBank > wrapLimitU) {
-              curAxiAddr := (curPlusBank - wrapSizeU).resize(axiAddrWidth)
-              addrFault  := True                                   // C4 (a)
-            } otherwise {
-              curAxiAddr := curPlusBank.resize(axiAddrWidth)
-            }
+            // C4 (a), r1: at the ring end the pointer parks at wrapLimit + 1; the wrap (and the fault) happen
+            // only if another non-empty bank follows
+            curAxiAddr := curPlusBank.resize(axiAddrWidth)
+            when(curPlusBank > wrapLimitU)(pendingWrap := True)
           }
           readFin := True
           state   := St.IDLE

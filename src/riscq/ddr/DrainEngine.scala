@@ -19,6 +19,9 @@ import spinal.lib._
  *   - `busy` rises the cycle after an accepted start and falls, with a one-cycle `done`, when the last R
  *     beat of the chunk is accepted into the FIFO (the vendored, advertised timing: before TLAST).
  *   - RRESP is not interpreted here; every beat is forwarded (the uplink's sticky monitor watches it).
+ *   - `quiesce` (r1 reset hold): no new AR is issued, and the R beats of a burst already issued are accepted and
+ *     DISCARDED (not pushed into the FIFO) until its RLAST, so the burst completes on the bus whatever the AXIS
+ *     side does. `axiBusy` is high while an AR is pending or its R beats are still due.
  * FIFO: `StreamFifo` with asynchronous read (the vendored first-word-fall-through `async_fifo_same`);
  * RREADY drops when it holds `fifoDepth - 4` beats (the vendored almost-full hysteresis).
  */
@@ -39,6 +42,8 @@ case class DrainEngine(addrWidth: Int, dataWidth: Int, idWidth: Int, fifoDepth: 
     val done          = out Bool()
     val idle          = out Bool()      // no chunk in flight: a start would be accepted (if valid)
     val startRejected = out Bool()      // one-cycle pulse
+    val quiesce       = in  Bool() default(False)
+    val axiBusy       = out Bool()      // an AR is pending or its R burst is not complete
     val ar = master(Stream(new Bundle {
       val id    = UInt(idWidth bits)
       val addr  = UInt(addrWidth bits)
@@ -87,7 +92,8 @@ case class DrainEngine(addrWidth: Int, dataWidth: Int, idWidth: Int, fifoDepth: 
     val a = (remaining > 256) ? U(256, 9 bits) | remaining.resize(9)
     (a < toPage) ? a | toPage
   }
-  val canIssue = busy && !outstanding && !arvalid && !afull && remaining =/= 0
+  val canIssue = busy && !outstanding && !arvalid && !afull && remaining =/= 0 && !io.quiesce
+  io.axiBusy := arvalid || outstanding
   when(accept) {
     busy       := True
     streaming  := True
@@ -116,8 +122,8 @@ case class DrainEngine(addrWidth: Int, dataWidth: Int, idWidth: Int, fifoDepth: 
   io.ar.payload.burst := B"01"
 
   // ---- R -> FIFO ----
-  io.r.ready := outstanding && !afull
-  fifo.io.push.valid   := io.r.fire
+  io.r.ready := outstanding && (!afull || io.quiesce)
+  fifo.io.push.valid   := io.r.fire && !io.quiesce
   fifo.io.push.payload := io.r.payload.data
   when(io.r.fire) {
     when(io.r.payload.last)(outstanding := False)

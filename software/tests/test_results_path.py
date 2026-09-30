@@ -270,3 +270,36 @@ def test_pynq_driver_no_rf_bringup_writes_no_rf_state(fake_board, tmp_path):
     drv = pd.PynqDriver("x.xsa", str(_board_cfg(tmp_path, "sim-2q-antq.json")), board=no_rf)
     assert drv.rfdc.dac_tiles.mock_calls == [] and drv.rfdc.adc_tiles.mock_calls == []
     assert drv.mts_result is None and drv.host_base is None
+
+
+# ── riscq.cal on an antq_uplink build (plan v2 r2 #11; the library itself is P6) ──────────────────
+
+def _cal_exp(m, measure, shots=16):
+    from riscq.cal.experiment import Experiment
+    from riscq.cal.sequence import Gate
+    from tests.cal_fixtures import _cfg
+    return Experiment(_cfg(m), [0], {0: [Gate("x90")]}, {0: ()}, (), measure, shots, label="p3b")
+
+
+def test_cal_raw_defaults_to_the_host_window_and_is_refused_on_antq(responder, antq):
+    """Measure.raw() defaults to host=True, so a raw capture on an antq_uplink build is refused at
+    compile time with the reason, before any board access."""
+    from riscq.cal.measure import Measure
+    r = responder(CONFIGS / "sim-2q-antq.json")
+    with pytest.raises(KernelCompileError, match="results_path='antq_uplink'"):
+        _cal_exp(antq, Measure.raw()).run(r.drv)
+    assert r.setups == []
+
+
+def test_cal_iqsum_and_ram_raw_still_compile_on_antq(responder, antq):
+    """IQSUM does not use the host window, and raw with host=False keeps its capture in core RAM:
+    both run on an antq_uplink build (their results go through the core, not the uplink)."""
+    from riscq.cal.measure import Measure
+    for measure, name in ((Measure.iqsum(4), "iqsum"), (Measure.raw(host=False), "raw-ram")):
+        r = responder(CONFIGS / "sim-2q-antq.json")
+        r.answer(lambda progs, params: {c: {"out": np.zeros(4096, int)} for c in progs})
+        try:
+            _cal_exp(antq, measure).run(r.drv)
+        except Exception as e:                     # a result-shape complaint is fine; a HostWindow one is not
+            assert "HostWindow" not in str(e) and "host=True" not in str(e), f"{name}: {e}"
+        assert r.setups and all(not p.host_arrays for p in r.setups[0].values()), name

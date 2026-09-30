@@ -148,22 +148,14 @@ if {$_fail != 0 || $_pass != 1} {
   error "G4 FAILED: $_pass PASS marker(s), $_fail FAIL marker(s) in [lindex $_log 0]\
          (a valid run has exactly 1 PASS and 0 FAIL)"
 }
-# P3b r1: the markers are not the whole transcript. The DDR4 device model reports protocol and timing
-# violations (tRRD, tFAW, ...) as non-fatal "VIOLATION" messages, and simulator errors are non-fatal too, so
-# count them and fail on any. RISCQ_G4_ALLOW_MODEL_VIOLATIONS=1 turns the model count into a warning (for
-# an investigation run, never for the gate).
-set _viol {}
-set _vlines [regexp -all -inline -line {VIOLATION: .*\n\s*(\S+)} $_txt]
-for {set _i 1} {$_i < [llength $_vlines]} {incr _i 2} { dict incr _viol [lindex $_vlines $_i] }
+# P3b r1: the markers are not the whole transcript: model violations and simulator errors fail the gate too.
+# P3c: the only waiver is the 3.333 ns probe's 1-2 ps tRRD_S/tFAW shortfalls (sim/g4-transcript-verdict.tcl).
 set _nviol [regexp -all -line {VIOLATION:} $_txt]
 set _nerr  [regexp -all -line {^(ERROR|Error|FATAL|Fatal)[: ]} $_txt]
-puts "\[G4\] transcript: $_nviol DDR4-model VIOLATION message(s) [expr {$_nviol ? "by type $_viol" : ""}], $_nerr simulator error line(s)"
-if {$_nerr != 0} { error "G4 FAILED: $_nerr error line(s) in [lindex $_log 0]" }
-if {$_nviol != 0} {
-  if {[info exists ::env(RISCQ_G4_ALLOW_MODEL_VIOLATIONS)] && $::env(RISCQ_G4_ALLOW_MODEL_VIOLATIONS)} {
-    puts "\[G4\] WARN: $_nviol model violation(s) allowed by RISCQ_G4_ALLOW_MODEL_VIOLATIONS"
-  } else {
-    error "G4 FAILED: $_nviol DDR4-model VIOLATION message(s) ($_viol) in [lindex $_log 0]"
-  }
-}
+source [file join [file dirname [file normalize [info script]]] g4-transcript-verdict.tcl]
+set _allow [expr {[info exists ::env(RISCQ_G4_ALLOW_MODEL_VIOLATIONS)] && $::env(RISCQ_G4_ALLOW_MODEL_VIOLATIONS)}]
+set _probe [expr {[info exists ::env(RISCQ_G4_SYSCLK_3333)] && $::env(RISCQ_G4_SYSCLK_3333)}]
+set _gv [g4_transcript_verdict $_txt $_allow $_probe]
+foreach _m [lrange $_gv 1 end] { puts $_m }
+if {[lindex $_gv 0] ne "PASS"} { error "G4 FAILED: [lindex $_gv end] in [lindex $_log 0]" }
 puts "\[G4\] VERDICT: PASS (1 PASS marker, 0 FAIL markers, $_nviol model violations, $_nerr errors in [lindex $_log 0])"

@@ -151,7 +151,11 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
   val ddrURst = ddrRstRaw | rstHold.applied
   val ddrRstInDsp = dspCd(BufferCC(ddrRstRaw, init = True, bufferDepth = 2))
   val holdInDsp   = dspCd(BufferCC(rstHold.applied, init = True, bufferDepth = 2))
-  val dspU = ClockDomain(dspCd.readClockWire, dspRstRaw | ddrRstInDsp | holdInDsp,
+  // P3c: the three reset sources are OR-ed into ONE register, so the dspU reset net starts at a flop (no LUT
+  // between the synchronizers and the ~2k reset pins). One dsp cycle more reset latency, far inside rstHold's
+  // 8-cycle minimum.
+  val dspURst = dspCd(RegNext(dspRstRaw | ddrRstInDsp | holdInDsp) init (True))
+  val dspU = ClockDomain(dspCd.readClockWire, dspURst,
                          config = dspCd.config.copy(resetKind = SYNC, resetActiveLevel = HIGH))
   val ddrU = ClockDomain(ddrCd.readClockWire, ddrURst,
                          config = ddrCd.config.copy(resetKind = SYNC, resetActiveLevel = HIGH))
@@ -219,6 +223,9 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
       when(inj.fire)(injDone := True)
 
       val arb  = StreamArbiterFactory().lowerFirst.noLock.onArgs(real, inj)
+      // (P3c: not forFMax. Its empty/full trackers encode "empty" as a SET msb, so a FIFO that powers up at 0
+      // without a reset -- ReadoutDdrUplinkCdcSim start_dsp_dead_no_reset -- reads as non-empty and pops junk;
+      // the pointer form reads empty from all-zero.)
       val fifo = StreamFifo(Bits(p.wordWidth bits), p.fifoDepth)
       fifo.io.push << arb
       when(fifo.io.push.fire)(acc(i) := acc(i) + 1)
@@ -255,7 +262,10 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     val ovfAny = Reg(Bool()) init False
     ovfAny := ovf.asBits.orR
 
-    val anyPush     = fifos.map(_.fifo.io.push.fire).orR
+    // P3c: `quiet` uses `admit && anyEdge` in place of the OR of the 14 push fires. Equivalent: a result that
+    // is not pushed only because its FIFO is full leaves that FIFO non-empty (anyFifoData), and an injection
+    // push needs injPending, which `quiet` excludes anyway. It takes the FIFO-full term out of the cone.
+    val anyEdge     = fifos.map(_.edge).orR
     val anyFifoData = fifos.map(_.fifo.io.pop.valid).orR
 
     // round-robin poller (data_buffer contract: valid holds until rd_en, pops on rd_en)
@@ -283,33 +293,44 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     val writeFinishedExt = False
     cbuf.io.writeFinishedExt := writeFinishedExt
     // run start: clear accounting, open admission, then ack
-    when(xStart.io.fire) {
+    // P3c: the clear and the admission open one cycle after the crossing's fire (a registered enable for the
+    // ~1k cleared flops); the acknowledge follows one cycle later, as before.
+    val startFire = RegNext(xStart.io.fire, False)
+    when(startFire) {
       // r11-#1: rejPend must be cleared too. At saturation `fire` stays low and credits accumulate, so a
       // BASE_RESET that cleared only `rej` would leak the previous run's pending increments into the next.
       for (i <- 0 until p.numCh) { ovf(i) := False; acc(i) := 0; rej(i) := 0; accSnap(i) := 0; rejPend(i) := 0 }
       ovfSnap := 0; earlyLate := False; skidOvf := False
       admit := True
     }
-    val startDone = RegNext(xStart.io.fire, False)
+    val startDone = RegNext(startFire, False)
     xStart.io.dstDone := startDone
 
     // flush: wait quiet × flushQuiet, then snapshot + commit (closes admission)
-    val quiet    = !anyPush && !anyFifoData && (skid.io.occupancy === 0) && !poller.io.wrEn && !injPending
+    val quiet    = !(admit && anyEdge) && !anyFifoData && (skid.io.occupancy === 0) && !poller.io.wrEn && !injPending
     val flushing = Reg(Bool()) init False
     val quietCnt = Reg(UInt(log2Up(p.flushQuiet + 1) bits)) init 0
     val flushDone = False
     when(xFlush.io.fire) { flushing := True; quietCnt := 0 }
+    // P3c: admission closes at t, the cycle the quiet run completes; the snapshot, the FINAL bank and the
+    // acknowledge follow at t+1 from a registered enable (`snapNow`), so accSnap/ovfSnap load from a flop and
+    // not through the quiet cone. Nothing changes in between: at t there was no push and no FIFO, skid or
+    // poller data, and from t+1 admission is closed, so acc, ovf and the cbuf contents at t+1 equal those at t.
+    val commitNow = flushing && quiet && quietCnt === p.flushQuiet - 1
+    val snapNow   = RegNext(commitNow, False)
     when(flushing) {
       when(quiet)(quietCnt := quietCnt + 1) otherwise (quietCnt := 0)
-      when(quiet && quietCnt === p.flushQuiet - 1) {
+      when(commitNow) {
         admit := False
-        for (i <- 0 until p.numCh) accSnap(i) := acc(i)
-        ovfSnap := ovf.asBits
-        snapToggle := !snapToggle
-        writeFinishedExt := True     // closes the current cbuf bank as the run's FINAL bank
         flushing := False
-        flushDone := True
       }
+    }
+    when(snapNow) {
+      for (i <- 0 until p.numCh) accSnap(i) := acc(i)
+      ovfSnap := ovf.asBits
+      snapToggle := !snapToggle
+      writeFinishedExt := True     // closes the current cbuf bank as the run's FINAL bank
+      flushDone := True
     }
     xFlush.io.dstDone := flushDone
 

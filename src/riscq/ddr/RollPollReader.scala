@@ -45,13 +45,15 @@ case class RollPollReader(numCh: Int, dataWidth: Int, pipelineThreshold: Int = 8
   wrData := 0
   io.wrEn   := wrEn
   io.wrData := wrData
-  io.rdEn   := 0
 
   val pipe = pipelined generate new Area {
     val phase     = Reg(UInt(2 bits)) init 0
     val dvRotR    = Reg(Bits(numCh bits)) init 0
     val pipeIdx   = Reg(UInt(idxW bits)) init 0
     val pipeFound = Reg(Bool()) init False
+    // P3c: the CONSUME-phase pop strobe, registered one-hot (set with pipeIdx at the end of ENCODE, cleared
+    // at the end of CONSUME), so `rdEn` is a plain flop and not a decoder of pipeIdx. Same cycles as before.
+    val rdEnOH    = Reg(Bits(numCh bits)) init 0
 
     // BARREL: bit j of dvRot = dataValid((curIdx + j) mod numCh)
     val dvRot = (io.dataValid ## io.dataValid) >> curIdx
@@ -61,13 +63,14 @@ case class RollPollReader(numCh: Int, dataWidth: Int, pipelineThreshold: Int = 8
     val absSum = curIdx.resize(idxW + 1) + offset
     val selIdx = (absSum >= numCh) ? (absSum - numCh).resize(idxW) | absSum.resize(idxW)
 
-    when(phase === 2 && pipeFound) { io.rdEn := B(1, numCh bits) |<< pipeIdx }
+    io.rdEn := rdEnOH
 
     switch(phase) {
       is(0) { dvRotR := dvRot.resize(numCh); phase := 1 }
-      is(1) { pipeIdx := selIdx; pipeFound := found; phase := 2 }
+      is(1) { pipeIdx := selIdx; pipeFound := found; rdEnOH := found ? (B(1, numCh bits) |<< selIdx) | B(0, numCh bits); phase := 2 }
       is(2) {
         phase := 0
+        rdEnOH := 0
         when(pipeFound) {
           wrEn   := True
           wrData := io.dataIn(pipeIdx)
@@ -85,6 +88,7 @@ case class RollPollReader(numCh: Int, dataWidth: Int, pipelineThreshold: Int = 8
     val offset = OHToUInt(OHMasking.first(rot)).resize(idxW + 1)
     val absSum = curIdx.resize(idxW + 1) + offset
     val selIdx = (absSum >= numCh) ? (absSum - numCh).resize(idxW) | absSum.resize(idxW)
+    io.rdEn := 0
     when(found) {
       io.rdEn := B(1, numCh bits) |<< selIdx
       wrEn    := True

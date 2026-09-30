@@ -1,0 +1,32 @@
+{
+    "name": "lbl-readout-emu-antq",
+    "qubit_num": 2,
+    "dac_num": 16,
+    "adc_num": 16,
+    "dac_map": [
+        [
+            0,
+            1
+        ],
+        [
+            4,
+            8
+        ]
+    ],
+    "adc_map": [
+        13,
+        12
+    ],
+    "mem_depth": 8192,
+    "env_depth": 1024,
+    "rob_depth": 1024,
+    "gate_pulse_num": 32,
+    "gate_interp": 1,
+    "readout_interp": 1,
+    "demod_interp": 1,
+    "link_pipe": 4,
+    "queue_depth": 32,
+    "with_mul": true,
+    "dsp_freq_hz": 500000000.0,
+    "results_path": "antq_uplink"
+}

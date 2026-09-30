@@ -45,6 +45,29 @@ cd vivado-scripts/riscvsoc-bd   && ./build-riscvsoc-bd.sh     # block design, 14
 `RISCQ_QUBITS=3 ./build-*.sh` runs a smaller config for fast iteration. Each subfolder's `README.md`
 documents its full env-knob set, recipe, and the reports it writes.
 
+### Results path: HostWindow or the Ant-Q readout uplink (qubic3)
+
+The config's `results_path` is the only switch (`software/configs/*.json`, `docs/soc/SocSpec.md`). The RTL
+and the block design read it from the same file:
+
+| `results_path` | RTL | block design (HP0) |
+|---|---|---|
+| `hostwindow` (default) | upstream's HostWindow chain, `M_AXI_HOST` | upstream's: `M_AXI_HOST` → HP0, 32-bit, hostClk |
+| `antq_uplink` | `ReadoutDdrUplink` (`m_axi_ddr`, `s_axi_ddr_ctrl`, `m_axis_rd`, `ddrClk`), no HostWindow | DDR4 MIG, `axi_dma` S2MM, `smc_ddr` / `smc_dma` / `smc_ctrl`; `smc_dma` → HP0, 128-bit, MIG ui_clk |
+
+```bash
+cd vivado-scripts/riscvsoc-bd
+RISCQ_CONFIG=software/configs/zcu216-14q-antq.json ./build-riscvsoc-bd.sh
+```
+
+Ready-made `antq_uplink` configs are:
+- `zcu216-14q-antq.json`, the production build with 14 qubits;
+- `lbl-readout-emu-antq.json`, the veneno BPF-loopback bench;
+- `sim-2q-antq.json`, a fast BD/xsim smoke;
+- `sim-dio-antq.json`, the co-sim with DIO.
+
+The old `RISCQ_DDR_READOUT` switch and a `ddr_readout` key are errors.
+
 ## Per-cone timing tracking — `report-cones.tcl`
 
 Both flows classify every failing endpoint of the routed design into the named logic cones of

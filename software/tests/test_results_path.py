@@ -260,3 +260,13 @@ def test_ddr_board_uses_the_shared_shim(monkeypatch):
     monkeypatch.setattr(pynq_compat, "numpy2_pynq_shim", lambda: calls.append(1))
     ddr_board.DdrBoard._numpy2_pynq_shim()
     assert calls == [1]
+
+
+def test_pynq_driver_no_rf_bringup_writes_no_rf_state(fake_board, tmp_path):
+    """g6_ddr_bringup's no-RF board.json (MTS, Nyquist and VOP all off) must construct the driver
+    without touching the RFDC tiles (the P3a Nyquist opt-out, carried onto 8300a1c)."""
+    pd, events = fake_board
+    no_rf = {"mts": None, "dac_nyquist": None, "adc_nyquist": None, "dac_current": {}}
+    drv = pd.PynqDriver("x.xsa", str(_board_cfg(tmp_path, "sim-2q-antq.json")), board=no_rf)
+    assert drv.rfdc.dac_tiles.mock_calls == [] and drv.rfdc.adc_tiles.mock_calls == []
+    assert drv.mts_result is None and drv.host_base is None

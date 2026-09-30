@@ -205,6 +205,16 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     val injDone = False
     when(injDone)(injPending := False)
     xInj.io.dstDone := injDone
+    // P3c: the target is decoded from the capture into registers one cycle later (injHit(i) = injCoreC === i,
+    // injCoreOkR = injCoreC < numCh), and the injection is armed (injLive) one cycle after injPending rises and
+    // falls with it. The per-core inj.valid, the central reject and the counters then read flops, not an 8-bit
+    // compare of injCoreC. `quiet` still uses injPending, which covers the whole window.
+    val injHit     = Vec(Reg(Bool()) init False, p.numCh)
+    val injCoreOkR = Reg(Bool()) init False
+    val injLive    = Reg(Bool()) init False
+    for (i <- 0 until p.numCh) injHit(i) := injCoreC === i
+    injCoreOkR := injCoreC < p.numCh
+    injLive    := injPending && !injDone
 
     // per-core: edge detect → admission → priority arbiter (real > inj) → FIFO
     val fifos = for (i <- 0 until p.numCh) yield new Area {
@@ -218,7 +228,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
       when(real.valid && !real.ready)(ovf(i) := True)                  // exact overflow detection
 
       val inj = Stream(Bits(p.wordWidth bits))
-      inj.valid   := injPending && admit && injCoreC === i
+      inj.valid   := injLive && admit && injHit(i)
       inj.payload := injRealC.asBits ## injImagC.asBits
       when(inj.fire)(injDone := True)
 
@@ -228,16 +238,18 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
       // the pointer form reads empty from all-zero.)
       val fifo = StreamFifo(Bits(p.wordWidth bits), p.fifoDepth)
       fifo.io.push << arb
-      when(fifo.io.push.fire)(acc(i) := acc(i) + 1)
+      // P3c: acc counts each push one cycle later, from a registered strobe, so its CE is a flop and not the
+      // FIFO-full compare. Its one reader, the snapshot, samples it at least flushQuiet cycles after the last push.
+      val pushed = RegNext(fifo.io.push.fire) init (False)
+      when(pushed)(acc(i) := acc(i) + 1)
       // tagged 64-bit DDR word: [63:56]=tag [55:28]=real[31:4] [27:0]=imag[31:4]
       val word = B(i, 8 bits) ## fifo.io.pop.payload(63 downto 36) ## fifo.io.pop.payload(31 downto 4)
     }
     // r08-#4/#5: reject an injection centrally — an out-of-range `inj_core` matches NO per-core arbiter,
     // so without this `injPending` (and therefore `inj_busy` and the flush quiet predicate) hangs forever.
-    val injCoreOk = injCoreC < p.numCh
-    val injReject = injPending && (!admit || !injCoreOk)
+    val injReject = injLive && (!admit || !injCoreOkR)
     when(injReject) { earlyLate := True; injDone := True }
-    for (i <- 0 until p.numCh) rejInj(i) := injReject && injCoreOk && injCoreC === i
+    for (i <- 0 until p.numCh) rejInj(i) := injReject && injCoreOkR && injHit(i)
 
     // r09-#2 / r10-#2: a late real result and a rejected injection can hit the SAME core in the SAME
     // cycle. Two separate `rej := rej + 1` statements let the later one win (undercount), but summing
@@ -245,12 +257,19 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     // most ONE bit change per source cycle. So the extra increment is QUEUED and applied on a later
     // cycle: the counter never advances by more than 1 per cycle and nothing is lost.
     val rejPend = Vec(Reg(UInt(3 bits)) init 0, p.numCh)
+    // P3c: `saturated` is a register equal to (rej === maxValue) at all times: set by the increment that reaches
+    // the maximum, cleared wherever rej is cleared (reset, run start). The rej CE and rejPend then no longer wait
+    // on a 16-bit compare.
+    val rejSat  = Vec(Reg(Bool()) init False, p.numCh)
     for (i <- 0 until p.numCh) {
       val inc   = rejReal(i).asUInt(2 bits) +^ rejInj(i).asUInt(2 bits)        // 0..2 this cycle
       val avail = rejPend(i) +^ inc                                            // 0..9
-      val saturated = rej(i) === rej(i).maxValue
+      val saturated = rejSat(i)
       val fire  = (avail =/= 0) && !saturated
-      when(fire)(rej(i) := rej(i) + 1)
+      when(fire) {
+        rej(i) := rej(i) + 1
+        when(rej(i) === rej(i).maxValue - 1)(rejSat(i) := True)
+      }
       val rest  = avail - fire.asUInt.resized
       // r11-#1: once the counter saturates the queue is meaningless -- drop it rather than hold credits
       // that can never be applied (and would otherwise survive into the next run).
@@ -299,7 +318,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     when(startFire) {
       // r11-#1: rejPend must be cleared too. At saturation `fire` stays low and credits accumulate, so a
       // BASE_RESET that cleared only `rej` would leak the previous run's pending increments into the next.
-      for (i <- 0 until p.numCh) { ovf(i) := False; acc(i) := 0; rej(i) := 0; accSnap(i) := 0; rejPend(i) := 0 }
+      for (i <- 0 until p.numCh) { ovf(i) := False; acc(i) := 0; rej(i) := 0; rejSat(i) := False; accSnap(i) := 0; rejPend(i) := 0 }
       ovfSnap := 0; earlyLate := False; skidOvf := False
       admit := True
     }

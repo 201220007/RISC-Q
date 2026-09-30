@@ -15,4 +15,9 @@ if {[file exists $SCRIPT_DIR/constraints-zcu216.xdc]} {
 if {$WR_BUILD && [file exists $SCRIPT_DIR/constraints-wr.xdc]} {
   add_files -fileset constrs_1 -norecurse $SCRIPT_DIR/constraints-wr.xdc
 }
+# antq_uplink: the MIG ui_clk's asynchronous clock group plus the uplink's CDC max-delay / bus-skew
+# constraints (inc/ddr-timing.xdc; verified on the routed design by inc/ddr-check-cdc.tcl)
+if {$ANTQ_UPLINK} {
+  add_files -fileset constrs_1 -norecurse $INC/ddr-timing.xdc
+}
 update_compile_order -fileset sources_1

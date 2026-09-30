@@ -98,6 +98,9 @@ if {$RUN_IMPL} {
     source $SCRIPT_DIR/../report-cones.tcl
   } _ce]} { puts "\[run\] WARN: report-cones failed: $_ce" }
   puts "\[run\] implementation OK — reports in $BUILD_DIR (util_impl.rpt / timing_impl.rpt / cones_impl.rpt)"
+  # antq_uplink: prove the uplink's clock groups and bus-skew constraints took effect, then the
+  # structural CDC review (report_cdc). Last, so every report above is on disk if it fails the build.
+  if {$ANTQ_UPLINK} { source $INC/ddr-check-cdc.tcl }
   if {$RUN_BITSTREAM} {
     file copy -force $BUILD_DIR/$PRJ.runs/impl_1/${BD_NAME}_wrapper.bit $BUILD_DIR/$TOP_MODULE.bit
     puts "\[run\] bitstream -> $BUILD_DIR/$TOP_MODULE.bit"

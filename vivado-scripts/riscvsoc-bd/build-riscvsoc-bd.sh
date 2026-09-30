@@ -29,6 +29,9 @@
 #   ./build-riscvsoc-bd.sh                    # zcu216-14q config, full floorplan, synth+impl+bitstream+xsa
 #   RISCQ_RUN_BITSTREAM=0 ./build-riscvsoc-bd.sh # stop after impl (no bitstream / xsa)
 #   RISCQ_CONFIG=software/configs/sim-2q.json ./build-riscvsoc-bd.sh # a different SocParams JSON
+#   RISCQ_CONFIG=software/configs/zcu216-14q-antq.json ./build-riscvsoc-bd.sh
+#                                             # results_path antq_uplink: the Ant-Q readout uplink owns HP0
+#                                             # (MIG + axi_dma + SmartConnects) instead of the HostWindow
 #   RISCQ_SKIP_GEN=1   ./build-riscvsoc-bd.sh # reuse the RTL already in the build dir (skip mill)
 #   RISCQ_PROJ_NAME=foo ./build-riscvsoc-bd.sh # build into <repo>/build/foo (parallel designs)
 #
@@ -60,12 +63,16 @@ fi
 # 2) Build via flow-bd.tcl, selecting the floorplan + IP retiming + place directive. RISCQ_PBLOCK
 #    just enables the pre-place hook (any value); RISCQ_PBLOCK_TCL is the actual floorplan file.
 export RISCQ_PROJ_NAME="$PROJ"
+# the Tcl flow reads the results path from the SAME JSON the RTL came from (inc/config.tcl)
+export RISCQ_CONFIG="$(cd "$REPO_DIR" && realpath "$CONFIG")"
 export RISCQ_BUILD_DIR="$BUILD"
 export RISCQ_PBLOCK=1
 export RISCQ_PBLOCK_TCL="$BD_DIR/pblocks-bd.tcl"
 export RISCQ_IP_RETIMING=1
 export RISCQ_PLACE_DIRECTIVE="${RISCQ_PLACE_DIRECTIVE:-ExtraNetDelay_high}"   # route stays AggressiveExplore (run.tcl)
-export RISCQ_RUN_IMPL=1
+# An explicit RISCQ_RUN_IMPL=0 is honoured (with RISCQ_RUN_SYNTH=0 RISCQ_RUN_BITSTREAM=0 it builds only the
+# block design, which is what the BD xsim gates in sim/ need); the default stays implementation.
+export RISCQ_RUN_IMPL="${RISCQ_RUN_IMPL:-1}"
 export RISCQ_RUN_BITSTREAM="${RISCQ_RUN_BITSTREAM:-1}"   # bitstream + XSA (hardware handoff) by default; set 0 for impl-only
 
 echo "[riscvsoc-bd] building block design in $BUILD (floorplan, IP retiming, place=$RISCQ_PLACE_DIRECTIVE / route=AggressiveExplore, bitstream+xsa=$RISCQ_RUN_BITSTREAM) …"

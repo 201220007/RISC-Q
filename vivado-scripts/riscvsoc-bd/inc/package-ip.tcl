@@ -15,6 +15,10 @@
 set fh [open $SOURCE_PATH/PulseTableSoc_ooc.xdc w]
 puts $fh "create_clock -name dspClk -period [format %.3f [expr {1e9 / $DSP_FREQ}]] \[get_ports dspClk\]"
 puts $fh "create_clock -name hostClk -period [format %.3f [expr {1e9 / $HOST_FREQ}]] \[get_ports hostClk\]"
+# antq_uplink: without it the uplink's whole ui_clk domain is untimed in the IP's OOC synthesis
+if {$ANTQ_UPLINK} {
+  puts $fh "create_clock -name ddrClk -period [format %.3f [expr {1e9 / $DDR_FREQ}]] \[get_ports ddrClk\]"
+}
 close $fh
 add_files -fileset constrs_1 $SOURCE_PATH/PulseTableSoc_ooc.xdc
 set_property USED_IN {synthesis implementation out_of_context} [get_files $SOURCE_PATH/PulseTableSoc_ooc.xdc]
@@ -43,9 +47,25 @@ set_property value $DSP_FREQ [ipx::get_bus_parameters FREQ_HZ \
 # bus<->clock associations
 ipx::associate_bus_interfaces -busif S_AXIS -clock hostClk [ipx::current_core]
 ipx::associate_bus_interfaces -busif S_AXIS -clock dspClk -remove [ipx::current_core]
-# the host-window write master (specs/software/22) runs in hostCd, straight into S_AXI_HP0_FPD
-ipx::associate_bus_interfaces -busif M_AXI_HOST -clock hostClk [ipx::current_core]
-ipx::associate_bus_interfaces -busif M_AXI_HOST -clock dspClk -remove [ipx::current_core]
+if {!$ANTQ_UPLINK} {
+  # the host-window write master (specs/software/22) runs in hostCd, straight into S_AXI_HP0_FPD
+  ipx::associate_bus_interfaces -busif M_AXI_HOST -clock hostClk [ipx::current_core]
+  ipx::associate_bus_interfaces -busif M_AXI_HOST -clock dspClk -remove [ipx::current_core]
+} else {
+  # antq_uplink: the three uplink buses live on ddrClk (the MIG ui_clk); there is no M_AXI_HOST
+  ipx::add_bus_parameter FREQ_HZ [ipx::get_bus_interfaces ddrClk -of_objects [ipx::current_core]]
+  set_property value $DDR_FREQ [ipx::get_bus_parameters FREQ_HZ \
+    -of_objects [ipx::get_bus_interfaces ddrClk -of_objects [ipx::current_core]]]
+  foreach b {M_AXI_DDR S_AXI_DDR_CTRL M_AXIS_RD} {
+    ipx::associate_bus_interfaces -busif $b -clock ddrClk [ipx::current_core]
+    foreach other {hostClk dspClk} {
+      catch { ipx::associate_bus_interfaces -busif $b -clock $other -remove [ipx::current_core] }
+    }
+  }
+  ipx::add_bus_parameter POLARITY [ipx::get_bus_interfaces ddrRst -of_objects [ipx::current_core]]
+  set_property value ACTIVE_HIGH [ipx::get_bus_parameters POLARITY \
+    -of_objects [ipx::get_bus_interfaces ddrRst -of_objects [ipx::current_core]]]
+}
 for {set i 0} {$i < 16} {incr i} {
   ipx::associate_bus_interfaces -busif DAC${i}_AXIS -clock dspClk [ipx::current_core]
   ipx::associate_bus_interfaces -busif DAC${i}_AXIS -clock hostClk -remove [ipx::current_core]

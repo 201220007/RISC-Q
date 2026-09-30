@@ -25,6 +25,16 @@ set_property -dict [list CONFIG.FREQ_HZ $HOST_FREQ] [get_bd_pins $CLKIFC/hostClk
 set ZYNQ_PS [create_bd_cell -type ip -vlnv xilinx.com:ip:zynq_ultra_ps_e:3.5 zynq_ps]
 apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e -config {apply_board_preset "1"} \
   [get_bd_cells zynq_ps]
+# antq_uplink: the project has the ZCU216 board part (create-project.tcl), whose PS preset turns
+# M_AXI_HPM0_LPD off and HPM0/HPM1_FPD on. Set the ports this design uses explicitly: HPM0_LPD (the
+# control plane) on, the two FPD masters off (an enabled but unclocked master fails validation).
+if {$ANTQ_UPLINK} {
+  set_property -dict {
+    CONFIG.PSU__USE__M_AXI_GP0 {0}
+    CONFIG.PSU__USE__M_AXI_GP1 {0}
+    CONFIG.PSU__USE__M_AXI_GP2 {1}
+  } $ZYNQ_PS
+}
 connect_bd_net [get_bd_pins zynq_ps/pl_clk0] [get_bd_pins zynq_ps/maxihpm0_lpd_aclk]
 
 # ---- User top IP ----
@@ -50,7 +60,8 @@ source $INC/rfdc-connect.tcl
 # ---- AXI SmartConnect: PS HPM0_LPD -> { top S_AXIS, rfdc s_axi } ----
 set AXI_CONNECT [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smartconnect]
 set_property CONFIG.NUM_SI 1 $AXI_CONNECT
-set_property CONFIG.NUM_MI 2 $AXI_CONNECT
+# antq_uplink: +1 master, feeding the cross-clock smc_ctrl that carries the control plane into ui_clk
+set_property CONFIG.NUM_MI [expr {$ANTQ_UPLINK ? 3 : 2}] $AXI_CONNECT
 set_property CONFIG.NUM_CLKS {2} $AXI_CONNECT
 set_property CONFIG.HAS_ARESETN {0} $AXI_CONNECT
 
@@ -60,10 +71,17 @@ connect_bd_intf_net [get_bd_intf_pins zynq_ps/M_AXI_HPM0_LPD]    [get_bd_intf_pi
 connect_bd_net      [get_bd_pins zynq_ps/pl_clk0]                [get_bd_pins $AXI_CONNECT/aclk]
 connect_bd_net      [get_bd_pins $CLKIFC/hostClk]                [get_bd_pins $AXI_CONNECT/aclk1]
 
+if {$ANTQ_UPLINK} {
+  source $INC/ddr-config.tcl     ;# DDR4 MIG + S2MM DMA + reset stretcher + smc_ddr / smc_dma
+  source $INC/ddr-connect.tcl    ;# ui_clk wiring, reset tree, interfaces, control-plane addresses
+}
+
 assign_bd_address -offset 0x80000000 -range 0x10000000 \
   -target_address_space [get_bd_addr_spaces zynq_ps/Data] [get_bd_addr_segs $TOP/S_AXIS/reg0] -force
 assign_bd_address
 
+# ---- S_AXI_HP0_FPD: exactly one results path owns it (SocSpec results_path) ----
+if {!$ANTQ_UPLINK} {
 # ---- Host window: per-core results -> PS DDR4 over S_AXI_HP0_FPD (specs/software/22 §2.5) ----
 # HP0 owns a DDRC port of its own (HP1/HP2 share one); the width is pinned to 32 so IP Integrator
 # inserts no width converter, and the port is a DIRECT connection, not through the SmartConnect.
@@ -74,6 +92,13 @@ assign_bd_address -target_address_space [get_bd_addr_spaces $TOP/M_AXI_HOST] \
   [get_bd_addr_segs zynq_ps/SAXIGP2/HP0_DDR_LOW] -force
 assign_bd_address -target_address_space [get_bd_addr_spaces $TOP/M_AXI_HOST] \
   [get_bd_addr_segs zynq_ps/SAXIGP2/HP0_DDR_HIGH] -force
+} else {
+# ---- Ant-Q uplink drain: axi_dma S2MM (256-bit) -> smc_dma (down-size) -> S_AXI_HP0_FPD, 128-bit on
+# the MIG ui_clk. The DMA has a 32-bit address port, so it reaches HP0_DDR_LOW only (where the CMA
+# buffer lives); ddr_board.py DA_WIDTH mirrors that. (Enabled + widened in ddr-connect.tcl.)
+assign_bd_address -target_address_space [get_bd_addr_spaces axi_dma_0/Data_S2MM] \
+  [get_bd_addr_segs zynq_ps/SAXIGP2/HP0_DDR_LOW] -force
+}
 
 # ---- White Rabbit GTY pins (with_white_rabbit builds only — the IP then has wr* pins): the GT
 # refclk + serial lanes go straight out as BD ports; constraints-wr.xdc places them (SFP0/X0Y4).

@@ -1,11 +1,17 @@
 # Implementation-run settings, shared by run.tcl (full flow) and trial-impl.tcl (P3c timing trials on a
 # copy of a frozen synthesis parent): one definition, so a trial cannot drift from what the full flow
-# would have done. Requires: impl_1 exists, INC and SCRIPT_DIR set. Reads env RISCQ_PLACE_DIRECTIVE,
+# would have done. Requires: impl_1 exists, INC and SCRIPT_DIR set. Reads env RISCQ_OPT_DIRECTIVE, RISCQ_PLACE_DIRECTIVE,
 # RISCQ_PHYSOPT_DIRECTIVE, RISCQ_POSTROUTE_PHYSOPT_DIRECTIVE, RISCQ_PBLOCK, RISCQ_PBLOCK_TCL.
 set_property strategy Performance_NetDelay_high [get_runs impl_1]
 set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
 set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE Explore [get_runs impl_1]
 set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
+# RISCQ_OPT_DIRECTIVE sets the opt_design directive (upstream runs opt_design without one), e.g.
+# ExploreSequentialArea / ExploreArea to trim registers and LUTs at ~92 % CLB.
+if {[info exists ::env(RISCQ_OPT_DIRECTIVE)]} {
+  set_property STEPS.OPT_DESIGN.ARGS.DIRECTIVE $::env(RISCQ_OPT_DIRECTIVE) [get_runs impl_1]
+  puts "\[run\] opt_design directive: $::env(RISCQ_OPT_DIRECTIVE)"
+}
 # RISCQ_PLACE_DIRECTIVE overrides the placer directive (e.g. AltSpreadLogic_high) to relieve the
 # RF-DAC edge congestion — placement, not routing, is the binder.
 if {[info exists ::env(RISCQ_PLACE_DIRECTIVE)]} {

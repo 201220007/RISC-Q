@@ -97,7 +97,15 @@ if {$confine == 2} {
 } elseif {$confine == 1} {
   # global form: the whole floating datapath into one X1Y0:X5Y7 block (wrGtyPhy excluded — see above).
   set pbd [create_pblock pb_datapath]
-  set dpCells [get_cells -hierarchical -filter "PRIMITIVE_LEVEL == LEAF && NAME =~ ${base}/* && NAME !~ ${base}/*_riscvSoc/* && NAME !~ ${base}/wrGtyPhy_1/*"]
+  # P3c: RISCQ_UPLINK_DDR_FLOAT=1 leaves the Ant-Q uplink's MIG-side half (its ui_clk `ddr_*` area: writer,
+  # drain engine, register file) out of the datapath block, so it can sit next to the MIG, the DMA and the
+  # SmartConnects (BD siblings that already float). No such cells exist in a hostwindow build.
+  set dpExtra ""
+  if {[info exists ::env(RISCQ_UPLINK_DDR_FLOAT)] && $::env(RISCQ_UPLINK_DDR_FLOAT)} {
+    set dpExtra " && NAME !~ ${base}/ddrUplink_up/ddr_*"
+    puts "\[riscvsoc-bd\] RISCQ_UPLINK_DDR_FLOAT: [llength [get_cells -quiet -hierarchical -filter "PRIMITIVE_LEVEL == LEAF && NAME =~ ${base}/ddrUplink_up/ddr_*"]] uplink ui_clk cells float (not in pb_datapath)"
+  }
+  set dpCells [get_cells -hierarchical -filter "PRIMITIVE_LEVEL == LEAF && NAME =~ ${base}/* && NAME !~ ${base}/*_riscvSoc/* && NAME !~ ${base}/wrGtyPhy_1/*${dpExtra}"]
   add_cells_to_pblock -quiet $pbd $dpCells
   resize_pblock $pbd -add CLOCKREGION_X1Y0:CLOCKREGION_X5Y7
   set_property IS_SOFT FALSE $pbd

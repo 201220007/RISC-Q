@@ -64,9 +64,9 @@ if {$RUN_SYNTH} {
     set _fh [open $_rl r]; set _rt [read $_fh]; close $_fh
     if {![regexp {Command: synth_design} $_rt]} continue
     incr _nran
-    if {![regexp "general.maxThreads = $_want_thr\M" $_rt]} { lappend _nothr $_r }
+    if {![regexp "general.maxThreads = $_want_thr\\M" $_rt]} { lappend _nothr $_r }
     if {[info exists ::env(RISCQ_CSET_THRESH)] && [string match *_top_* $_r]} {
-      if {![regexp "Command: synth_design .*-control_set_opt_threshold $::env(RISCQ_CSET_THRESH)\M" $_rt]} {
+      if {![regexp "Command: synth_design .*-control_set_opt_threshold $::env(RISCQ_CSET_THRESH)\\M" $_rt]} {
         error "RISCQ_CSET_THRESH=$::env(RISCQ_CSET_THRESH) is not on $_r's synth_design command ($_rl)"
       }
       puts "\[run\] verified: $_r ran synth_design -control_set_opt_threshold $::env(RISCQ_CSET_THRESH)"

@@ -55,6 +55,9 @@ case class RiscvSoc(
     useUram: Boolean = true,
     putAddrWidth: Int = SocSpecMap.putAddrWidth,   // the put window (specs/cross-core/02 §3.2)
     hostWinAddrWidth: Int = 24,   // per-core host window (24 ⇒ 16 MB) at `RiscvSoc.hostWinBase`
+    // the HostWindow bridge and its `hostCmd` port; off in an `antq_uplink` build (SocSpec.resultsPath),
+    // where a store to the window decodes to nothing (software refuses such programs up front)
+    withHostWindow: Boolean = true,
     // the up-link's core-local sinks (specs/universal-control/01 §2.4), from the core's EventPlan;
     // the default is the qubit build's single readout-result sink at 0x4200 plus the cross-core inbox
     // registers (board / release / signal mailboxes, specs/cross-core/02 §3.3).
@@ -72,7 +75,7 @@ case class RiscvSoc(
   val time     = in  port UInt(timeWidth bits)        // shared batch-time broadcast
   val cmd      = master port Flow(Put(putAddrWidth)) // posted writes (PutBridge) → DSP
   val resultIn = slave  port Flow(Put(EventLink.inboxAddrWidth)) // the up-link: puts into the inbox (sinks)
-  val hostCmd  = master port Stream(HostCmd(hostWinAddrWidth))    // posted result writes → host window
+  val hostCmd  = withHostWindow generate (master port Stream(HostCmd(hostWinAddrWidth)))  // posted result writes → host window
   val done     = out port Bool()                     // run-completion flag (specs/software/23) → host
 
   def getPipe[T <: Data](data: T, cycles: Int): T = {
@@ -167,9 +170,11 @@ case class RiscvSoc(
     // write-only host window (specs/software/22): results leave the core here instead of piling up in
     // the 16 KB I+D RAM. Unlike the RF bridge this one is a Stream — the far side (a CC FIFO, then DDR)
     // can stall, and the bridge then withholds the AccessAck so the store back-pressures the CPU.
-    val hostWindow = HostWindowBridge(hostWinAddrWidth)
-    hostWindow.up at SizeMapping(RiscvSoc.hostWinBase, BigInt(1) << hostWinAddrWidth) of dMemPortDec
-    hostWindow.up.setUpConnection(a = StreamPipe.FULL, d = StreamPipe.FULL)
+    val hostWindow = withHostWindow generate HostWindowBridge(hostWinAddrWidth)
+    if (withHostWindow) {
+      hostWindow.up at SizeMapping(RiscvSoc.hostWinBase, BigInt(1) << hostWinAddrWidth) of dMemPortDec
+      hostWindow.up.setUpConnection(a = StreamPipe.FULL, d = StreamPipe.FULL)
+    }
 
     // one sink per reporting channel, by kind: the readout result keeps its latched-level contract,
     // edge-like reports get a consume-on-read FIFO with a sequence number and the cause time.
@@ -192,7 +197,7 @@ case class RiscvSoc(
   } }
 
   cmd     << posted.bridge.cmd                      // posted writes leave for the DSP datapath
-  hostCmd << posted.hostWindow.cmd                  // posted result writes leave for the host funnel
+  if (withHostWindow) hostCmd << posted.hostWindow.cmd   // posted result writes leave for the host funnel
 
   // finish the control block: add the local result-sink read map, then connect the bus.
   posted.sinkAreas.foreach {                          // sink k at 0x4200 + 0x20·k (local reads)

@@ -6,7 +6,8 @@ import spinal.core.fiber.Fiber
 import spinal.lib._
 import spinal.lib.bus.tilelink
 import spinal.lib.bus.tilelink.fabric.{Node, MasterBus, WidthAdapter}
-import spinal.lib.bus.amba4.axi.Axi4ToTilelinkFiber
+import spinal.lib.bus.amba4.axi.{Axi4, Axi4ToTilelinkFiber}
+import riscq.misc.{Axi4VivadoHelper, VivadoClkHelper}
 import spinal.lib.bus.misc.SizeMapping
 import riscq.dsp.{AdderTree, ComplexBatch}
 import riscq.riscv.RiscqParam
@@ -61,7 +62,7 @@ class PulseTableSoc(
     // host window (specs/software/22): the PS physical address width.
     val hostMemAddrWidth: Int = 40,
 ) extends Zcu216Top(dacNum = spec.dacNum, adcNum = spec.adcNum, dacBatch = 16, adcBatch = 4, dataWidth = 16, vivado = vivado,
-                    dio = PulseTableSoc.dioNames(spec)) {
+                    dio = PulseTableSoc.dioNames(spec), withHostMem = spec.withHostWindow) {
   // Every per-SoC parameter comes from the spec (universal-control/01 P1): the cores' channel lists,
   // converter ids and memory sizes from their CoreSpecs; the link depth, host-window width, readout
   // trace depth and the RFDC-edge ADC pipe (specs/dsp-fmax.md C2) from the SoC fields.
@@ -74,6 +75,9 @@ class PulseTableSoc(
   val adcPipe          = spec.adcPipe
   val withWhiteRabbit  = spec.withWhiteRabbit   // White Rabbit node window + phy ports (specs/white-rabbit/06)
   val wrMarkerDac      = spec.wrMarkerDac       // spare DAC carrying the sync marker (white-rabbit/09)
+  // the results path (qubic3 plan v2 §0.2): exactly one of the two is built and owns S_AXI_HP0_FPD
+  val withHostWindow   = spec.withHostWindow    // HostWindow bridge + CC FIFO + funnel + M_AXI_HOST
+  val withAntqUplink   = spec.withAntqUplink    // readout -> PL DDR4 -> PS uplink (riscq.ddr)
   val N        = 16    // DAC drive batch
   val adcBatch = 4
   val w        = 16
@@ -173,7 +177,7 @@ class PulseTableSoc(
       RiscqRfWithPulseTableFiber(
         spec = core, plugins = cp(core).plugins(), dspCd = dspCd, hostCd = hostCd, riscqCd = riscqCd,
         time = coreTimes(i), batchSize = N, dataWidth = w, adcBatch = adcBatch,
-        linkPipe = linkPipe, hostWinAddrWidth = hostWinAddrWidth,
+        linkPipe = linkPipe, hostWinAddrWidth = hostWinAddrWidth, withHostWindow = withHostWindow,
         withTestTap = withTest) }
 
     // floorplan: keep each core's RiscvSoc a hard synth boundary so opt can't merge logic across the
@@ -303,9 +307,12 @@ class PulseTableSoc(
 
   // ── host window: every core's posted result stream → one write-only AXI master → PS DDR4 ──
   // hostCd logic, outside every core's hard band; `io.hostMem` goes to `S_AXI_HP0_FPD`.
-  val hostWindow = HostWindowFunnel(qubitNum, hostWinAddrWidth, hostMemAddrWidth)
-  for ((core, i) <- riscqArea.riscqCores.zipWithIndex) hostWindow.io.cmd(i) << core.hostCmd
-  io.hostMem << hostWindow.io.axi
+  // (hostwindow builds only: an antq_uplink build has no funnel, no bridge and no CC FIFO)
+  val hostWindow = withHostWindow generate HostWindowFunnel(qubitNum, hostWinAddrWidth, hostMemAddrWidth)
+  if (withHostWindow) {
+    for ((core, i) <- riscqArea.riscqCores.zipWithIndex) hostWindow.io.cmd(i) << core.hostCmd
+    io.hostMem << hostWindow.io.axi
+  }
 
   // ── host control block (host clock domain) ──
   val riscqResetHostCd = Bool()
@@ -323,11 +330,13 @@ class PulseTableSoc(
   // `enable` powers up LOW so a core storing to the window before the host has programmed `base` stalls
   // visibly instead of writing DDR address 0 (the kernel's memory). `setup` writes both words while
   // `riscqReset` is asserted, so the funnel is idle when the 40-bit address changes — no torn base.
-  val hostWinBaseLo = Reg(UInt(32 bits)) init 0
-  val hostWinBaseHi = Reg(UInt(hostMemAddrWidth - 32 bits)) init 0
-  val hostWinEnable = Reg(Bool()) init False
-  hostWindow.io.base   := hostWinBaseHi @@ hostWinBaseLo
-  hostWindow.io.enable := hostWinEnable
+  val hostWinBaseLo = withHostWindow generate (Reg(UInt(32 bits)) init 0)
+  val hostWinBaseHi = withHostWindow generate (Reg(UInt(hostMemAddrWidth - 32 bits)) init 0)
+  val hostWinEnable = withHostWindow generate (Reg(Bool()) init False)
+  if (withHostWindow) {
+    hostWindow.io.base   := hostWinBaseHi @@ hostWinBaseLo
+    hostWindow.io.enable := hostWinEnable
+  }
 
   // Run-completion flags (specs/software/23), one bit per core: each core's sticky `done` level is
   // crossed into `hostCd` and packed into one read-only word, so `poll_done` reads ONE address for the
@@ -341,15 +350,72 @@ class PulseTableSoc(
   for ((core, i) <- riscqArea.riscqCores.zipWithIndex) doneHostCd(i) := BufferCC(core.done, False)
   val hubMismatchHostCd = BufferCC(riscqArea.hub.countMismatch, False)   // sticky until riscqReset
 
+  // ── qubic3 Ant-Q readout uplink (antq_uplink builds only) ──
+  // Each core's decoder result, as its LEVEL-valued `ReadoutResultLink.source` in dspCd (never the
+  // EventLink puts, which carry both valid edges), goes through the uplink into PL DDR4 (`M_AXI_DDR` ->
+  // smc_ddr -> the MIG); the drain streams out on `M_AXIS_RD` -> axi_dma S2MM -> smc_dma -> HP0. The
+  // control block is `S_AXI_DDR_CTRL` (PS 0x9000_0000). `ddrClk` is the MIG ui_clk, `ddrRst` its
+  // psr_ddr peripheral_reset (vivado-scripts/riscvsoc-bd/inc/ddr-connect.tcl). The uplink's own
+  // reset is independent of `riscqReset`: `rerun()` re-asserts the core reset right after DONE, and
+  // the run's flush / snapshot / drain happen after that (plan v2 r2 #10).
+  //
+  // ui_clk is 333.25 MHz on this board (300 MHz sysclk, CLKOUT0_DIVIDE 3); a mismatched FREQ_HZ fails
+  // validate_bd_design. Mirrored by DDR_FREQ in vivado-scripts/riscvsoc-bd/inc/config.tcl.
+  def DdrClkFreqHz: Long = 333250000L
+  val ddrUplink = withAntqUplink generate new Area {
+    val ddrClk = in Bool()
+    val ddrRst = in Bool()
+    ddrClk.setName("ddrClk"); ddrRst.setName("ddrRst")
+    val ddrCd  = ClockDomain(ddrClk, ddrRst)
+    val p      = riscq.ddr.ReadoutDdrUplinkParams(numCh = qubitNum, accWidth = SocSpec.readoutAccWidth)
+    // the MIG's c0_init_calib_complete: without it a failed calibration looks like a wedged uplink
+    // (an AXI transaction that never returns). Published below in the host-domain status word.
+    val calibDone = in Bool();  calibDone.setName("ddrCalibDone")
+    val ctrl   = slave(Axi4(p.ctrlAxiConfig));  ctrl.setName("s_axi_ddr_ctrl")
+    val ddr    = master(Axi4(p.ddrAxiConfig));  ddr.setName("m_axi_ddr")
+    val rd     = master(Stream(Fragment(Bits(p.axiDataWidth bits)))); rd.setName("m_axis_rd")
+
+    val up = ddrCd(riscq.ddr.ReadoutDdrUplink(p, dspCd))
+    up.io.calibDone := calibDone
+    for ((core, i) <- riscqArea.riscqCores.zipWithIndex) up.io.results(i) << dspCd(core.readoutResult)
+    up.io.ctrl << ctrl
+    ddr << up.io.ddr
+    rd  << up.io.rd
+
+    if (vivado) {
+      VivadoClkHelper.addInference(ddrClk, ddrRst, DdrClkFreqHz)
+      Axi4VivadoHelper.addInference(ddr,  "M_AXI_DDR")
+      Axi4VivadoHelper.addInference(ctrl, "S_AXI_DDR_CTRL")
+      // a Stream[Fragment]: tag the members, or the generic helper gives `last` both TDATA and TLAST
+      def axis(d: Data, sig: String): Unit =
+        d.addAttribute("X_INTERFACE_INFO", s"xilinx.com:interface:axis:1.0 M_AXIS_RD $sig")
+      axis(rd.valid, "TVALID"); axis(rd.ready, "TREADY")
+      axis(rd.fragment, "TDATA"); axis(rd.last, "TLAST")
+    }
+  }
+  // HOST_DDR_STATUS (0x58), in hostCd, whose reset tree is independent of the DDR one, so it answers
+  // even when the whole ui_clk side is dead (the case it exists to diagnose):
+  //   [31:16] magic 0xCA1B (an older / hostwindow bitstream reads 0 here: capability absent)
+  //   [1]     ui_reset_released (psr_ddr let go)    [0] calib_done (MIG c0_init_calib_complete)
+  // 0x5C is reserved for the future host STOP word: no logic, it reads 0 and ignores writes.
+  val ddrStatusHost = withAntqUplink generate new Area {
+    val calib = BufferCC(ddrUplink.calibDone, init = False, bufferDepth = 3)
+    val rstOk = BufferCC(!ddrUplink.ddrRst,   init = False, bufferDepth = 3)
+    val word  = B(0xCA1B, 16 bits) ## B(0, 14 bits) ## rstOk ## calib
+  }
+
   val hostCtrlDriver = MemMapDriverFiber(addressWidth = 10, dataWidth = 32, driveProc = { factory =>
     factory.drive(riscqResetHostCd, 0)
     factory.read(doneHostCd, 0x50)                     // DONE: bit i = core i has finished
     factory.read(hubMismatchHostCd, 0x54)              // HUB_STATUS: bit 0 = a barrier's counts disagreed
     factory.write(timeOffset(0, 32 bits), 64)
     factory.write(timeOffset(32, 32 bits), 68)
-    factory.write(hostWinBaseLo, 72)                        // HOSTWIN_BASE_LO = base[31:0]
-    factory.write(hostWinBaseHi, 76, 0)                     // HOSTWIN_BASE_HI[7:0]  = base[39:32]
-    factory.write(hostWinEnable, 76, 31)                    // HOSTWIN_BASE_HI[31]   = enable
+    if (withHostWindow) {
+      factory.write(hostWinBaseLo, 72)                      // HOSTWIN_BASE_LO = base[31:0]
+      factory.write(hostWinBaseHi, 76, 0)                   // HOSTWIN_BASE_HI[7:0]  = base[39:32]
+      factory.write(hostWinEnable, 76, 31)                  // HOSTWIN_BASE_HI[31]   = enable
+    }
+    if (withAntqUplink) factory.read(ddrStatusHost.word, 0x58)   // HOST_DDR_STATUS (see ddrStatusHost)
   })
   hostCtrlDriver.up.setUpConnection(a = StreamPipe.FULL, d = StreamPipe.FULL)
   hostCtrlDriver.up at SizeMapping(map.hostCtrlBase, map.regionSize) of hostBus

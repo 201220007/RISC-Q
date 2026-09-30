@@ -16,3 +16,7 @@ ext/VexiiRiscv
 BASIC_MISTAKES.md
 /src/scratch
 .Xil/
+# qubic3 uplink: cocotb build outputs
+src/riscq/ddr/cocotb/**/results.xml
+src/riscq/ddr/cocotb/**/sim_build/
+__pycache__/

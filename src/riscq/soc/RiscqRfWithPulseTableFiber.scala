@@ -13,7 +13,7 @@ import riscq.riscv.RiscqParam
 import riscq.soc.fabric.BramWriteFiber
 import riscq.soc.rf.{Channel, PulseDriveChannel, DemodChannel}
 import riscq.soc.dio.TimedDio
-import riscq.soc.link.{PutLink, EventLink, EventPlan, EventSource, Put, HostCmd}
+import riscq.soc.link.{PutLink, EventLink, EventPlan, EventSource, Put, HostCmd, ReadoutResult, ReadoutResultLink}
 import riscq.soc.spec.SocSpecMap
 import riscq.soc.spec.{ChannelSpec, CoreSpec, SocSpecMap}
 
@@ -66,6 +66,7 @@ case class RiscqRfWithPulseTableFiber(
     hostWinAddrWidth: Int = 24,   // per-core host window (24 ⇒ 16 MB)
     hostWinFifoDepth: Int = 16,   // CC FIFO depth: a shot tail is 2-3 words, so every core can finish
                                   // a shot at once without stalling
+    withHostWindow: Boolean = true, // the HostWindow bridge + CC FIFO (off in an `antq_uplink` build)
     withTestTap: Boolean = false,
     hubQueueDepth: Int = 16       // ≥ the cores on the board: a same-cycle burst of hub beats never drops
 ) extends Area {
@@ -85,7 +86,7 @@ case class RiscqRfWithPulseTableFiber(
     plugins = plugins, riscqCd = riscqCd,
     timeWidth = timeWidth, readoutAccWidth = readoutAccWidth, memDepth = memDepth, memWidth = memWidth,
     memOutReg = memOutReg, putAddrWidth = putAddrWidth, hostWinAddrWidth = hostWinAddrWidth,
-    sinks = eventPlan.allSinks, withTestTap = withTestTap)
+    withHostWindow = withHostWindow, sinks = eventPlan.allSinks, withTestTap = withTestTap)
 
   /** The hub's puts for this core (already gated by its mask bit and piped by the parent), merged onto
     * the up-link with the channels' reports. The SoC top drives it. */
@@ -124,9 +125,9 @@ case class RiscqRfWithPulseTableFiber(
   // Stream feeds it directly, and a reset mid-run simply drops `valid` — beats are atomic, so nothing
   // is torn; whatever was already accepted drains to the same addresses (the base is allocated once per
   // session), which is idempotent.
-  val hostWinFifo = StreamFifoCC(HostCmd(hostWinAddrWidth), hostWinFifoDepth, dspCd, hostCd)
-  hostWinFifo.io.push << riscvSoc.hostCmd
-  val hostCmd = hostWinFifo.io.pop
+  val hostWinFifo = withHostWindow generate StreamFifoCC(HostCmd(hostWinAddrWidth), hostWinFifoDepth, dspCd, hostCd)
+  if (withHostWindow) hostWinFifo.io.push << riscvSoc.hostCmd
+  val hostCmd = if (withHostWindow) hostWinFifo.io.pop else null
 
   // run-completion flag (specs/software/23): a plain level out of the core, crossed to `hostCd` by the
   // toplevel's BufferCC alongside the other host-control registers. Nothing to buffer — it is sticky
@@ -240,6 +241,13 @@ case class RiscqRfWithPulseTableFiber(
   val tracePulses: Seq[Flow[Vec[Complex]]] =
     spec.channels.zip(posted.channels).collect { case (s, c) if s.trace => c.dacOut.get }
   val decoderRd      = posted.decoder
+  /** The decoder's result as a LEVEL-valued `Flow` in dspCd (`ReadoutResultLink.source`: valid high from
+    * a window's settle until the next window's start) — the Ant-Q uplink's tap (qubic3 plan v2 r2 #8).
+    * It is NOT the EventLink up-link, whose puts carry both valid edges and would be miscounted. Built
+    * only when called, so a `hostwindow` build, which never calls it, has no extra signal. */
+  def readoutResult: Flow[ReadoutResult] = ReadoutResultLink.source(
+    posted.decoder.io.res.valid, posted.decoder.io.res.payload, posted.decoder.io.real, posted.decoder.io.imag,
+    readoutAccWidth)
   // qubit-build conveniences (the sims observe them); absent channels raise at elaboration
   def gatePulse      = channel("gate").dacOut.get
   def readoutPulse   = channel("ro").dacOut.get

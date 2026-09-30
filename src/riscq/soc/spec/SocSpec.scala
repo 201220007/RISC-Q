@@ -67,8 +67,15 @@ case class SocSpec(
     withWhiteRabbit: Boolean = false,     // White Rabbit node window + phy ports (specs/white-rabbit/06)
     wrMarkerDac: Option[Int] = None,      // spare DAC carrying the sync marker (white-rabbit/09)
     board: Int = 0,                       // this board's id in the system (0 = the barrier root)
-    boards: Int = 1                       // boards in the system (> 1 needs the WR lane: cross-core/02 §5)
+    boards: Int = 1,                      // boards in the system (> 1 needs the WR lane: cross-core/02 §5)
+    // The results path, chosen when the bitfile is built (qubic3 plan v2 §0.2): exactly one is built
+    // and it owns S_AXI_HP0_FPD. `hostwindow` is upstream's HostWindow (the default; its RTL is
+    // unchanged by this field); `antq_uplink` builds the readout -> PL DDR4 -> PS uplink
+    // (riscq.ddr.ReadoutDdrUplink) and no HostWindow chain at all.
+    resultsPath: String = SocSpec.HostWindow
 ) {
+  require(SocSpec.resultsPaths.contains(resultsPath),
+    s"results_path '$resultsPath' is not one of ${SocSpec.resultsPaths.mkString("{", ", ", "}")}")
   require(0 <= board && board < boards && boards <= 16, s"board $board of $boards")
   require(boards == 1 || withWhiteRabbit, "a multi-board system carries its puts on the White Rabbit lane")
   require(wrMarkerDac.forall(d => withWhiteRabbit && d >= 0 && d < dacNum),
@@ -81,6 +88,10 @@ case class SocSpec(
   }
 
   def qubitNum: Int = cores.length
+  /** The HostWindow chain (bridge, CC FIFO, funnel, `M_AXI_HOST`) is built. */
+  def withHostWindow: Boolean = resultsPath == SocSpec.HostWindow
+  /** The Ant-Q readout uplink (`M_AXI_DDR` / `S_AXI_DDR_CTRL` / `M_AXIS_RD`) is built. */
+  def withAntqUplink: Boolean = resultsPath == SocSpec.AntqUplink
   def maxChannels: Int = cores.map(_.channels.length).max
 
   // ── legacy uniform views (what PulseTableSoc still takes; P1 makes the SoC read the lists) ──
@@ -134,13 +145,32 @@ object SocSpec {
   private val fixed = Map("batch_size" -> batchSize, "adc_batch" -> adcBatch, "data_width" -> dataWidth,
     "readout_max_win_log2" -> readoutMaxWinLog2, "readout_acc_width" -> readoutAccWidth)
 
+  // the results-path values (`results_path` in the JSON; python riscq.spec.RESULTS_PATHS)
+  val HostWindow = "hostwindow"
+  val AntqUplink = "antq_uplink"
+  val resultsPaths: Seq[String] = Seq(HostWindow, AntqUplink)
+
   def load(path: String): SocSpec = fromJson(scala.io.Source.fromFile(path).mkString)
 
   def fromJson(text: String): SocSpec = {
     val cfg = ujson.read(text)
     for ((key, value) <- fixed if cfg.obj.contains(key))
       require(cfg(key).num.toInt == value, s"$key is fixed by architecture at $value, got ${cfg(key).num.toInt}")
+    // the pre-SocSpec uplink switch: a config that still carries it must not build silently without
+    // the uplink (this loader ignores unknown keys), so it is an error that names the replacement
+    require(!cfg.obj.contains("ddr_readout"),
+      "the `ddr_readout` key is gone: select the results path with `\"results_path\": \"antq_uplink\"` " +
+      "(or \"hostwindow\", the default)")
     if (cfg.obj.contains("cores")) fromChannelList(cfg.obj) else fromLegacy(cfg.obj)
+  }
+
+  /** `results_path`: absent means the default; anything but one of [[resultsPaths]] is an error. */
+  private def resultsPathOf(o: collection.Map[String, ujson.Value]): String = o.get("results_path") match {
+    case None => HostWindow
+    case Some(ujson.Str(v)) =>
+      require(resultsPaths.contains(v), s"results_path '$v' is not one of ${resultsPaths.mkString("{", ", ", "}")}")
+      v
+    case Some(v) => throw new IllegalArgumentException(s"results_path must be a string, got $v")
   }
 
   private def intOr(o: collection.Map[String, ujson.Value], key: String, default: Int): Int =
@@ -171,7 +201,7 @@ object SocSpec {
     SocSpec(o("name").str, o("dsp_freq_hz").num, intOr(o, "dac_num", 16), intOr(o, "adc_num", 16),
       intOr(o, "link_pipe", 4), intOr(o, "hostwin_bits", 24), intOr(o, "rob_depth", 1024),
       intOr(o, "adc_pipe", 3), cores, boolOr(o, "with_white_rabbit", false), optInt(o, "wr_marker_dac"),
-      intOr(o, "board", 0), intOr(o, "boards", 1))
+      intOr(o, "board", 0), intOr(o, "boards", 1), resultsPathOf(o))
   }
 
   /** The SocParams form: `qubit_num` identical qubit cores of gate / ro / demod channels (the python
@@ -195,7 +225,7 @@ object SocSpec {
     SocSpec(o("name").str, o("dsp_freq_hz").num, o("dac_num").num.toInt, o("adc_num").num.toInt,
       o("link_pipe").num.toInt, intOr(o, "hostwin_bits", 24), intOr(o, "rob_depth", 1024),
       intOr(o, "adc_pipe", 3), cores, boolOr(o, "with_white_rabbit", false), optInt(o, "wr_marker_dac"),
-      intOr(o, "board", 0), intOr(o, "boards", 1))
+      intOr(o, "board", 0), intOr(o, "boards", 1), resultsPathOf(o))
   }
 }
 
@@ -253,6 +283,10 @@ case class SocSpecMap(spec: SocSpec) {
   val hostCtrlBase = (2 + nSlots) * regionSize
   val wrBase = (3 + nSlots) * regionSize        // White Rabbit node window (withWhiteRabbit builds)
 
+  /** The host control block's extent. `antq_uplink` adds the DDR status word at 0x58 and reserves 0x5C
+   *  for the future STOP word (python `SocMap.HOST_DDR_STATUS` / `HOST_STOP`). */
+  val hostCtrlBytes: Int = if (spec.withAntqUplink) 0x60 else 0x54
+
   def coreMemOffset(core: Int): Int = coreMemBase + core * coreStride
   def envOffset(core: Int, j: Int): Int = {
     require(j < spec.cores(core).channels.length, s"core $core has no channel $j")
@@ -275,7 +309,7 @@ case class SocSpecMap(spec: SocSpec) {
         c.channels.zipWithIndex.filter(_._1.envBytes > 0).map { case (ch, j) =>
           (s"core${i}_${ch.name}_env", envOffset(i, j), ch.envBytes, s"env_${ch.name}") }
     }
-    perCore ++ Seq(("robs", robBase, robBytes, "robs_ro"), ("host_ctrl", hostCtrlBase, 0x54, "ctrl_wo"))
+    perCore ++ Seq(("robs", robBase, robBytes, "robs_ro"), ("host_ctrl", hostCtrlBase, hostCtrlBytes, "ctrl_wo"))
   }
 }
 
@@ -300,6 +334,7 @@ object PrintSocMap extends App {
         "slots" -> ch.slots, "samples_per_line" -> ch.samplesPerLine, "line_bytes" -> ch.lineBytes,
         "dac" -> optNum(ch.dac), "adc" -> optNum(ch.adc)) }: _*) }: _*),
     "put_addr_width" -> ujson.Arr(spec.cores.indices.map(i => ujson.Num(m.putAddrWidth(i))): _*),
-    "dac_pipe" -> m.dacPipe)
+    "dac_pipe" -> m.dacPipe,
+    "results_path" -> spec.resultsPath)
   println(ujson.write(out))
 }

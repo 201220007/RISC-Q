@@ -20,13 +20,27 @@ this gate is the plumbing, not the DSP (G3 already proved decoder ⇄ DDR equiva
 base_reset → 12 × inj_fire → flush → arm S2MM DMA → rd_start → read PS memory → byte-exact compare
 ```
 
+P3b (the 8300a1c port, results_path `antq_uplink`) adds four phases to the same testbench, each one
+printing `[G4] ok-<phase>:` before the single final `[G4] PASS:`:
+
+| phase | stimulus | pass condition |
+|---|---|---|
+| B | `force` SLVERR, then DECERR, on the MIG's write response (`smc_ddr_M00_AXI_BRESP`) during a flush | STATUS `bresp_err` = 1, a fatal bit: the run is refused |
+| R | the same on the read response (`smc_ddr_M00_AXI_RRESP`) during a drain | the DMA completes, STATUS `rresp_err` = 1: refused |
+| C | `force` the DSP-domain reset (`dsp_rst_peripheral_reset`) for 1 µs mid-run | `run_active` = 0 and the run fails the certification; the next run is byte-exact |
+| D | the same reset while a 32-beat drain is streaming | no TLAST, the S2MM never completes; after the `ddr_board` timeout, the S2MM soft reset clears and the next drain on that channel is byte-exact |
+
+On this BD the drain reaches HP0 through `smc_dma` at 128 bits on the MIG ui_clk (HP0 belongs to the
+uplink in `antq_uplink` mode; in `hostwindow` mode it is upstream's 32-bit `M_AXI_HOST`).
+
 ## Running
 
 ```bash
-# 1. build a feature-on BD (once)
+# 1. build an antq_uplink BD (once). results_path in the config selects the uplink; BD only, no synthesis
 cd vivado-scripts/riscvsoc-bd
-RISCQ_DDR_READOUT=1 RISCQ_CONFIG=../../software/configs/sim-2q-ddr.json \
-  RISCQ_PROJ_NAME=ddr-bd-smoke RISCQ_RUN_BITSTREAM=0 ./build-riscvsoc-bd.sh
+RISCQ_CONFIG=$PWD/../../software/configs/sim-2q-antq.json RISCQ_PROJ_NAME=ddr-bd-smoke \
+  RISCQ_RUN_SYNTH=0 RISCQ_RUN_IMPL=0 RISCQ_RUN_BITSTREAM=0 ./build-riscvsoc-bd.sh
+vivado -mode batch -source sim/gen-ddr4-model.tcl -tclargs ../../build/ddr-bd-smoke
 
 # 2. simulate it
 vivado -mode batch -source sim/run-sim-bd.tcl -tclargs ../../build/ddr-bd-smoke

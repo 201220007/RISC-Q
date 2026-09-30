@@ -3,8 +3,8 @@
 #
 #   vivado -mode batch -source run-sim-bd.tcl -tclargs <build_dir>
 #
-# <build_dir> is a folder produced by build-riscvsoc-bd.sh with RISCQ_DDR_READOUT=1 and a *-ddr.json
-# config (e.g. <repo>/build/ddr-bd-smoke). The project is opened read-only-ish: the testbench is added
+# <build_dir> is a folder produced by build-riscvsoc-bd.sh from a results_path = antq_uplink config
+# (e.g. software/configs/sim-2q-antq.json -> <repo>/build/ddr-bd-smoke). The project is opened read-only-ish: the testbench is added
 # to sim_1 and the simulation is launched; nothing in synth_1/impl_1 is touched.
 # ===========================================================================================
 proc lmapless {paths} { set o {}; foreach p $paths { lappend o [file tail $p] }; return [join $o " -> "] }

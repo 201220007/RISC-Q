@@ -31,7 +31,7 @@ set OUT   $BUILD/ddr4_model_sim
 set SCRATCH $BUILD/ddr4_model_gen
 
 set XCI [lindex [glob -nocomplain $BUILD/bd/*/ip/*ddr4*/*.xci] 0]
-if {$XCI eq ""} { error "no ddr4 .xci under $BUILD/bd/*/ip -- was the BD built with RISCQ_DDR_READOUT=1?" }
+if {$XCI eq ""} { error "no ddr4 .xci under $BUILD/bd/*/ip -- was the BD built from a results_path = antq_uplink config?" }
 puts "\[g4-model\] reading the configured device from [file tail $XCI]"
 
 # ---- read the configured dictionary out of the build's own IP, without opening the build project ----

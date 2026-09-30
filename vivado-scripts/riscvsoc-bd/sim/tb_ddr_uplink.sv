@@ -12,6 +12,16 @@
 //   port, and the HP0 slave port. PS-memory PERSISTENCE is a separate claim and is NOT made here (this
 //   VIP does not update its read_mem() store from HP0 writes); it is settled on hardware in G6.
 //
+// P3b (results_path antq_uplink, 8300a1c): the same run on the new BD (smc_dma -> HP0 at 128-bit on ui_clk),
+// then four hardware-backed phases (plan v2 r2 #12, P3a "carried into P3b"):
+//   B  a SLVERR, then a DECERR, forced on the MIG's write response (smc_ddr M00 BRESP) -> bresp_err;
+//   R  a SLVERR, then a DECERR, forced on the MIG's read data response (RRESP) during a drain -> rresp_err;
+//   C  a DSP-domain reset in the middle of a run -> the run is gone and cannot be certified; the next is exact;
+//   D  a DSP-domain reset in the middle of a DRAIN -> the S2MM packet is truncated (no TLAST), the DMA never
+//      completes; the ddr_board recovery (timeout, S2MM soft reset) leaves a channel on which the next drain
+//      is byte-exact.
+// Each phase prints "[G4] ok-<phase>: ..."; the single "[G4] PASS:" line comes only after all of them.
+//
 // Instance path: tb_ddr_uplink.DUT.riscq_bd_i.zynq_ps.inst  (the VIP; see .../ip/riscq_bd_zynq_ps_0/sim).
 // =====================================================================================================
 `timescale 1ps / 1ps
@@ -297,6 +307,121 @@ module tb_ddr_uplink;
     begin tag_word = {tag, re[31:4], im[31:4]}; end
   endfunction
 
+  // ======================= P3b: helpers for the extra phases ======================================
+  localparam S_BRESP_ERR = 3, S_RRESP_ERR = 4;
+  localparam [63:0] PS_DEST2 = 64'h1100_0000;
+  localparam int    MAXP = 256;
+  reg  [63:0] pexp [0:MAXP-1];
+  logic [31:0] ps, pv;
+  logic        pb;
+
+  task automatic reset_links();
+    begin
+      axis_beats = 0; axis_last = 0; aw_cnt = 0; w_cnt = 0; wlast_cnt = 0; b_cnt = 0;
+      axis_last_at = 0; wlast_at = 0; hp_wlast_at = 0; axis_last_x = 0; wlast_x = 0; hp_wlast_x = 0;
+      zero_strb_beats = 0; strb_and = 32'hFFFF_FFFF; strb_or = 32'h0;
+      hp_aw = 0; hp_w = 0; hp_wlast = 0; hp_b = 0;
+      first_awaddr = 32'hFFFF_FFFF; last_bresp = 2'b11; hp_last_bresp = 2'b11;
+    end
+  endtask
+
+  task automatic p_start(input [63:0] base);
+    int n; logic v; begin
+      ps_w32(CTRL + O_WR_BASE, base);
+      ps_w32(CTRL + O_BASE_RST, 1);
+      n = 0; stat(S_RUN_ACTIVE, v);
+      while (v !== 1'b1 && n < POLL_LIMIT) begin #1000; n++; stat(S_RUN_ACTIVE, v); end
+      if (v !== 1'b1) begin ps_r32(CTRL + O_STATUS, ps); fail($sformatf("run at 0x%0h never became active (STATUS=0x%08h)", base, ps)); end
+      ps_r32(CTRL + O_RUN_BASE, pv);
+      if (pv !== base[31:0]) fail($sformatf("run_base latched 0x%0h, expected 0x%0h", pv, base[31:0]));
+    end
+  endtask
+
+  task automatic p_inject(input int n, input int salt);
+    begin
+      if (n > MAXP) fail("p_inject: too many");
+      for (int i = 0; i < n; i++) begin
+        automatic int core = i % n_ch;
+        automatic int re   = 32'h0100_0000 * (salt + 1) + (i << 8) + 16;
+        automatic int im   = 32'h0050_0000 + (salt << 16) + (i << 8) + 32;
+        ps_w32(CTRL + O_INJ_REAL, re); ps_w32(CTRL + O_INJ_IMAG, im);
+        ps_w32(CTRL + O_INJ_CORE, core); ps_w32(CTRL + O_INJ_FIRE, 1);
+        poll_clear(S_INJ_BUSY, "inj_busy");
+        pexp[i] = tag_word(core[7:0], re, im);
+      end
+    end
+  endtask
+
+  task automatic p_flush(output logic [31:0] s);
+    begin
+      ps_w32(CTRL + O_FLUSH, 1);
+      poll_clear(S_FLUSH_BUSY, "flush_busy");
+      ps_r32(CTRL + O_STATUS, s);
+    end
+  endtask
+
+  // the ddr_board.dma_recv_prepare order: RS, RS must take (not halted), DA, LENGTH (starts it)
+  task automatic p_dma_arm(input [63:0] dest, input [31:0] n);
+    int k2; begin
+      ps_w32(DMA + O_S2MM_DMACR, 32'h1);
+      k2 = 0; ps_r32(DMA + O_S2MM_DMASR, ps);
+      while (ps[0] !== 1'b0 && k2 < POLL_LIMIT) begin #1000; k2++; ps_r32(DMA + O_S2MM_DMASR, ps); end
+      if (ps[0] !== 1'b0) fail($sformatf("S2MM stayed halted after RS=1 (DMASR=0x%08h)", ps));
+      ps_w32(DMA + O_S2MM_DA, dest[31:0]);
+      ps_w32(DMA + O_S2MM_LENGTH, n);
+    end
+  endtask
+
+  task automatic p_drain_go(input [63:0] base, input [31:0] n);
+    begin
+      ps_w32(CTRL + O_RD_BASE, base); ps_w32(CTRL + O_RD_SIZE, n); ps_w32(CTRL + O_RD_START, 1);
+    end
+  endtask
+
+  // poll S2MM_DMASR for Idle with a bound (the driver's timeout); `idle` = completed
+  task automatic p_dma_wait(input int limit_us, output logic [31:0] sr, output logic idle);
+    int k2; begin
+      k2 = 0; idle = 1'b0;
+      do begin #1000; k2++; ps_r32(DMA + O_S2MM_DMASR, sr); end
+      while (sr[1] !== 1'b1 && (sr & 32'h770) == 0 && k2 < limit_us);
+      idle = (sr[1] === 1'b1);
+    end
+  endtask
+
+  // ddr_board.dma_reset(): DMACR.Reset, wait for it to self-clear, the channel is halted again
+  task automatic p_dma_soft_reset();
+    int k2; begin
+      ps_w32(DMA + O_S2MM_DMACR, 32'h4);
+      k2 = 0; ps_r32(DMA + O_S2MM_DMACR, pv);
+      while (pv[2] !== 1'b0 && k2 < POLL_LIMIT) begin #1000; k2++; ps_r32(DMA + O_S2MM_DMACR, pv); end
+      if (pv[2] !== 1'b0) fail($sformatf("S2MM soft reset never cleared (DMACR=0x%08h)", pv));
+      ps_r32(DMA + O_S2MM_DMASR, ps);
+      if (ps[0] !== 1'b1) fail($sformatf("S2MM not halted after the soft reset (DMASR=0x%08h)", ps));
+    end
+  endtask
+
+  // byte-exact check of an n-word drain at all three boundaries (uplink AXIS, DMA master, HP0 slave)
+  task automatic p_verify(input int n, input [63:0] dest, input string what);
+    int errs; begin
+      errs = 0;
+      if (axis_beats != (n * 8) / 32 || axis_last != 1 || axis_last_at != (n * 8) / 32)
+        fail($sformatf("%0s: AXIS %0d beats, TLAST x%0d at %0d (expected %0d, x1)", what, axis_beats, axis_last, axis_last_at, (n*8)/32));
+      if (aw_cnt != 1 || b_cnt != 1 || last_bresp !== 2'b00 || first_awaddr !== dest[31:0])
+        fail($sformatf("%0s: S2MM AW=%0d B=%0d bresp=%b addr=0x%08h", what, aw_cnt, b_cnt, last_bresp, first_awaddr));
+      if (hp_aw != 1 || hp_b != 1 || hp_last_bresp !== 2'b00 || hp_w != (n * 8) / 16 || hp_wlast != 1)
+        fail($sformatf("%0s: HP0 AW=%0d B=%0d W=%0d wlast x%0d bresp=%b", what, hp_aw, hp_b, hp_w, hp_wlast, hp_last_bresp));
+      if (zero_strb_beats != 0) fail($sformatf("%0s: %0d all-zero-strobe beats", what, zero_strb_beats));
+      for (int i = 0; i < n; i++) begin
+        if (axis_data_log[i / 4][64 * (i % 4) +: 64] !== pexp[i]) errs++;
+        if (w_data_log[i / 4][64 * (i % 4) +: 64] !== pexp[i]) errs++;
+        if (w_strb_log[i / 4][8 * (i % 4) +: 8] !== 8'hFF) errs++;
+        if (hp_data_log[i / 2][64 * (i % 2) +: 64] !== pexp[i]) errs++;
+        if (hp_strb_log[i / 2][8 * (i % 2) +: 8] !== 8'hFF) errs++;
+      end
+      if (errs != 0) fail($sformatf("%0s: %0d word/strobe mismatches", what, errs));
+    end
+  endtask
+
   reg [63:0]   expect_w [0:N_INJ-1];
   int          n_ch, k, errors;
   logic [31:0] final_addr, nbytes, dmasr, acc_total, rv, sreg;
@@ -569,11 +694,120 @@ module tb_ddr_uplink;
                backdoor_disagreed, N_INJ);
 
     if (errors != 0) fail($sformatf("%0d/%0d words mismatched", errors, N_INJ));
+    $display("[G4] ok-A: %0d injected results byte-exact at the AXIS, S2MM master and HP0 slave ports", N_INJ);
+
+    // ============================ P3b phase B: BRESP errors =====================================
+    for (int e = 0; e < 2; e++) begin
+      automatic logic [1:0] code = e ? 2'b11 : 2'b10;    // SLVERR, then DECERR
+      p_start(64'h0004_0000 + 64'h1000 * e);
+      p_inject(8, 16 + e);
+      force DUT.riscq_bd_i.smc_ddr_M00_AXI_BRESP = code;   // the MIG's write response, at its output
+      p_flush(sreg);
+      release DUT.riscq_bd_i.smc_ddr_M00_AXI_BRESP;
+      ps_r32(CTRL + O_STATUS, sreg);
+      if (sreg[S_BRESP_ERR] !== 1'b1)
+        fail($sformatf("BRESP=%b on the write burst but bresp_err is clear (STATUS=0x%08h)", code, sreg));
+      if ((sreg & FATAL_MASK) == 0) fail("bresp_err is not in the fatal mask");
+      $display("[G4] ok-B%0d: BRESP=%b forced on the MIG write response -> STATUS=0x%08h, bresp_err=1: the run is refused",
+               e, code, sreg);
+    end
+
+    // ============================ P3b phase R: RRESP errors =====================================
+    for (int e = 0; e < 2; e++) begin
+      automatic logic [1:0] code = e ? 2'b11 : 2'b10;
+      automatic logic [63:0] base = 64'h0006_0000 + 64'h1000 * e;
+      p_start(base);
+      p_inject(8, 20 + e);
+      p_flush(sreg);
+      check_clean($sformatf("before the RRESP=%b drain", code));
+      reset_links();
+      p_dma_arm(PS_DEST2, 64);
+      force DUT.riscq_bd_i.smc_ddr_M00_AXI_RRESP = code;   // the MIG's read response, during the drain
+      p_drain_go(base, 64);
+      p_dma_wait(POLL_LIMIT, dmasr, sv);
+      release DUT.riscq_bd_i.smc_ddr_M00_AXI_RRESP;
+      if (sv !== 1'b1) fail($sformatf("RRESP=%b drain: the DMA did not complete (DMASR=0x%08h)", code, dmasr));
+      ps_r32(CTRL + O_STATUS, sreg);
+      if (sreg[S_RRESP_ERR] !== 1'b1)
+        fail($sformatf("RRESP=%b on the drain but rresp_err is clear (STATUS=0x%08h)", code, sreg));
+      $display("[G4] ok-R%0d: RRESP=%b forced on the MIG read data -> the drain completed (%0d AXIS beats) but STATUS=0x%08h, rresp_err=1: refused",
+               e, code, axis_beats, sreg);
+    end
+
+    // ============================ P3b phase C: reset rejection ==================================
+    p_start(64'h0008_0000);
+    p_inject(8, 30);
+    force DUT.riscq_bd_i.dsp_rst_peripheral_reset = 1'b1;   // the DSP domain's reset, mid-run
+    #1_000_000;
+    release DUT.riscq_bd_i.dsp_rst_peripheral_reset;
+    k = 0; stat(S_DSP_IN_RESET, sv);
+    while (sv === 1'b1 && k < POLL_LIMIT) begin #1000; k++; stat(S_DSP_IN_RESET, sv); end
+    #20000;
+    ps_r32(CTRL + O_STATUS, sreg); ps_r32(CTRL + O_RUN_BASE, rv);
+    acc_total = 0;
+    for (k = 0; k < n_ch; k++) begin ps_r32(CTRL + O_ACCEPTED + 4*k, pv); acc_total += pv; end
+    // the certification ddr.py applies: run active until the flush, write_done, run_base == wr_base, exact counts
+    if (sreg[S_RUN_ACTIVE] === 1'b1) fail($sformatf("the run survived a DSP reset (STATUS=0x%08h)", sreg));
+    if (sreg[S_WRITE_DONE] === 1'b1 && rv === 32'h0008_0000 && acc_total == 8)
+      fail("a run interrupted by a DSP reset would still certify");
+    $display("[G4] ok-C: DSP reset mid-run -> STATUS=0x%08h run_active=0, run_base=0x%08h, accepted=%0d: the run cannot be certified",
+             sreg, rv, acc_total);
+    p_start(64'h0009_0000);
+    p_inject(12, 31);
+    p_flush(sreg);
+    check_clean("the run after the DSP reset");
+    reset_links();
+    p_dma_arm(PS_DEST2, 96);
+    p_drain_go(64'h0009_0000, 96);
+    p_dma_wait(POLL_LIMIT, dmasr, sv);
+    if (sv !== 1'b1 || (dmasr & 32'h770)) fail($sformatf("post-reset drain: DMASR=0x%08h", dmasr));
+    p_verify(12, PS_DEST2, "the run after the DSP reset");
+    $display("[G4] ok-C: the next run is byte-exact at AXIS, S2MM and HP0");
+
+    // ============================ P3b phase D: DMA truncation recovery ==========================
+    p_start(64'h000A_0000);
+    p_inject(128, 40);                                        // 1 KiB: a 32-beat drain
+    p_flush(sreg);
+    check_clean("before the truncated drain");
+    reset_links();
+    p_dma_arm(PS_DEST2, 1024);
+    p_drain_go(64'h000A_0000, 1024);
+    k = 0;
+    while (axis_beats < 4 && k < 1_000_000) begin #100; k++; end
+    if (axis_beats < 4) fail("the drain never streamed");
+    force DUT.riscq_bd_i.dsp_rst_peripheral_reset = 1'b1;   // DSP reset with the AXIS packet mid-flight
+    #1_000_000;
+    release DUT.riscq_bd_i.dsp_rst_peripheral_reset;
+    // the driver's wait: the DMA wants 1024 B and TLAST; it must NOT complete
+    p_dma_wait(50, dmasr, sv);                               // 50 us, the stand-in for ddr_board's timeout
+    $display("[G4] D: after the DSP reset: %0d of 32 AXIS beats, TLAST x%0d, DMASR=0x%08h (idle=%b)",
+             axis_beats, axis_last, dmasr, sv);
+    if (sv === 1'b1 || axis_last != 0 || axis_beats >= 32)
+      fail($sformatf("the reset did not truncate the packet (%0d beats, TLAST x%0d, idle %b) -- nothing to recover from",
+                     axis_beats, axis_last, sv));
+    ps_r32(CTRL + O_STATUS, sreg);
+    if (sreg[S_WRITE_DONE] === 1'b1) fail($sformatf("write_done survived the reset (STATUS=0x%08h): ddr.py would certify", sreg));
+    p_dma_soft_reset();                                      // ddr_board.dma_reset()
+    $display("[G4] ok-D: S2MM timed out on the truncated packet; soft reset cleared, channel halted; write_done=0 (STATUS=0x%08h): refused",
+             sreg);
+    k = 0; stat(S_DSP_IN_RESET, sv);
+    while (sv === 1'b1 && k < POLL_LIMIT) begin #1000; k++; stat(S_DSP_IN_RESET, sv); end
+    p_start(64'h000C_0000);
+    p_inject(12, 41);
+    p_flush(sreg);
+    check_clean("the run after the truncation");
+    reset_links();
+    p_dma_arm(PS_DEST2, 96);
+    p_drain_go(64'h000C_0000, 96);
+    p_dma_wait(POLL_LIMIT, dmasr, sv);
+    if (sv !== 1'b1 || (dmasr & 32'h770)) fail($sformatf("drain after the S2MM soft reset: DMASR=0x%08h", dmasr));
+    p_verify(12, PS_DEST2, "the drain after the S2MM soft reset");
+    $display("[G4] ok-D: the next drain on the reset channel is byte-exact at AXIS, S2MM and HP0");
     // r24-#5 / r25-#4: state exactly what was proven and what was not. The oracle sits at the HP0 slave
     // port -- the design's last signal boundary. Persistence INSIDE the PS memory is not claimed here,
     // and G4b does NOT close it either: G4b's Micron model terminates the PL MIG interface, while HP0
     // still terminates in the same Zynq VIP. PS-memory persistence is provable only on HARDWARE (G6).
-    $display("[G4] PASS: %0d injected results travelled uplink -> smc_ddr -> MIG -> mmu2 -> AXIS -> axi_dma -> smc_dma -> HP0, byte-exact at BOTH the DMA master port and the HP0 slave port, single INCR burst to 0x%08h with full byte strobes%0s",
+    $display("[G4] PASS: %0d injected results travelled uplink -> smc_ddr -> MIG -> mmu2 -> AXIS -> axi_dma -> smc_dma -> HP0, byte-exact at BOTH the DMA master port and the HP0 slave port, single INCR burst to 0x%08h with full byte strobes; B (BRESP SLVERR/DECERR), R (RRESP SLVERR/DECERR), C (DSP reset mid-run) and D (DMA truncation + S2MM soft-reset recovery) passed%0s",
              N_INJ, PS_DEST[31:0],
              (backdoor_disagreed == 0) ? " (and the VIP memory image agrees)"
                                        : " (PS-memory persistence NOT claimed -- provable only on hardware, see the read_mem note above)");

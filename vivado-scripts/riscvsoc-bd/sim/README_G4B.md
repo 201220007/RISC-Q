@@ -43,16 +43,17 @@ exactly what G4b exists to rule out.
 
 ```bash
 cd vivado-scripts/riscvsoc-bd
-RISCQ_DDR_READOUT=1 RISCQ_DDR_SIM_PHY=1 \
-  RISCQ_CONFIG=../../software/configs/sim-2q-ddr.json \
-  RISCQ_PROJ_NAME=ddr-bd-g4b RISCQ_RUN_SYNTH=0 ./build-riscvsoc-bd.sh   # BD only, no synthesis needed
+RISCQ_DDR_SIM_PHY=1 RISCQ_CONFIG=$PWD/../../software/configs/sim-2q-antq.json \
+  RISCQ_PROJ_NAME=ddr-bd-g4b RISCQ_RUN_SYNTH=0 RISCQ_RUN_IMPL=0 RISCQ_RUN_BITSTREAM=0 \
+  ./build-riscvsoc-bd.sh                      # results_path antq_uplink; BD only, no synthesis
 vivado -mode batch -source sim/gen-ddr4-model.tcl -tclargs ../../build/ddr-bd-g4b
-vivado -mode batch -source sim/run-sim-bd.tcl    -tclargs ../../build/ddr-bd-g4b 3ms phy
+vivado -mode batch -source sim/run-sim-bd.tcl    -tclargs ../../build/ddr-bd-g4b - phy
 ```
 
 `Simulation_Mode` is a **simulation-only** IP property: synthesis and the bitstream are byte-identical to
 a BFM build, so G4b cannot perturb the G5 artifact.
 
-The test body is the same 12-word byte-exact injector run as G4a — per Codex r14, a single word would
+The test body is the same testbench as G4a (the 12-word byte-exact injector run, then the P3b phases B/R/C/D:
+forced BRESP/RRESP errors, a DSP reset mid-run, and the DMA-truncation recovery) — per Codex r14, a single word would
 exercise neither multiple 256-bit beats, nor lane placement, nor ordering, nor the final partial-burst
 pad, nor TLAST framing.

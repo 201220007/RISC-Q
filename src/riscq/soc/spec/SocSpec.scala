@@ -177,8 +177,9 @@ object SocSpec {
     o.get(key).map(_.num.toInt).getOrElse(default)
   private def boolOr(o: collection.Map[String, ujson.Value], key: String, default: Boolean): Boolean =
     o.get(key).map(_.bool).getOrElse(default)
+  // a JSON null is "absent": python's SocSpec.to_json writes `"wr_marker_dac": null`
   private def optInt(o: collection.Map[String, ujson.Value], key: String): Option[Int] =
-    o.get(key).map(_.num.toInt)
+    o.get(key).filterNot(_.isNull).map(_.num.toInt)
 
   private def fromChannelList(o: collection.Map[String, ujson.Value]): SocSpec = {
     val defaults = o.get("core_defaults").map(_.obj).getOrElse(collection.mutable.LinkedHashMap.empty[String, ujson.Value])

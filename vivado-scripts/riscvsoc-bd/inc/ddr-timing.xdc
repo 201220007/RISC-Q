@@ -57,3 +57,9 @@ set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_a
              -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/ddr_accSnapDdr_*_reg[*] || NAME =~ */ddrUplink_up/ddr_ovfSnapDdr_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_buffercc/buffers_0_reg}] 2.000
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/injReal_reg[*] || NAME =~ */ddrUplink_up/injImag_reg[*] || NAME =~ */ddrUplink_up/injCore_reg[*] || NAME =~ */ddrUplink_up/xInj/src_reqReg_reg}] \
              -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_injRealC_reg[*] || NAME =~ */ddrUplink_up/dsp_injImagC_reg[*] || NAME =~ */ddrUplink_up/dsp_injCoreC_reg[*] || NAME =~ */ddrUplink_up/xInj/reqLevel_buffercc/buffers_0_reg}] 2.000
+
+# ---- P3c: the DDR4 RESET_n output ------------------------------------------------------------------
+# ddr4_sdram_c0_reset_n (the MIG c0 DRAM reset) has no timing relationship to any clock: JEDEC only asks for
+# it to be held low >= 200 us, and the MIG drives it from its own slow reset sequencer. No output delay
+# applies, so it is a false path; check_timing then lists only the baseline's own no_output_delay items.
+set_false_path -to [get_ports -quiet ddr4_sdram_c0_reset_n]

@@ -45,11 +45,12 @@ set_clock_groups -asynchronous -name uplink_async_domains \
 # The cells are inside the packaged SoC IP, which does not exist as cells during synth_1 of the BD
 # wrapper, so the lookups are -quiet. inc/ddr-check-cdc.tcl re-resolves every set against the
 # routed design and fails the build if one is empty, and report_bus_skew shows each one met.
-set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_rejGray_*_reg[*]}] \
+set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_rejGray_*_reg[*] && NAME !~ */dsp_rejGray_*_buffercc/*}] \
              -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_rejGray_*_buffercc/buffers_0_reg[*]}] 2.000
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_cbuf/wr_* && IS_SEQUENTIAL}] \
              -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_cbuf/*/buffers_0_reg* && NAME !~ */rd_retTog_buffercc/*}] 2.000
+# (set_bus_skew takes cells/pins/ports only, not clocks: -to names the capturing registers)
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_accSnap_*_reg[*] || NAME =~ */ddrUplink_up/dsp_ovfSnap_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_reg}] \
-             -to   [get_clocks -quiet -include_generated_clocks -of_objects [get_ports -quiet default_sysclk_c0_300mhz_clk_p]] 2.000
+             -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/ddr_accSnapDdr_*_reg[*] || NAME =~ */ddrUplink_up/ddr_ovfSnapDdr_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_buffercc/buffers_0_reg}] 2.000
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/injReal_reg[*] || NAME =~ */ddrUplink_up/injImag_reg[*] || NAME =~ */ddrUplink_up/injCore_reg[*] || NAME =~ */ddrUplink_up/xInj/src_reqReg_reg}] \
-             -to   [get_clocks -quiet dspClk_clk_p] 2.000
+             -to   [get_cells -quiet -hier -filter {(NAME =~ */ddrUplink_up/dsp_fifos_* && IS_SEQUENTIAL) || NAME =~ */ddrUplink_up/xInj/reqLevel_buffercc/buffers_0_reg}] 2.000

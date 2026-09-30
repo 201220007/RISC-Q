@@ -133,12 +133,14 @@ puts "\[ddr-cdc\] OK: 4/4 domains declared AND independently resolved from netli
 # Their lookups are -quiet (the cells do not exist at BD-wrapper synthesis), so an empty set would be
 # silent: resolve every from/to set against the routed design and require it non-empty.
 set _skewsets [list \
-  rejGray_from  [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_rejGray_*_reg[*]}] \
+  rejGray_from  [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_rejGray_*_reg[*] && NAME !~ */dsp_rejGray_*_buffercc/*}] \
   rejGray_to    [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_rejGray_*_buffercc/buffers_0_reg[*]}] \
   cbufMeta_from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_cbuf/wr_* && IS_SEQUENTIAL}] \
   cbufMeta_to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_cbuf/*/buffers_0_reg* && NAME !~ */rd_retTog_buffercc/*}] \
   snap_from     [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_accSnap_*_reg[*] || NAME =~ */ddrUplink_up/dsp_ovfSnap_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_reg}] \
-  inj_from      [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/injReal_reg[*] || NAME =~ */ddrUplink_up/injImag_reg[*] || NAME =~ */ddrUplink_up/injCore_reg[*] || NAME =~ */ddrUplink_up/xInj/src_reqReg_reg}] ]
+  snap_to       [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/ddr_accSnapDdr_*_reg[*] || NAME =~ */ddrUplink_up/ddr_ovfSnapDdr_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_buffercc/buffers_0_reg}] \
+  inj_from      [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/injReal_reg[*] || NAME =~ */ddrUplink_up/injImag_reg[*] || NAME =~ */ddrUplink_up/injCore_reg[*] || NAME =~ */ddrUplink_up/xInj/src_reqReg_reg}] \
+  inj_to        [get_cells -quiet -hier -filter {(NAME =~ */ddrUplink_up/dsp_fifos_* && IS_SEQUENTIAL) || NAME =~ */ddrUplink_up/xInj/reqLevel_buffercc/buffers_0_reg}] ]
 set _emptysets {}
 foreach {_n _cells} $_skewsets {
   puts [format "\[ddr-cdc\] bus-skew set %-13s -> %d cell(s)" $_n [llength $_cells]]

@@ -44,3 +44,4 @@ if {[info exists ::env(RISCQ_PBLOCK)]} {
   puts "\[run\] pblock floorplan: $_ppre (RISCQ_PBLOCK=$::env(RISCQ_PBLOCK))"
 }
 set_property STEPS.OPT_DESIGN.TCL.PRE $INC/threads.tcl [get_runs impl_1]   ;# opt -> route in one process
+set_property STEPS.ROUTE_DESIGN.TCL.POST $INC/route-finish.tcl [get_runs impl_1]   ;# route what route_design left

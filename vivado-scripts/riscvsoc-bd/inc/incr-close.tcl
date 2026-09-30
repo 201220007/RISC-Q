@@ -26,6 +26,7 @@ read_checkpoint -incremental $routed -directive TimingClosure
 place_design
 phys_opt_design
 route_design
+source [file join [file dirname [info script]] route-finish.tcl]   ;# P3c: route what route_design left
 phys_opt_design -directive AggressiveExplore
 report_timing_summary -max_paths 20 -file $BUILD_DIR/timing_incr.rpt
 write_checkpoint -force $BUILD_DIR/routed_incr.dcp

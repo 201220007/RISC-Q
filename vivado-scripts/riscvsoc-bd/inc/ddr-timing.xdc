@@ -41,7 +41,10 @@ set_clock_groups -asynchronous -name uplink_async_domains \
 #      the ui side reads them after the synced toggle. Skew against the toggle's own path bounds when
 #      they have settled.
 #   4. injector payload (ui -> dsp): injReal / injImag / injCore are held from INJ_FIRE until the
-#      acknowledge; the dsp side reads them after xInj's synced request. Same argument, other way.
+#      acknowledge. The dsp side captures them into dsp.injRealC/ImagC/CoreC, enabled by xInj's synchronized
+#      request, and consumes only the captures (P3b r1). The group ends at those capture flops (no logic in
+#      between) and at the request's first synchronizer flop, so the payload settles before the 2-flop
+#      synchronized request can enable the capture.
 # The cells are inside the packaged SoC IP, which does not exist as cells during synth_1 of the BD
 # wrapper, so the lookups are -quiet. inc/ddr-check-cdc.tcl re-resolves every set against the
 # routed design and fails the build if one is empty, and report_bus_skew shows each one met.
@@ -53,4 +56,4 @@ set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_c
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_accSnap_*_reg[*] || NAME =~ */ddrUplink_up/dsp_ovfSnap_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_reg}] \
              -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/ddr_accSnapDdr_*_reg[*] || NAME =~ */ddrUplink_up/ddr_ovfSnapDdr_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_buffercc/buffers_0_reg}] 2.000
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/injReal_reg[*] || NAME =~ */ddrUplink_up/injImag_reg[*] || NAME =~ */ddrUplink_up/injCore_reg[*] || NAME =~ */ddrUplink_up/xInj/src_reqReg_reg}] \
-             -to   [get_cells -quiet -hier -filter {(NAME =~ */ddrUplink_up/dsp_fifos_* && IS_SEQUENTIAL) || NAME =~ */ddrUplink_up/xInj/reqLevel_buffercc/buffers_0_reg}] 2.000
+             -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_injRealC_reg[*] || NAME =~ */ddrUplink_up/dsp_injImagC_reg[*] || NAME =~ */ddrUplink_up/dsp_injCoreC_reg[*] || NAME =~ */ddrUplink_up/xInj/reqLevel_buffercc/buffers_0_reg}] 2.000

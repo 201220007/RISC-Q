@@ -140,7 +140,7 @@ set _skewsets [list \
   snap_from     [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_accSnap_*_reg[*] || NAME =~ */ddrUplink_up/dsp_ovfSnap_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_reg}] \
   snap_to       [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/ddr_accSnapDdr_*_reg[*] || NAME =~ */ddrUplink_up/ddr_ovfSnapDdr_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_buffercc/buffers_0_reg}] \
   inj_from      [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/injReal_reg[*] || NAME =~ */ddrUplink_up/injImag_reg[*] || NAME =~ */ddrUplink_up/injCore_reg[*] || NAME =~ */ddrUplink_up/xInj/src_reqReg_reg}] \
-  inj_to        [get_cells -quiet -hier -filter {(NAME =~ */ddrUplink_up/dsp_fifos_* && IS_SEQUENTIAL) || NAME =~ */ddrUplink_up/xInj/reqLevel_buffercc/buffers_0_reg}] ]
+  inj_to        [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_injRealC_reg[*] || NAME =~ */ddrUplink_up/dsp_injImagC_reg[*] || NAME =~ */ddrUplink_up/dsp_injCoreC_reg[*] || NAME =~ */ddrUplink_up/xInj/reqLevel_buffercc/buffers_0_reg}] ]
 set _emptysets {}
 foreach {_n _cells} $_skewsets {
   puts [format "\[ddr-cdc\] bus-skew set %-13s -> %d cell(s)" $_n [llength $_cells]]
@@ -160,8 +160,16 @@ if {$_nbs < 4} {
 }
 
 # ---- structural CDC review (plan v2 r2 #13): Vivado's own classification of every crossing --------
-# Written, not gated: the report is reviewed against the uplink's design (P3b REPORT, CDC section).
+# P3b r1: written AND gated. ddr-cdc-verdict.tcl fails the build on any negative bus-skew slack and on any
+# Critical report_cdc finding outside its (upstream-only) allowlist.
 report_cdc -details -file $BUILD_DIR/cdc_${CDC_SFX}.rpt
 if {[catch {report_cdc -summary -file $BUILD_DIR/cdc_summary_${CDC_SFX}.rpt} _e]} { puts "\[ddr-cdc\] WARN: report_cdc -summary: $_e" }
 if {[catch {report_methodology -file $BUILD_DIR/methodology_${CDC_SFX}.rpt} _e]} { puts "\[ddr-cdc\] WARN: report_methodology: $_e" }
 puts "\[ddr-cdc\] report_cdc -> $BUILD_DIR/cdc_${CDC_SFX}.rpt (+ cdc_summary_${CDC_SFX}.rpt, methodology_${CDC_SFX}.rpt)"
+source $INC/ddr-cdc-verdict.tcl
+set _fh [open $BUILD_DIR/cdc_${CDC_SFX}.rpt r]; set _cdct [read $_fh]; close $_fh
+set _vm [ddr_cdc_verdict $_bs $_cdct]
+if {[llength $_vm] > 0} {
+  error "the CDC review failed ([llength $_vm] issue(s)):\n  [join $_vm "\n  "]\nReports: $BUILD_DIR/bus_skew_${CDC_SFX}.rpt, cdc_${CDC_SFX}.rpt"
+}
+puts "\[ddr-cdc\] review OK: every bus-skew constraint met, no unexpected Critical report_cdc finding"

@@ -361,6 +361,13 @@ class _FrontEnd:
                 if v.input:
                     self.input_arrays.add(name)
                 if v.host:
+                    # an antq_uplink build has no HostWindow chain: refuse here, not at run time
+                    if not self.m.params.with_host_window:
+                        self._err(arg, f"Array {name!r} has host=True, but {self.m.params.name} is "
+                                       f"built with results_path={self.m.params.results_path!r}, "
+                                       f"which has no HostWindow. Drop host=True (the array then "
+                                       f"lives in core RAM), or use a hostwindow build; readout "
+                                       f"results of this build leave through riscq.ddr.DdrReadout")
                     self.host_arrays.add(name)
             else:
                 self._err(arg, f"parameter {name!r} must be annotated int, ParamTable, Array, "

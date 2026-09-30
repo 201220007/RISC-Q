@@ -168,6 +168,16 @@ class SocMap:
     HOST_DONE = 0x50                # read-only: bit i = core i set its CTRL_DONE since the last reset
     HOST_HOSTWIN_LO = 0x48          # host-buffer physical base[31:0]
     HOST_HOSTWIN_HI = 0x4C          # [7:0] = base[39:32], [31] = enable (0 at reset ⇒ funnel holds)
+    #   (HOSTWIN_LO/HI exist only in a hostwindow build; an antq_uplink build has no HostWindow chain)
+    # ── Ant-Q uplink status (read-only; antq_uplink builds only, PulseTableSoc ddrStatusHost) ──
+    # In the HOST clock domain on purpose: its reset tree is independent of the DDR one, so it answers
+    # when the whole ui_clk side is dead, the failure it exists to diagnose. Clear of DONE (0x50) and
+    # HUB_STATUS (0x54); 0x5C is reserved for the future host STOP word (no logic, reads 0).
+    HOST_DDR_STATUS = 0x58
+    HOST_STOP = 0x5C                # reserved: no hardware yet
+    DDR_STATUS_MAGIC = 0xCA1B       # [31:16]; a bitstream without the register reads 0 here
+    DDR_STATUS_CALIB = 0            # MIG c0_init_calib_complete
+    DDR_STATUS_UI_RST_OK = 1        # the ui_clk reset tree released
 
     LEAD = LEAD
 
@@ -405,15 +415,42 @@ class SocMap:
         align = max(combine_latency(channels_on(d)) for d in range(self.params.dac_num))
         return align + 2
 
+    @property
+    def host_ctrl_bytes(self) -> int:
+        """Extent of the host control block: through HUB_STATUS (0x54) on a hostwindow build; an
+        antq_uplink build adds HOST_DDR_STATUS (0x58) and the reserved HOST_STOP (0x5C). Scala twin:
+        SocSpecMap.hostCtrlBytes."""
+        return 0x60 if self.params.with_antq_uplink else 0x54
+
+    def ddr_status(self) -> int:
+        """Host-AXI address (SoC-window relative) of the uplink's host-domain status register."""
+        if not self.params.with_antq_uplink:
+            raise ValueError(f"{self.params.name} has results_path={self.params.results_path!r}: "
+                             f"there is no DDR status register (it needs antq_uplink)")
+        return self.host_ctrl + self.HOST_DDR_STATUS
+
+    def require_host_window(self, what: str) -> None:
+        """Raise early, with the reason, when `what` needs the HostWindow and this build has none."""
+        if not self.params.with_host_window:
+            raise ValueError(
+                f"{what} needs the HostWindow, but {self.params.name} is built with results_path="
+                f"{self.params.results_path!r}, which has no HostWindow chain. Results of an "
+                f"antq_uplink build leave through the Ant-Q uplink (riscq.ddr.DdrReadout); drop "
+                f"host=True, or use a hostwindow build. (riscq.cal on the uplink is P6.)")
+
     def hostwin_offset(self, core: int) -> int:
         """Offset of `core`'s 16 MB slice inside the host result buffer — the `core << 24` term of
         the funnel's `base + (core << 24) + offset` (specs/software/22 §2.2). Buffer-relative, so it
         is what `Driver.read_host` takes."""
+        self.require_host_window("hostwin_offset")
         return self._core(core) * self.HOSTWIN_BYTES
 
     @property
     def hostwin_bytes_total(self) -> int:
-        """Bytes the host result buffer must have: one 16 MB slice per core."""
+        """Bytes the host result buffer must have: one 16 MB slice per core (0 on an antq_uplink
+        build, which has no HostWindow and allocates no buffer)."""
+        if not self.params.with_host_window:
+            return 0
         return len(self.params.cores) * self.HOSTWIN_BYTES
 
     def to_host_addr(self, core: int, cpu_addr: int) -> int:
@@ -433,7 +470,7 @@ class SocMap:
                     out.append(MapEntry(f"core{c}_{ch.name}_env", self.env_base(j, c), ch.env_bytes,
                                         f"env_{ch.name}"))
         out.append(MapEntry("robs", self.robs(), self.rob_bytes, "robs_ro"))
-        out.append(MapEntry("host_ctrl", self.host_ctrl, 0x54, "ctrl_wo"))
+        out.append(MapEntry("host_ctrl", self.host_ctrl, self.host_ctrl_bytes, "ctrl_wo"))
         return out
 
     # ── generated firmware inputs ──

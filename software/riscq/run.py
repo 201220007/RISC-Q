@@ -32,6 +32,7 @@ def set_host_window(drv, m: SocMap, base: int, enable: bool = True) -> None:
     store to `HOSTWIN + off` then lands at `base + (core << 24) + off`. Write it while the core reset
     is ASSERTED — the funnel is idle then, so the 40-bit base can never be seen torn. `enable` powers
     up low, so until this runs a window store stalls instead of writing DDR address 0."""
+    m.require_host_window("set_host_window")
     drv.write32(m.host_ctrl + m.HOST_HOSTWIN_LO, base & 0xFFFFFFFF)
     drv.write32(m.host_ctrl + m.HOST_HOSTWIN_HI,
                 ((base >> 32) & 0xFF) | (0x80000000 if enable else 0))
@@ -65,6 +66,7 @@ def read_host_array(drv, m: SocMap, core: int, program: Program, name: str) -> n
     of the driver's result buffer at `hostwin_offset(core) + <the array's window offset>`
     (specs/software/22 §2.6). Valid only after DONE (§2.4: the writes are posted, and the ordering
     contract is that the host reads from python after `poll_done`)."""
+    m.require_host_window(f"reading host-window array {name!r}")
     off, count = program.host_arrays[name]
     buf = drv.read_host(m.hostwin_offset(core) + off, 4 * count)
     return np.frombuffer(buf, dtype="<i4").copy()
@@ -236,11 +238,24 @@ def _env_from_wire(entry) -> tuple:
     return int(line0), arr
 
 
+def _check_results_path(m: SocMap, progs: dict[int, Program]) -> None:
+    """Refuse HostWindow programs on a build without the HostWindow (results_path antq_uplink)."""
+    if m.params.with_host_window:
+        return
+    bad = {core: sorted(prog.host_arrays) for core, prog in progs.items() if prog.host_arrays}
+    if bad:
+        m.require_host_window(f"the host-window arrays {bad} (core: names)")
+
+
 def setup(drv, m: SocMap, progs: dict[int, Program]) -> None:
     """Once per session: hold reset, load each core's image + envelopes + tables, and park the
     unassigned cores. Leaves reset ASSERTED so the first `rerun` writes into a quiescent, loaded
     core — the image then stays put across reruns (spec 03 §2, 08 §4). With a `drv.remote` extras
     object present, the whole load runs server-side in one RPC (spec 08 §5)."""
+    # antq_uplink: no HostWindow chain, so a program with host-window arrays is refused before anything
+    # is loaded (compile_kernel already refuses host=True against such a map; this catches a Program
+    # compiled for another build). Checked before the remote hop too, so it fails client-side.
+    _check_results_path(m, progs)
     remote = getattr(drv, "remote", None)
     if remote is not None:
         remote.setup(_params_json(m), {core: _prog_to_wire(prog) for core, prog in progs.items()})
@@ -249,7 +264,7 @@ def setup(drv, m: SocMap, progs: dict[int, Program]) -> None:
     # point the funnel at this driver's result buffer while the reset is held (spec 22 §2.3). A
     # host-pure test double carries no buffer: leave the funnel disabled — correct, since without a
     # buffer there is nowhere for a window store to go — but refuse a program that needs one.
-    base = getattr(drv, "host_base", None)
+    base = getattr(drv, "host_base", None) if m.params.with_host_window else None
     if base is not None:
         set_host_window(drv, m, int(base))
     elif any(prog.host_arrays for prog in progs.values()):
@@ -278,6 +293,7 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
     clear under that reset, so no stale-DONE clearing write is needed (specs/software/23). With a
     `drv.remote` extras object present, the whole batch (params + arrays in, poll, results out) runs
     server-side in one RPC (spec 08 §5)."""
+    _check_results_path(m, progs)
     remote = getattr(drv, "remote", None)
     if remote is not None:
         raw = remote.rerun(list(progs), params or {}, arrays or {}, results, timeout)

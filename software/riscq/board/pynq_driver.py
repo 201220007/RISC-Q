@@ -16,6 +16,8 @@ import pynq
 import xrfclk
 import xrfdc  # noqa: F401 — registers the RFdc driver so overlay.rf_data_converter binds
 
+from riscq.board.pynq_compat import numpy2_pynq_shim
+
 log = logging.getLogger(__name__)
 
 AXI_BASE = 0x8000_0000   # riscvsoc-bd flow: bd-build.tcl assign_bd_address -offset
@@ -53,6 +55,9 @@ class PynqDriver:
             asyncio.get_event_loop()
         except RuntimeError:
             asyncio.set_event_loop(asyncio.new_event_loop())
+
+        # numpy >= 2 / pynq 3.0.0: before ANY pynq allocation in this process (pynq_compat)
+        numpy2_pynq_shim()
 
         cfg = {**BOARD_DEFAULTS, **(board or {})}
         self.params_text = Path(params_json).read_text()
@@ -93,12 +98,21 @@ class PynqDriver:
         # results straight into it over S_AXI_HP0_FPD, so a raw run is no longer bounded by the
         # core's 16 KB RAM and readback is a numpy copy instead of word-at-a-time MMIO.
         # `pynq.allocate` is non-cacheable by default, so a read sees DDR with no cache maintenance.
+        # Only a hostwindow build has a HostWindow: an antq_uplink build (results_path) allocates no
+        # buffer here -- its results leave through the uplink, whose drain buffer DdrBoard allocates
+        # lazily -- and has no `host_base`, so run.setup never programs HOSTWIN registers it lacks.
         from riscq.map import SocMap, SocParams
-        nbytes = SocMap(SocParams.from_json(self.params_text)).hostwin_bytes_total
-        _check_cma(nbytes)
-        self._host_buf = pynq.allocate(shape=(nbytes,), dtype=np.uint8)
-        self.host_base = int(self._host_buf.device_address)
-        log.info(f"host window: {nbytes / (1 << 20):.0f} MB at {self.host_base:#x}")
+        self.params = SocParams.from_json(self.params_text)
+        self._host_buf = None
+        self.host_base = None
+        if self.params.with_host_window:
+            nbytes = SocMap(self.params).hostwin_bytes_total
+            _check_cma(nbytes)
+            self._host_buf = pynq.allocate(shape=(nbytes,), dtype=np.uint8)
+            self.host_base = int(self._host_buf.device_address)
+            log.info(f"host window: {nbytes / (1 << 20):.0f} MB at {self.host_base:#x}")
+        else:
+            log.info(f"results_path={self.params.results_path}: no host-window buffer allocated")
 
     # ── the Driver protocol over pynq.MMIO (a numpy uint32 view of the /dev/mem mmap) ──
 
@@ -137,6 +151,9 @@ class PynqDriver:
     def read_host(self, offset: int, nbytes: int) -> bytes:
         """Read the CMA result buffer at buffer-relative `offset` (specs/software/22 §2.6). Only
         valid after the program's DONE — the window writes are posted (§2.4)."""
+        if self._host_buf is None:
+            raise ValueError(f"read_host: {self.params.name} is built with results_path="
+                             f"{self.params.results_path!r} and has no host-window buffer")
         if not 0 <= offset <= self._host_buf.nbytes - nbytes:
             raise ValueError(f"read_host [{offset}, {offset + nbytes}) outside the "
                              f"{self._host_buf.nbytes} B host buffer")

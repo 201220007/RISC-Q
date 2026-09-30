@@ -83,8 +83,11 @@ class BoardServer:
     @_locked
     def get_host_base(self):
         """Physical base of the driver's CMA result buffer — what `riscq.run.setup` programs into
-        `HOSTWIN_BASE_LO/HI`."""
-        return int(self._driver().host_base)
+        `HOSTWIN_BASE_LO/HI`. An antq_uplink build (results_path) has no such buffer."""
+        base = self._driver().host_base
+        if base is None:
+            raise RuntimeError("the loaded build has no host-window buffer (results_path antq_uplink)")
+        return int(base)
 
     # ── handshake ──
 

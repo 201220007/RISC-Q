@@ -37,6 +37,13 @@ _FIXED = {
 
 KIND_LANES = {"pulse": BATCH_SIZE, "demod": ADC_BATCH, "dio": 0}   # dio: 16 timed lines, no bank
 
+# The results path, chosen when the bitfile is built (Scala twin: `SocSpec.resultsPaths`). Exactly one
+# is built and it owns S_AXI_HP0_FPD: `hostwindow` is upstream's HostWindow (the default), `antq_uplink`
+# the Ant-Q readout uplink (riscq.ddr) with no HostWindow chain at all.
+HOSTWINDOW = "hostwindow"
+ANTQ_UPLINK = "antq_uplink"
+RESULTS_PATHS = (HOSTWINDOW, ANTQ_UPLINK)
+
 
 @dataclass(frozen=True)
 class ChannelSpec:
@@ -139,10 +146,13 @@ class SocSpec:
     wr_marker_dac: int | None = None  # spare DAC carrying the sync marker (white-rabbit/09)
     board: int = 0                    # this board's id in the system (0 = the barrier root)
     boards: int = 1                   # boards in the system (> 1 rides the WR lane, cross-core/02 §5)
+    results_path: str = HOSTWINDOW    # "hostwindow" | "antq_uplink" (see RESULTS_PATHS)
 
     def __post_init__(self):
         if not self.cores:
             raise ValueError("a SocSpec needs at least one core")
+        if not isinstance(self.results_path, str) or self.results_path not in RESULTS_PATHS:
+            raise ValueError(f"results_path {self.results_path!r} is not one of {list(RESULTS_PATHS)}")
         if self.wr_marker_dac is not None and not (self.with_white_rabbit and 0 <= self.wr_marker_dac < self.dac_num):
             raise ValueError(f"wr_marker_dac={self.wr_marker_dac} needs with_white_rabbit and a valid DAC id")
         if not (0 <= self.board < self.boards <= 16) or (self.boards > 1 and not self.with_white_rabbit):
@@ -166,6 +176,9 @@ class SocSpec:
     @classmethod
     def from_json(cls, text: str) -> "SocSpec":
         raw = json.loads(text)
+        if "ddr_readout" in raw:
+            raise ValueError("the `ddr_readout` key is gone: select the results path with "
+                             "\"results_path\": \"antq_uplink\" (or \"hostwindow\", the default)")
         for key, value in _FIXED.items():  # fixed constants may be stated, never changed
             if key in raw and raw.pop(key) != value:
                 raise ValueError(f"{key} is fixed by architecture at {value}")
@@ -202,7 +215,8 @@ class SocSpec:
         known = {"name", "qubit_num", "dac_num", "adc_num", "mem_depth", "env_depth", "rob_depth",
                  "gate_pulse_num", "gate_interp", "readout_interp", "demod_interp", "link_pipe",
                  "with_mul", "dsp_freq_hz", "hostwin_bits", "queue_depth", "adc_pipe",
-                 "dac_map", "adc_map", "with_white_rabbit", "wr_marker_dac", "board", "boards"}
+                 "dac_map", "adc_map", "with_white_rabbit", "wr_marker_dac", "board", "boards",
+                 "results_path"}
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"unknown SocParams fields: {sorted(unknown)}")
@@ -234,7 +248,8 @@ class SocSpec:
                    rob_depth=int(raw.get("rob_depth", 1024)), adc_pipe=int(raw.get("adc_pipe", 3)),
                    with_white_rabbit=bool(raw.get("with_white_rabbit", False)),
                    wr_marker_dac=(int(raw["wr_marker_dac"]) if raw.get("wr_marker_dac") is not None else None),
-                   board=int(raw.get("board", 0)), boards=int(raw.get("boards", 1)))
+                   board=int(raw.get("board", 0)), boards=int(raw.get("boards", 1)),
+                   results_path=raw.get("results_path", HOSTWINDOW))
 
     def to_json(self) -> str:
         """The canonical channel-list form (what the remote runner ships; `from_json` reads it back)."""
@@ -254,10 +269,22 @@ class SocSpec:
                "adc_pipe": self.adc_pipe,
                "with_white_rabbit": self.with_white_rabbit, "wr_marker_dac": self.wr_marker_dac,
                "board": self.board, "boards": self.boards,
+               "results_path": self.results_path,
                "cores": [{"name": c.name, "role": c.role, "mem_depth": c.mem_depth,
                           "with_mul": c.with_mul, "queue_depth": c.queue_depth,
                           "channels": [chan(ch) for ch in c.channels]} for c in self.cores]}
         return json.dumps(out, indent=4)
+
+    # ── the results path ──
+    @property
+    def with_host_window(self) -> bool:
+        """The HostWindow chain (bridge, CC FIFO, funnel, M_AXI_HOST, HOSTWIN registers) is built."""
+        return self.results_path == HOSTWINDOW
+
+    @property
+    def with_antq_uplink(self) -> bool:
+        """The Ant-Q readout uplink (riscq.ddr) is built, with the DDR status word at HOST_DDR_STATUS."""
+        return self.results_path == ANTQ_UPLINK
 
     # ── per-core access ──
     def core(self, index: int) -> CoreSpec:

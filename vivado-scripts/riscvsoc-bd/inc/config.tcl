@@ -1,4 +1,5 @@
 # ---- riscvsoc-bd configuration (script-scope; override any of these from the environment) -----------
+source [file join [file dirname [info script]] threads.tcl]   ;# general.maxThreads for this session
 
 set PART          xczu49dr-ffvf1760-2-e
 set TOP_MODULE    PulseTableSoc

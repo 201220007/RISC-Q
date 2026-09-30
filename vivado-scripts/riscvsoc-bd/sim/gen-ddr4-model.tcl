@@ -26,6 +26,7 @@
 # Output: <build_dir>/ddr4_model_sim/  (model sources), listed at the end.
 # ===========================================================================================
 if {[llength $argv] < 1} { error "usage: -tclargs <build_dir>" }
+source [file join [file dirname [file dirname [file normalize [info script]]]] inc threads.tcl]
 set BUILD [file normalize [lindex $argv 0]]
 set OUT   $BUILD/ddr4_model_sim
 set SCRATCH $BUILD/ddr4_model_gen

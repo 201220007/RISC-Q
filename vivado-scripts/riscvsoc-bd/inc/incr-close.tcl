@@ -14,6 +14,7 @@
 # Outputs: $RISCQ_BUILD_DIR/timing_incr.rpt (the headline), routed_incr.dcp (the closed design —
 #          write_bitstream from it if it is the one to ship).
 set BUILD_DIR $::env(RISCQ_BUILD_DIR)
+source [file join [file dirname [info script]] threads.tcl]   ;# P3b r1: 8 threads for the closure session
 set PBLOCKS   $::env(RISCQ_PBLOCK_TCL)
 set opt    [lindex [glob $BUILD_DIR/*.runs/impl_1/*_opt.dcp] 0]
 set routed [lindex [glob $BUILD_DIR/*.runs/impl_1/*_routed.dcp] 0]

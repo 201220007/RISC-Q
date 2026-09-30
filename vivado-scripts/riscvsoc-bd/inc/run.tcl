@@ -1,5 +1,6 @@
 # ---- Synthesis (+ optional implementation / bitstream), gated by the config run flags --------------
-set_param general.maxThreads 2
+# P3b r1: 8 threads (was 2; the child runs inherited 2 as well: impl_1 ran "DRC with 2 threads").
+source $INC/threads.tcl
 if {$RUN_SYNTH} {
   set_property strategy Flow_PerfOptimized_high [get_runs synth_1]
   set_property STEPS.SYNTH_DESIGN.ARGS.GLOBAL_RETIMING on [get_runs synth_1]
@@ -37,6 +38,10 @@ if {$RUN_SYNTH} {
         puts "\[run\] global retiming on -> IP run $_r"
       }
     }
+  }
+  # every synthesis run (synth_1 and the IP OOC runs) sets its own thread count first
+  foreach _r [get_runs -quiet -filter {IS_SYNTHESIS}] {
+    set_property STEPS.SYNTH_DESIGN.TCL.PRE $INC/threads.tcl $_r
   }
   launch_runs synth_1 -jobs 1
   wait_on_run synth_1
@@ -80,6 +85,7 @@ if {$RUN_IMPL} {
     set_property STEPS.PLACE_DESIGN.TCL.PRE $_ppre [get_runs impl_1]
     puts "\[run\] pblock floorplan: $_ppre (RISCQ_PBLOCK=$::env(RISCQ_PBLOCK))"
   }
+  set_property STEPS.OPT_DESIGN.TCL.PRE $INC/threads.tcl [get_runs impl_1]   ;# opt -> route in one process
   if {$RUN_BITSTREAM} {
     launch_runs impl_1 -to_step write_bitstream -jobs 1
   } else {

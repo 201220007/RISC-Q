@@ -6,5 +6,6 @@
 set INC       [file dirname [file normalize [info script]]]
 set BUILD_DIR $::env(RISCQ_BUILD_DIR)
 set CDC_SFX   incr
+source $INC/threads.tcl
 open_checkpoint $BUILD_DIR/routed_incr.dcp
 source $INC/ddr-check-cdc.tcl

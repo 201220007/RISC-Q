@@ -21,9 +21,11 @@ if {$RUN_SYNTH} {
   # cores (the OOC bench's `synth_design -retiming`), so a block-design impl is a fair compare to the
   # out-of-context vivado-scripts/riscvsoc bench — the synth_1 GLOBAL_RETIMING above only touches the
   # ≈FF-free BD wrapper, never the cores. Both levers reuse the one create_ip_run materialisation.
+  # P3c: the BD's OOC child runs are materialised UNCONDITIONALLY (it used to happen only when an IP-synth
+  # lever was set), so the per-run thread hook below reaches every one of them, lever or not.
+  set _bd [get_files -quiet $BD_NAME.bd]
+  if {[llength $_bd]} { catch { create_ip_run $_bd } }
   if {[info exists ::env(RISCQ_CSET_THRESH)] || [info exists ::env(RISCQ_IP_RETIMING)]} {
-    set _bd [get_files -quiet $BD_NAME.bd]
-    if {[llength $_bd]} { catch { create_ip_run $_bd } }
     set _ipruns [get_runs -quiet -filter {IS_SYNTHESIS && NAME =~ *_top_*}]
     if {[llength $_ipruns] == 0} {
       puts "\[run\] WARN: an IP-synth lever (RISCQ_CSET_THRESH / RISCQ_IP_RETIMING) was set but no *_top_* IP synth run found — cores will NOT get it"
@@ -41,14 +43,37 @@ if {$RUN_SYNTH} {
     }
   }
   # every synthesis run (synth_1 and the IP OOC runs) sets its own thread count first
-  foreach _r [get_runs -quiet -filter {IS_SYNTHESIS}] {
+  set _synruns [get_runs -quiet -filter {IS_SYNTHESIS}]
+  foreach _r $_synruns {
     set_property STEPS.SYNTH_DESIGN.TCL.PRE $INC/threads.tcl $_r
   }
+  puts "\[run\] thread hook on [llength $_synruns] synthesis run(s): [lsort $_synruns]"
   launch_runs synth_1 -jobs 1
   wait_on_run synth_1
   if {[get_property PROGRESS [get_runs synth_1]] != "100%"} {
     error "synthesis failed — see $BUILD_DIR/$PRJ.runs/synth_1"
   }
+  # P3c: prove it from the run logs. Every synthesis run that ran must log `general.maxThreads = 8` (or the
+  # RISCQ_MAX_THREADS value), and the SoC IP run's synth_design command must carry the requested
+  # control-set threshold. A run served from the IP cache has no synth_design in its log and is skipped.
+  set _want_thr [expr {[info exists ::env(RISCQ_MAX_THREADS)] ? $::env(RISCQ_MAX_THREADS) : 8}]
+  set _nothr {}; set _nran 0
+  foreach _r [get_runs -quiet -filter {IS_SYNTHESIS}] {
+    set _rl [get_property DIRECTORY $_r]/runme.log
+    if {![file exists $_rl]} continue
+    set _fh [open $_rl r]; set _rt [read $_fh]; close $_fh
+    if {![regexp {Command: synth_design} $_rt]} continue
+    incr _nran
+    if {![regexp "general.maxThreads = $_want_thr\M" $_rt]} { lappend _nothr $_r }
+    if {[info exists ::env(RISCQ_CSET_THRESH)] && [string match *_top_* $_r]} {
+      if {![regexp "Command: synth_design .*-control_set_opt_threshold $::env(RISCQ_CSET_THRESH)\M" $_rt]} {
+        error "RISCQ_CSET_THRESH=$::env(RISCQ_CSET_THRESH) is not on $_r's synth_design command ($_rl)"
+      }
+      puts "\[run\] verified: $_r ran synth_design -control_set_opt_threshold $::env(RISCQ_CSET_THRESH)"
+    }
+  }
+  if {[llength $_nothr]} { error "these synthesis runs did not log general.maxThreads = $_want_thr: $_nothr" }
+  puts "\[run\] verified: $_nran synthesis run(s) ran with general.maxThreads = $_want_thr"
   open_run synth_1 -name synth_1
   report_utilization     -file $BUILD_DIR/util_synth.rpt
   report_timing_summary  -file $BUILD_DIR/timing_synth.rpt -max_paths 20

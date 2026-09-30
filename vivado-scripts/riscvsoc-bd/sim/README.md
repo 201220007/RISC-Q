@@ -8,7 +8,7 @@ and G3 (`PulseTableSocDdrSim`) drive the SoC's ports against behavioural AXI mod
 |---|---|
 | PS address decode (`0x9000_0000` ctrl, `0x9001_0000` DMA) via **M_AXI_HPM0_LPD** | G2 drives the control slave directly |
 | `smc_ctrl` — the cross-clock SmartConnect from `pl_clk0` into `ui_clk` | there is one clock in G2's control path |
-| `smc_ddr` — 4 KiB burst legalisation for mmu2's `arlen=255` reads | `AxiMemorySim` accepts illegal bursts silently |
+| the uplink's `M_AXI_DDR` connected straight to the MIG (P3c: `smc_ddr` removed; the Spinal uplink's bursts are page-bounded) | `AxiMemorySim` accepts illegal bursts silently |
 | the DDR4 MIG's own AXI slave (`Simulation_Mode = BFM`) | ditto |
 | `axi_dma_0` S2MM: AXIS → `smc_dma` (256→128 down-size) → **PS HP0** | G2 collects the AXIS beats in the testbench |
 | the `ui_clk` reset tree (stretcher → `proc_sys_reset`) | G2/G3 drive resets directly |
@@ -25,8 +25,8 @@ printing `[G4] ok-<phase>:` before the single final `[G4] PASS:`:
 
 | phase | stimulus | pass condition |
 |---|---|---|
-| B | `force` SLVERR, then DECERR, on the MIG's write response (`smc_ddr_M00_AXI_BRESP`) during a flush | STATUS `bresp_err` = 1, a fatal bit: the run is refused |
-| R | the same on the read response (`smc_ddr_M00_AXI_RRESP`) during a drain | the DMA completes, STATUS `rresp_err` = 1: refused |
+| B | `force` SLVERR, then DECERR, on the MIG's write response (`uplink_ddr_axi_BRESP`, the uplink → MIG net) during a flush | STATUS `bresp_err` = 1, a fatal bit: the run is refused |
+| R | the same on the read response (`uplink_ddr_axi_RRESP`) during a drain | the DMA completes, STATUS `rresp_err` = 1: refused |
 | C | `force` the DSP-domain reset (`dsp_rst_peripheral_reset`) for 1 µs mid-run | `run_active` = 0 and the run fails the certification; the next run is byte-exact |
 | D | the same reset while a 32-beat drain is streaming | no TLAST, the S2MM never completes; after the `ddr_board` timeout, the S2MM soft reset clears and the next drain on that channel is byte-exact |
 
@@ -99,5 +99,5 @@ Stated explicitly so the PASS is not read for more than it is worth (Codex r13-#
 - **No RF.** The stimulus is the register-paced injector. Decoder ⇄ DDR equivalence is G3's job.
 
 What it *does* cover is the plumbing between the SoC's ports and the PS, which exists nowhere else:
-address decode over HPM0_LPD, the `smc_ctrl` clock crossing, `smc_ddr` in front of the MIG's AXI slave,
+address decode over HPM0_LPD, the `smc_ctrl` clock crossing, the direct uplink → MIG AXI connection,
 the `axi_dma` S2MM path into HP0 memory, and the `ui_clk` reset tree.

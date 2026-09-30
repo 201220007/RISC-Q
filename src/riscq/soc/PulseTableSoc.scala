@@ -353,7 +353,7 @@ class PulseTableSoc(
   // ── qubic3 Ant-Q readout uplink (antq_uplink builds only) ──
   // Each core's decoder result, as its LEVEL-valued `ReadoutResultLink.source` in dspCd (never the
   // EventLink puts, which carry both valid edges), goes through the uplink into PL DDR4 (`M_AXI_DDR` ->
-  // smc_ddr -> the MIG); the drain streams out on `M_AXIS_RD` -> axi_dma S2MM -> smc_dma -> HP0. The
+  // the MIG, direct since P3c); the drain streams out on `M_AXIS_RD` -> axi_dma S2MM -> smc_dma -> HP0. The
   // control block is `S_AXI_DDR_CTRL` (PS 0x9000_0000). `ddrClk` is the MIG ui_clk, `ddrRst` its
   // psr_ddr peripheral_reset (vivado-scripts/riscvsoc-bd/inc/ddr-connect.tcl). The uplink's own
   // reset is independent of `riscqReset`: `rerun()` re-asserts the core reset right after DONE, and

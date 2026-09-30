@@ -4,7 +4,7 @@
 # after ddr-config.tcl.
 #
 # Domains: the MIG's own c0_ddr4_ui_clk (~333 MHz) is the uplink's `ddrClk`. Everything on the uplink
-# side of the design (top/ddrClk, the DMA, both SmartConnects, the PS HP0 port) runs on it, so there is
+# side of the design (top/ddrClk, the DMA, smc_dma, the PS HP0 port) runs on it, so there is
 # exactly ONE new clock domain in the BD.
 # ===========================================================================================
 # Guard (belt to create-project.tcl's RTL check): the packaged SoC must have the uplink ports.
@@ -30,7 +30,6 @@ connect_bd_net $UI_CLK \
     [get_bd_pins psr_ddr/slowest_sync_clk] \
     [get_bd_pins axi_dma_0/s_axi_lite_aclk] \
     [get_bd_pins axi_dma_0/m_axi_s2mm_aclk] \
-    [get_bd_pins smc_ddr/aclk] \
     [get_bd_pins smc_dma/aclk] \
     [get_bd_pins zynq_ps/saxihp0_fpd_aclk]
 
@@ -43,7 +42,6 @@ connect_bd_net [get_bd_pins ddr_rst_stretch/rst] \
 connect_bd_net [get_bd_pins psr_ddr/peripheral_aresetn] \
     [get_bd_pins ddr4_0/c0_ddr4_aresetn] \
     [get_bd_pins axi_dma_0/axi_resetn] \
-    [get_bd_pins smc_ddr/aresetn] \
     [get_bd_pins smc_dma/aresetn]
 connect_bd_net [get_bd_pins psr_ddr/peripheral_reset] [get_bd_pins $TOP/ddrRst]
 
@@ -54,9 +52,10 @@ connect_bd_net [get_bd_pins psr_ddr/peripheral_reset] [get_bd_pins $TOP/ddrRst]
 connect_bd_net [get_bd_pins ddr4_0/c0_init_calib_complete] [get_bd_pins $TOP/ddrCalibDone]
 
 # ---- data paths ----
-# uplink AXI write/read master -> SmartConnect (4 KiB legalisation, see ddr-config.tcl) -> MIG
-connect_bd_intf_net [get_bd_intf_pins $TOP/M_AXI_DDR]  [get_bd_intf_pins smc_ddr/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins smc_ddr/M00_AXI] [get_bd_intf_pins ddr4_0/C0_DDR4_S_AXI]
+# uplink AXI write/read master -> MIG, direct (P3c: page-bounded bursts, same clock/width/ID; ddr-config.tcl).
+# The net is named, so the G4 testbench can force the MIG's BRESP/RRESP at a stable path
+# (tb_ddr_uplink.DUT.riscq_bd_i.uplink_ddr_axi_*).
+connect_bd_intf_net -intf_net uplink_ddr_axi [get_bd_intf_pins $TOP/M_AXI_DDR] [get_bd_intf_pins ddr4_0/C0_DDR4_S_AXI]
 # uplink AXIS drain -> DMA S2MM -> SmartConnect (256->128 down-size) -> PS HP0
 connect_bd_intf_net [get_bd_intf_pins $TOP/M_AXIS_RD]        [get_bd_intf_pins axi_dma_0/S_AXIS_S2MM]
 connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_S2MM]  [get_bd_intf_pins smc_dma/S00_AXI]

@@ -64,13 +64,13 @@ create_bd_cell -type module -reference reset ddr_rst_stretch
 set_property -dict [list CONFIG.N {5000}] [get_bd_cells ddr_rst_stretch]
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 psr_ddr
 
-# ---- SmartConnects.
-# smc_ddr: the vendored QubiC mmu2 emitted arlen=255 (8 KiB) bursts that crossed 4 KiB boundaries
-# (AXI A3.4.1), and this SmartConnect legalised them (QubiC bd_ddr_streaming.tcl:122-123, "Required, NOT a
-# bare direct net"). Since the P3a SpinalHDL rewrite every uplink burst is page-bounded by construction
-# (src/riscq/ddr/CONTRACT.md F1), so smc_ddr is no longer needed for correctness; the BD keeps it unchanged.
-create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smc_ddr
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1} CONFIG.NUM_CLKS {1}] [get_bd_cells smc_ddr]
+# ---- SmartConnects (P3c: two; smc_ddr is gone, see below).
+# P3c: NO SmartConnect between the uplink and the MIG. smc_ddr legalised the vendored QubiC mmu2's arlen=255
+# (8 KiB) bursts that crossed 4 KiB boundaries (AXI A3.4.1; QubiC bd_ddr_streaming.tcl:122-123). Since the
+# P3a SpinalHDL rewrite every uplink burst is page-bounded by construction (src/riscq/ddr/CONTRACT.md F1),
+# and the uplink's M_AXI_DDR already matches the MIG's AXI slave: the same ui_clk, 256-bit data, 32-bit
+# address, 4-bit ID. So ddr-connect.tcl connects them directly, which saves smc_ddr's ~1.9k LUT / 1.8k FF
+# (its OOC synthesis in the P3c parents) at 92 % CLB.
 # DMA M_AXI_S2MM (256-bit, ui_clk) -> PS HP0 (128-bit, ui_clk): width down-size.
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smc_dma
 set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1} CONFIG.NUM_CLKS {1}] [get_bd_cells smc_dma]

@@ -44,7 +44,8 @@ else does (`inc/config.tcl` reads it from `RISCQ_CONFIG`, which `build-riscvsoc-
 - `hostwindow` (default): upstream's flow, unchanged. `M_AXI_HOST` → HP0, 32-bit, hostClk.
 - `antq_uplink`: `RISCQ_CONFIG=software/configs/zcu216-14q-antq.json ./build-riscvsoc-bd.sh`. It adds:
   - the ZCU216 board part and the DDR4 MIG (`inc/ddr-config.tcl`);
-  - `axi_dma` S2MM, `smc_ddr`, `smc_dma` → HP0 at 128-bit on the MIG ui_clk, and `smc_ctrl` for the
+  - `axi_dma` S2MM, `smc_dma` → HP0 at 128-bit on the MIG ui_clk, the uplink's `M_AXI_DDR` straight into the MIG
+    (P3c: no `smc_ddr`, the bursts are page-bounded), and `smc_ctrl` for the
     control plane at 0x9000_0000 / 0x9001_0000 (`inc/ddr-connect.tcl`);
   - the ui_clk clock group and the uplink's bus-skew constraints (`inc/ddr-timing.xdc`);
   - after impl_1, the `[ddr-cdc]` gate, `report_bus_skew` and `report_cdc` (`inc/ddr-check-cdc.tcl`).

@@ -119,7 +119,7 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
   }
 
   // ───────────────────────────── symmetric uplink resets ─────────────────────────────
-  // A raw DDR reset (psr_ddr peripheral_reset) also resets the AXI fabric behind `ddr` (smc_ddr, the MIG's AXI
+  // A raw DDR reset (psr_ddr peripheral_reset) also resets the AXI fabric behind `ddr` (the MIG's AXI
   // port, the DMA: vivado-scripts/riscvsoc-bd/inc/ddr-connect.tcl), so it may cut the DDR half at once. A raw DSP
   // reset does not reset that fabric, so its effect on the DDR half is HELD (r1) until the AXI master is quiescent:
   // no bank burst started, and no AR pending or R beat due. While held (`quiesce`) nothing new starts and the R

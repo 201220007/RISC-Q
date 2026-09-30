@@ -124,7 +124,7 @@ against `ddr_regs.py`. In particular:
 ### Reset rule (r1)
 
 - A raw DDR reset (`ddrRst`, from `psr_ddr`) resets the AXI fabric behind the `ddr` master with it (the
-  MIG's AXI port, `smc_ddr`, the DMA and `smc_ctrl`; `vivado-scripts/riscvsoc-bd/inc/ddr-connect.tcl`). It
+  MIG's AXI port, the DMA and `smc_ctrl`; `vivado-scripts/riscvsoc-bd/inc/ddr-connect.tcl`). It
   resets both uplink halves at once; no transaction can outlive it.
 - A raw DSP reset does not reset that fabric. Its effect on the DDR half is held until the `ddr` master is
   quiescent: no bank burst started (AW, W or B still due) and no AR pending or R beat due. While it is held,

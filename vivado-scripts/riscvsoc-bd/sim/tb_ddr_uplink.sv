@@ -2,9 +2,9 @@
 // G4 — block-design xsim of the readout->DDR uplink (qubic3 C1).
 //
 // This is the ONLY gate that runs the design with the real Vivado IP in the loop: the Zynq UltraScale+
-// VIP as the PS, the DDR4 MIG (Simulation_Mode = BFM), the two SmartConnects and the S2MM AXI DMA. G2/G3
+// VIP as the PS, the DDR4 MIG (Simulation_Mode = BFM), the SmartConnects and the S2MM AXI DMA. G2/G3
 // use behavioural AXI models; everything BETWEEN the SoC's ports and the PS -- address decode, the
-// ui_clk reset tree, SmartConnect burst legalisation, the DMA's AXIS->memory path -- exists only here.
+// ui_clk reset tree, the direct uplink->MIG AXI connection, the DMA's AXIS->memory path -- exists only here.
 //
 // Stimulus is the built-in test injector (register-paced), so no RF is needed:
 //   base_reset -> N x inj_fire -> flush -> program the DMA -> rd_start -> compare, byte-exactly, the
@@ -14,7 +14,7 @@
 //
 // P3b (results_path antq_uplink, 8300a1c): the same run on the new BD (smc_dma -> HP0 at 128-bit on ui_clk),
 // then four hardware-backed phases (plan v2 r2 #12, P3a "carried into P3b"):
-//   B  a SLVERR, then a DECERR, forced on the MIG's write response (smc_ddr M00 BRESP) -> bresp_err;
+//   B  a SLVERR, then a DECERR, forced on the MIG's write response (BRESP on uplink_ddr_axi) -> bresp_err;
 //   R  a SLVERR, then a DECERR, forced on the MIG's read data response (RRESP) during a drain -> rresp_err;
 //   C  a DSP-domain reset in the middle of a run -> the run is gone and cannot be certified; the next is exact;
 //   D  a DSP-domain reset in the middle of a DRAIN -> the S2MM packet is truncated (no TLAST), the DMA never
@@ -712,9 +712,9 @@ module tb_ddr_uplink;
       p_start(64'h0004_0000 + 64'h1000 * e);
       p_inject(8, 16 + e);
       fcode = code;
-      force DUT.riscq_bd_i.smc_ddr_M00_AXI_BRESP = fcode;  // the MIG's write response, at its output
+      force DUT.riscq_bd_i.uplink_ddr_axi_BRESP = fcode;  // the MIG's write response, at its output
       p_flush(sreg);
-      release DUT.riscq_bd_i.smc_ddr_M00_AXI_BRESP;
+      release DUT.riscq_bd_i.uplink_ddr_axi_BRESP;
       ps_r32(CTRL + O_STATUS, sreg);
       if (sreg[S_BRESP_ERR] !== 1'b1)
         fail($sformatf("BRESP=%b on the write burst but bresp_err is clear (STATUS=0x%08h)", code, sreg));
@@ -734,10 +734,10 @@ module tb_ddr_uplink;
       reset_links();
       p_dma_arm(PS_DEST2, 64);
       fcode = code;
-      force DUT.riscq_bd_i.smc_ddr_M00_AXI_RRESP = fcode;  // the MIG's read response, during the drain
+      force DUT.riscq_bd_i.uplink_ddr_axi_RRESP = fcode;  // the MIG's read response, during the drain
       p_drain_go(base, 64);
       p_dma_wait(POLL_LIMIT, dmasr, sv);
-      release DUT.riscq_bd_i.smc_ddr_M00_AXI_RRESP;
+      release DUT.riscq_bd_i.uplink_ddr_axi_RRESP;
       if (sv !== 1'b1) fail($sformatf("RRESP=%b drain: the DMA did not complete (DMASR=0x%08h)", code, dmasr));
       ps_r32(CTRL + O_STATUS, sreg);
       if (sreg[S_RRESP_ERR] !== 1'b1)
@@ -834,7 +834,7 @@ module tb_ddr_uplink;
     // port -- the design's last signal boundary. Persistence INSIDE the PS memory is not claimed here,
     // and G4b does NOT close it either: G4b's Micron model terminates the PL MIG interface, while HP0
     // still terminates in the same Zynq VIP. PS-memory persistence is provable only on HARDWARE (G6).
-    $display("[G4] PASS: %0d injected results travelled uplink -> smc_ddr -> MIG -> mmu2 -> AXIS -> axi_dma -> smc_dma -> HP0, byte-exact at BOTH the DMA master port and the HP0 slave port, single INCR burst to 0x%08h with full byte strobes; B (BRESP SLVERR/DECERR), R (RRESP SLVERR/DECERR), C (DSP reset mid-run) and D (DMA truncation + S2MM soft-reset recovery) passed%0s",
+    $display("[G4] PASS: %0d injected results travelled uplink -> MIG -> mmu2 -> AXIS -> axi_dma -> smc_dma -> HP0, byte-exact at BOTH the DMA master port and the HP0 slave port, single INCR burst to 0x%08h with full byte strobes; B (BRESP SLVERR/DECERR), R (RRESP SLVERR/DECERR), C (DSP reset mid-run) and D (DMA truncation + S2MM soft-reset recovery) passed%0s",
              N_INJ, PS_DEST[31:0],
              (backdoor_disagreed == 0) ? " (and the VIP memory image agrees)"
                                        : " (PS-memory persistence NOT claimed -- provable only on hardware, see the read_mem note above)");

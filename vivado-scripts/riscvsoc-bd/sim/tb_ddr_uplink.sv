@@ -73,7 +73,10 @@ module tb_ddr_uplink;
   // ---- clocks -----------------------------------------------------------------------------------
   // BFM mode does not run the DDR PHY, so only the free-running board clocks matter.
   reg sysclk300 = 0, dspclk = 0, hostclk = 0, adcclk = 0, dacclk = 0, sysref = 0, usysref = 0;
-  always #1666 sysclk300 = ~sysclk300;   // 300.0 MHz
+  // 3.334 ns, exactly the MIG's CONFIG.C0.DDR4_InputClockPeriod (3334 ps, ddr-config.tcl). The old #1666
+  // (3.332 ns) ran the memory clock 0.06 % fast: the controller's tRRD_S / tFAW counts, sized for 3.334 ns,
+  // then fell 1-9 ps short and the DDR4 model reported them as VIOLATIONs (P3b r1).
+  always #1667 sysclk300 = ~sysclk300;   // 299.94 MHz = the configured 3334 ps
   always #1000 dspclk    = ~dspclk;      // 500.0 MHz
   always #4000 hostclk   = ~hostclk;     // 125.0 MHz
   always #1000 adcclk    = ~adcclk;      // placeholder: nothing in this test uses the RFDC

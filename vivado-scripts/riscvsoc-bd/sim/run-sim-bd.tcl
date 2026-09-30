@@ -20,6 +20,7 @@ if {$MODE ni {bfm phy}} { error "mode must be `bfm` (G4a) or `phy` (G4b), got `$
 set SIM_TIME [expr {[llength $argv] > 1 && [lindex $argv 1] ne "-" ? [lindex $argv 1] \
                     : ($MODE eq "phy" ? "6ms" : "4ms")}]
 set SIM_DIR  [file dirname [file normalize [info script]]]
+source [file join [file dirname $SIM_DIR] inc threads.tcl]   ;# P3b r1
 # r17-#5: validate UNCONDITIONALLY and cover every xsim time unit. The previous form only ran when the
 # string matched ns|us|ms|s, so `1000ps` -- a perfectly valid xsim runtime -- slipped past the >=5 ms
 # rule entirely. Anything that does not parse is now rejected outright rather than waved through.
@@ -140,4 +141,22 @@ if {$_fail != 0 || $_pass != 1} {
   error "G4 FAILED: $_pass PASS marker(s), $_fail FAIL marker(s) in [lindex $_log 0]\
          (a valid run has exactly 1 PASS and 0 FAIL)"
 }
-puts "\[G4\] VERDICT: PASS (1 PASS marker, 0 FAIL markers in [lindex $_log 0])"
+# P3b r1: the markers are not the whole transcript. The DDR4 device model reports protocol and timing
+# violations (tRRD, tFAW, ...) as non-fatal "VIOLATION" messages, and simulator errors are non-fatal too, so
+# count them and fail on any. RISCQ_G4_ALLOW_MODEL_VIOLATIONS=1 turns the model count into a warning (for
+# an investigation run, never for the gate).
+set _viol {}
+set _vlines [regexp -all -inline -line {VIOLATION: .*\n\s*(\S+)} $_txt]
+for {set _i 1} {$_i < [llength $_vlines]} {incr _i 2} { dict incr _viol [lindex $_vlines $_i] }
+set _nviol [regexp -all -line {VIOLATION:} $_txt]
+set _nerr  [regexp -all -line {^(ERROR|Error|FATAL|Fatal)[: ]} $_txt]
+puts "\[G4\] transcript: $_nviol DDR4-model VIOLATION message(s) [expr {$_nviol ? "by type $_viol" : ""}], $_nerr simulator error line(s)"
+if {$_nerr != 0} { error "G4 FAILED: $_nerr error line(s) in [lindex $_log 0]" }
+if {$_nviol != 0} {
+  if {[info exists ::env(RISCQ_G4_ALLOW_MODEL_VIOLATIONS)] && $::env(RISCQ_G4_ALLOW_MODEL_VIOLATIONS)} {
+    puts "\[G4\] WARN: $_nviol model violation(s) allowed by RISCQ_G4_ALLOW_MODEL_VIOLATIONS"
+  } else {
+    error "G4 FAILED: $_nviol DDR4-model VIOLATION message(s) ($_viol) in [lindex $_log 0]"
+  }
+}
+puts "\[G4\] VERDICT: PASS (1 PASS marker, 0 FAIL markers, $_nviol model violations, $_nerr errors in [lindex $_log 0])"

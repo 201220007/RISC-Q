@@ -65,7 +65,7 @@ def sim_batches(request):
     fixture closure (directly or transitively, e.g. through `sub` / `remote` / `demod_phase`),
     so it never starts a simulator that the test did not ask for.
     """
-    names = [n for n in ("cosim", "cosim_2q1c") if n in request.fixturenames]
+    names = [n for n in ("cosim", "cosim_2q1c", "cosim_antq") if n in request.fixturenames]
     if not names:
         yield
         return
@@ -159,6 +159,22 @@ def cosim_mm(request):
     from riscq.sim import server
 
     drv = server.start(CONFIGS / "sim-mm.json", SW_ROOT / "build" / "sim-mm")
+    m = SocMap(SocParams.from_json(drv.sim.get_params()))
+    yield drv, m
+    server.stop(drv)
+
+
+@pytest.fixture(scope="session")
+def cosim_antq(request):
+    """A running verilator co-sim of the sim-dio-antq build: the sim-dio cores (core 0 with a timed-DIO
+    bank, core 1 on its own ADC) with results_path antq_uplink, so the Ant-Q uplink with a modelled PL
+    DDR4 and S2MM DMA replaces the HostWindow: (CosimDriver, SocMap)."""
+    if not request.config.getoption("--cosim"):
+        pytest.skip("needs --cosim")
+    from riscq.map import SocMap, SocParams
+    from riscq.sim import server
+
+    drv = server.start(CONFIGS / "sim-dio-antq.json", SW_ROOT / "build" / "sim-dio-antq")
     m = SocMap(SocParams.from_json(drv.sim.get_params()))
     yield drv, m
     server.stop(drv)

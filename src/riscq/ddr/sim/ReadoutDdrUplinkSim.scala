@@ -17,6 +17,10 @@ import scala.util.Random
 object ReadoutDdrUplinkSim extends App {
   import ReadoutDdrRegs._
 
+  // P3b: `runMain riscq.ddr.sim.ReadoutDdrUplinkSim stalls` runs every scenario again with random AW / AR /
+  // B / W stalls injected at the memory (StallInjector); without the argument it is the P3a G2 run.
+  val STALLS  = args.contains("stalls")
+  val stallTotals = Array.fill(4)(0L)   // AW, AR, B, W stall cycles the uplink saw, over all scenarios
   val NCH     = 4   // local channel count; NOTE: do NOT call it NCH — that is a register offset                      // small enough for fast sims; geometry is derived, not literal
   val BASE0   = 0x1000L
   val p       = ReadoutDdrUplinkParams(numCh = NCH)
@@ -44,6 +48,7 @@ object ReadoutDdrUplinkSim extends App {
           dut.io.results(i).payload.real #= 0; dut.io.results(i).payload.imag #= 0 }
         dut.io.rd.ready #= true
         dut.io.wStall #= false
+        val stalls = new StallInjector(dut, ddrCd, if (STALLS) StallProfile.heavy else StallProfile.none, seed)
         val mem = AxiMemorySim(dut.io.ddr, ddrCd, AxiMemorySimConfig(
           maxOutstandingReads = 2, maxOutstandingWrites = 2,
           readResponseDelay = memDelay, writeResponseDelay = memDelay))
@@ -54,7 +59,10 @@ object ReadoutDdrUplinkSim extends App {
         ddrCd.waitSampling(20); dspCd.waitSampling(20)
         body(dut, new Helper(dut, ddrCd, dspCd, ctrl, mem, new Random(seed), nch))
         AxiProtocolMonitor.check(mons, name)
-        println(s"[G2] PASS $name (AXI protocol monitor clean; stall cycles ${AxiProtocolMonitor.summary(mons)})")
+        stallTotals(0) += stalls.awStalled; stallTotals(1) += stalls.arStalled
+        stallTotals(2) += stalls.bStalled;  stallTotals(3) += stalls.wStalled
+        println(s"[G2] PASS $name (AXI protocol monitor clean; stall cycles ${AxiProtocolMonitor.summary(mons)}" +
+                (if (STALLS) s"; ${stalls.summary})" else ")"))
       }
   }
 
@@ -823,5 +831,9 @@ object ReadoutDdrUplinkSim extends App {
     assert(hits == 1, s"the injected payload landed $hits times; a refused fire must produce NOTHING extra")
   }
 
-  println("[G2] all scenarios PASS")
+  if (STALLS) {
+    println(s"[G2] stall injection totals: AW=${stallTotals(0)} AR=${stallTotals(1)} B=${stallTotals(2)} W=${stallTotals(3)} cycles")
+    assert(stallTotals.forall(_ > 0), "a channel was never stalled: the stall pass would be vacuous for it")
+  }
+  println(s"[G2] all scenarios PASS${if (STALLS) " (with AW/AR/B/W stall injection)" else ""}")
 }

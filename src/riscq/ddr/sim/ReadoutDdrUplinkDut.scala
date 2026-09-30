@@ -25,6 +25,13 @@ case class ReadoutDdrUplinkDut(p: ReadoutDdrUplinkParams) extends Component {
     // r2 (test only): hold the memory side's WREADY low towards the uplink, so a sim can stall W beats
     // (AxiMemorySim cannot back-pressure W). Undriven it is 0 and the W channel passes straight through.
     val wStall  = in Bool()
+    // P3b (test only): the same for AW, AR and B, which in P3a never stalled (AxiMemorySim accepts every
+    // address at once and answers B at once). AW/AR: VALID towards the memory and READY towards the
+    // uplink are held low; B: VALID towards the uplink and READY towards the memory are held low, so the
+    // response is delayed, never lost. All undriven = 0 = pass-through. Driven by `StallInjector`.
+    val awStall = in Bool()
+    val arStall = in Bool()
+    val bStall  = in Bool()
   }
   noIoPrefix()
   val dspCd = ClockDomain(io.dspClk, io.dspRst)
@@ -50,9 +57,15 @@ case class ReadoutDdrUplinkDut(p: ReadoutDdrUplinkParams) extends Component {
   for (i <- 0 until p.numCh) up.io.results(i) << io.results(i)
   up.io.calibDone := True          // the MIG is calibrated in every G2 scenario
   up.io.ctrl  << io.ctrl
-  io.ddr.aw << up.io.ddr.aw
-  io.ddr.ar << up.io.ddr.ar
-  up.io.ddr.b << io.ddr.b
+  io.ddr.aw.payload  := up.io.ddr.aw.payload
+  io.ddr.aw.valid    := up.io.ddr.aw.valid && !io.awStall
+  up.io.ddr.aw.ready := io.ddr.aw.ready && !io.awStall
+  io.ddr.ar.payload  := up.io.ddr.ar.payload
+  io.ddr.ar.valid    := up.io.ddr.ar.valid && !io.arStall
+  up.io.ddr.ar.ready := io.ddr.ar.ready && !io.arStall
+  up.io.ddr.b.payload := io.ddr.b.payload
+  up.io.ddr.b.valid   := io.ddr.b.valid && !io.bStall
+  io.ddr.b.ready      := up.io.ddr.b.ready && !io.bStall
   up.io.ddr.r << io.ddr.r
   io.ddr.w.payload  := up.io.ddr.w.payload
   io.ddr.w.valid    := up.io.ddr.w.valid && !io.wStall

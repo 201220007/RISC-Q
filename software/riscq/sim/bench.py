@@ -49,11 +49,19 @@ SIMSTART_TO_TIME0 = 2
 
 class AxiMaster:
     """Single-beat AXI4 master (len=0, size=2, INCR, strb=0xF); AW/W handshakes independent,
-    B/R awaited. Proven mechanics from the old cosim driver."""
+    B/R awaited. Proven mechanics from the old cosim driver. `prefix`/`clk` select the port: the SoC's
+    host slave `io_axi` on `clk` (default), or an antq_uplink build's `s_axi_ddr_ctrl` on `ddrClk`."""
 
-    def __init__(self, dut):
+    def __init__(self, dut, prefix: str = "io_axi", clk=None, aw_w_together: bool = False):
         self.dut = dut
-        self.clk = dut.clk
+        self.p = prefix
+        self.clk = dut.clk if clk is None else clk
+        # SpinalHDL's Axi4SlaveFactory (the uplink's control slave) takes AW only together with W, so
+        # that master raises both VALIDs at once; the host path keeps its proven AW-then-W order.
+        self.aw_w_together = aw_w_together
+
+    def _s(self, name: str):
+        return getattr(self.dut, f"{self.p}_{name}")
 
     async def _await_ready(self, valid, ready, what: str):
         valid.value = 1
@@ -64,43 +72,63 @@ class AxiMaster:
                 return
         raise RuntimeError(f"AXI {what} handshake timeout after {AXI_TIMEOUT} cycles")
 
+    async def _await_both(self):
+        """AW and W VALID together; each drops on its own handshake (they may complete apart)."""
+        aw_v, aw_r, w_v, w_r = (self._s("aw_valid"), self._s("aw_ready"), self._s("w_valid"), self._s("w_ready"))
+        aw_v.value = 1
+        w_v.value = 1
+        aw_done = w_done = False
+        for _ in range(AXI_TIMEOUT):
+            await RisingEdge(self.clk)
+            if not aw_done and aw_r.value == 1:
+                aw_done = True
+                aw_v.value = 0
+            if not w_done and w_r.value == 1:
+                w_done = True
+                w_v.value = 0
+            if aw_done and w_done:
+                return
+        raise RuntimeError(f"AXI AW/W handshake timeout after {AXI_TIMEOUT} cycles "
+                           f"(aw done {aw_done}, w done {w_done})")
+
     def _addr_phase(self, prefix: str, addr: int):
-        d = self.dut
-        getattr(d, f"io_axi_{prefix}_payload_addr").value = addr & 0xFFFFFFFF
+        width = len(self._s(f"{prefix}_payload_addr"))
+        self._s(f"{prefix}_payload_addr").value = addr & ((1 << width) - 1)
         for field, value in (("id", 0), ("region", 0), ("len", 0), ("size", 2),
                              ("burst", 1), ("lock", 0), ("cache", 0), ("qos", 0), ("prot", 0)):
-            getattr(d, f"io_axi_{prefix}_payload_{field}").value = value
+            self._s(f"{prefix}_payload_{field}").value = value
 
     async def write_word(self, addr: int, data: int) -> None:
-        d = self.dut
         self._addr_phase("aw", addr)
-        d.io_axi_w_payload_data.value = data & 0xFFFFFFFF
-        d.io_axi_w_payload_strb.value = 0xF
-        d.io_axi_w_payload_last.value = 1
-        d.io_axi_b_ready.value = 1
-        await self._await_ready(d.io_axi_aw_valid, d.io_axi_aw_ready, "AW")
-        await self._await_ready(d.io_axi_w_valid, d.io_axi_w_ready, "W")
+        self._s("w_payload_data").value = data & 0xFFFFFFFF
+        self._s("w_payload_strb").value = 0xF
+        self._s("w_payload_last").value = 1
+        self._s("b_ready").value = 1
+        if self.aw_w_together:
+            await self._await_both()
+        else:
+            await self._await_ready(self._s("aw_valid"), self._s("aw_ready"), "AW")
+            await self._await_ready(self._s("w_valid"), self._s("w_ready"), "W")
         for _ in range(AXI_TIMEOUT):
-            if d.io_axi_b_valid.value == 1:
+            if self._s("b_valid").value == 1:
                 break
             await RisingEdge(self.clk)
         else:
             raise RuntimeError(f"AXI B response timeout at addr {addr:#x}")
-        d.io_axi_b_ready.value = 0
+        self._s("b_ready").value = 0
 
     async def read_word(self, addr: int) -> int:
-        d = self.dut
         self._addr_phase("ar", addr)
-        d.io_axi_r_ready.value = 1
-        await self._await_ready(d.io_axi_ar_valid, d.io_axi_ar_ready, "AR")
+        self._s("r_ready").value = 1
+        await self._await_ready(self._s("ar_valid"), self._s("ar_ready"), "AR")
         for _ in range(AXI_TIMEOUT):
-            if d.io_axi_r_valid.value == 1:
+            if self._s("r_valid").value == 1:
                 break
             await RisingEdge(self.clk)
         else:
             raise RuntimeError(f"AXI R response timeout at addr {addr:#x}")
-        data = int(d.io_axi_r_payload_data.value) & 0xFFFFFFFF
-        d.io_axi_r_ready.value = 0
+        data = int(self._s("r_payload_data").value) & 0xFFFFFFFF
+        self._s("r_ready").value = 0
         return data
 
 
@@ -328,6 +356,177 @@ async def _wr_loopback(dut):
         await Timer(half_ns, units="ns")
 
 
+# ── Ant-Q uplink (results_path antq_uplink): the PL DDR4 behind the MIG, and the S2MM DMA ─────────────
+DDR_CLK_PERIOD_NS = 7     # the MIG ui_clk stand-in: asynchronous to clk / dspClk (10 ns)
+DDR_BEAT = 32             # 256-bit AXI beats
+
+
+class DdrModel:
+    """The MIG's AXI slave (256-bit, INCR bursts) over a sparse byte store, plus the knobs a test turns:
+    `b_delay` (ui cycles from WLAST to BVALID: delayed writes), `aw_stall` / `ar_stall` / `b_stall`
+    (per-cycle probability of holding the channel off), `bresp` / `rresp` (the response of the NEXT
+    burst, then back to OKAY). The S2MM side (`dma_*`) stands in for axi_dma: armed with a length it
+    holds TREADY (randomly deasserted with `tready_stall`), collects beats, and completes on TLAST."""
+
+    def __init__(self):
+        self.mem: dict[int, int] = {}          # byte address -> byte (absent = 0)
+        self.rng = np.random.default_rng(20260929)
+        self.b_delay = 0
+        self.aw_stall = self.ar_stall = self.b_stall = 0.0
+        self.tready_stall = 0.0
+        self.bresp_next = 0
+        self.rresp_next = 0
+        self.stats = {"aw": 0, "ar": 0, "w": 0, "r": 0, "b": 0, "aw_stalled": 0, "ar_stalled": 0,
+                      "b_stalled": 0, "axis": 0, "axis_stalled": 0}
+        self.dma = None                          # the armed S2MM transfer, or None (TREADY low)
+        self._next_dma = 0
+
+    def configure(self, cfg: dict) -> dict:
+        for k in ("b_delay", "aw_stall", "ar_stall", "b_stall", "tready_stall", "bresp_next", "rresp_next"):
+            if k in cfg:
+                setattr(self, k, type(getattr(self, k))(cfg[k]))
+        return dict(self.stats)
+
+    def stall(self, p: float) -> bool:
+        return p > 0 and self.rng.random() < p
+
+    def write_beat(self, addr: int, data: int, strb: int) -> None:
+        for b in range(DDR_BEAT):
+            if strb >> b & 1:
+                self.mem[addr + b] = data >> (8 * b) & 0xFF
+
+    def read_beat(self, addr: int) -> int:
+        return int.from_bytes(bytes(self.mem.get(addr + b, 0) for b in range(DDR_BEAT)), "little")
+
+    def read(self, addr: int, nbytes: int) -> bytes:
+        return bytes(self.mem.get(addr + i, 0) for i in range(nbytes))
+
+
+async def _ddr_slave(dut, dm: DdrModel) -> None:
+    """`m_axi_ddr` slave on ddrClk. Same falling-edge discipline as `_host_window_slave`: at the falling
+    edge the master's VALID/READY are stable since the last rising edge, so a READY/VALID driven now
+    decides the transfer at the coming rising edge. One burst is written or read at a time per channel;
+    AW/AR are queued (up to 4)."""
+    clk = dut.ddrClk
+    p = "m_axi_ddr"
+    sig = lambda n: getattr(dut, f"{p}_{n}")      # noqa: E731
+    awq: deque = deque()
+    arq: deque = deque()
+    bq: deque = deque()                             # (due_cycle, id, resp)
+    cyc = 0
+    wbeat = 0
+    rcur = None                                     # [addr, beats_left, id, resp]
+    b_up = False                                    # BVALID presented, not yet taken
+    for n in ("aw_ready", "w_ready", "b_valid", "ar_ready", "r_valid"):
+        sig(n).value = 0
+    while True:
+        await FallingEdge(clk)
+        cyc += 1
+        # ── AW ──
+        aw_ready = len(awq) < 4 and not dm.stall(dm.aw_stall)
+        if _int_or_zero(sig("aw_valid")):
+            if aw_ready:
+                awq.append([_int_or_zero(sig("aw_payload_addr")), _int_or_zero(sig("aw_payload_len")) + 1,
+                            _int_or_zero(sig("aw_payload_id"))])
+                dm.stats["aw"] += 1
+            else:
+                dm.stats["aw_stalled"] += 1
+        sig("aw_ready").value = int(aw_ready)
+        # ── W: accepted only against a known burst (the uplink sends W after its AW) ──
+        w_ready = bool(awq)
+        if w_ready and _int_or_zero(sig("w_valid")):
+            addr, beats, bid = awq[0]
+            dm.write_beat(addr + DDR_BEAT * wbeat, _int_or_zero(sig("w_payload_data")),
+                          _int_or_zero(sig("w_payload_strb")))
+            dm.stats["w"] += 1
+            wbeat += 1
+            last = _int_or_zero(sig("w_payload_last"))
+            if last != (wbeat == beats):
+                raise RuntimeError(f"m_axi_ddr: WLAST={last} on beat {wbeat} of a {beats}-beat burst at {addr:#x}")
+            if last:
+                awq.popleft()
+                wbeat = 0
+                bq.append((cyc + dm.b_delay, bid, dm.bresp_next))
+                dm.bresp_next = 0
+        sig("w_ready").value = int(w_ready)
+        # ── B: presented once due (and not stalled); once BVALID is up it stays up until the handshake
+        # (AXI), which happens at the coming edge if BREADY is high now ──
+        if not b_up and bq and bq[0][0] <= cyc:
+            if dm.stall(dm.b_stall):
+                dm.stats["b_stalled"] += 1
+            else:
+                b_up = True
+        if b_up:
+            sig("b_payload_id").value = bq[0][1]
+            sig("b_payload_resp").value = bq[0][2]
+        sig("b_valid").value = int(b_up)
+        if b_up and _int_or_zero(sig("b_ready")):
+            bq.popleft()
+            b_up = False
+            dm.stats["b"] += 1
+        # ── AR ──
+        ar_ready = len(arq) < 4 and not dm.stall(dm.ar_stall)
+        if _int_or_zero(sig("ar_valid")):
+            if ar_ready:
+                arq.append([_int_or_zero(sig("ar_payload_addr")), _int_or_zero(sig("ar_payload_len")) + 1,
+                            _int_or_zero(sig("ar_payload_id")), dm.rresp_next])
+                dm.rresp_next = 0
+                dm.stats["ar"] += 1
+            else:
+                dm.stats["ar_stalled"] += 1
+        sig("ar_ready").value = int(ar_ready)
+        # ── R: one burst at a time, in order ──
+        if rcur is None and arq:
+            rcur = arq.popleft()
+        if rcur is not None:
+            addr, left, rid, resp = rcur
+            sig("r_payload_data").value = dm.read_beat(addr)
+            sig("r_payload_id").value = rid
+            sig("r_payload_resp").value = resp
+            sig("r_payload_last").value = int(left == 1)
+            sig("r_valid").value = 1
+            if _int_or_zero(sig("r_ready")):
+                dm.stats["r"] += 1
+                rcur = None if left == 1 else [addr + DDR_BEAT, left - 1, rid, resp]
+        else:
+            sig("r_valid").value = 0
+
+
+class DmaTransfer:
+    """One armed S2MM transfer: `nbytes` programmed, beats collected until TLAST."""
+
+    def __init__(self, nbytes: int):
+        self.nbytes = nbytes
+        self.data = bytearray()
+        self.tlast = False
+        self.error: str | None = None
+
+
+async def _axis_sink(dut, dm: DdrModel) -> None:
+    """`m_axis_rd` -> the S2MM DMA stand-in. TREADY is high only while a transfer is armed (a halted
+    DMA holds it low), minus the random `tready_stall`. Like axi_dma it completes on TLAST: a packet
+    longer than the programmed length is an error, a shorter one is returned short (the driver's
+    `ddr.py` length checks then refuse it)."""
+    clk = dut.ddrClk
+    dut.m_axis_rd_ready.value = 0
+    while True:
+        await FallingEdge(clk)
+        t = dm.dma
+        ready = t is not None and not t.tlast and t.error is None and not dm.stall(dm.tready_stall)
+        if _int_or_zero(dut.m_axis_rd_valid):
+            if ready:
+                beat = _int_or_zero(dut.m_axis_rd_payload_fragment)
+                t.data += beat.to_bytes(DDR_BEAT, "little")
+                dm.stats["axis"] += 1
+                if _int_or_zero(dut.m_axis_rd_payload_last):
+                    t.tlast = True
+                if len(t.data) > t.nbytes:
+                    t.error = f"S2MM overrun: {len(t.data)} B received for a {t.nbytes} B transfer"
+            elif t is not None:
+                dm.stats["axis_stalled"] += 1
+        dut.m_axis_rd_ready.value = int(ready)
+
+
 class _Req:
     __slots__ = ("op", "args", "done", "result", "error")
 
@@ -401,6 +600,9 @@ class DriverServer:
     def dio_set(self, name, value):
         return self._submit("dio_set", str(name), int(value))
 
+    def dio_loopback(self, name, on):
+        return self._submit("dio_loopback", str(name), bool(on))
+
     def set_model(self, spec):
         return self._submit("set_model", dict(spec))
 
@@ -415,6 +617,25 @@ class DriverServer:
 
     def get_params(self):
         return self._params
+
+    # ── antq_uplink builds: the uplink's control slave, the modelled PL DDR4 and the S2MM stand-in ──
+    def ddr_read32(self, off):
+        return self._submit("ddr_read32", int(off))
+
+    def ddr_write32(self, off, value):
+        return self._submit("ddr_write32", int(off), int(value))
+
+    def ddr_config(self, cfg):
+        return self._submit("ddr_config", dict(cfg))
+
+    def ddr_mem(self, addr, nbytes):
+        return self._submit("ddr_mem", int(addr), int(nbytes))
+
+    def dma_arm(self, nbytes):
+        return self._submit("dma_arm", int(nbytes))
+
+    def dma_get(self, timeout_cycles):
+        return self._submit("dma_get", int(timeout_cycles))
 
     # ── server-side batch runner (spec 08 §5): run the SAME riscq.run functions next to the sim,
     # so a whole batch is one RPC instead of ~10 per-op round trips. The seam ops each method issues
@@ -451,8 +672,12 @@ class _BenchState:
         self.captures: dict[int, DacCapture] = {}
         self._next_handle = 0
         self.model = models.ZeroModel()   # ADC seam; replaced at runtime via set_model
-        # the modelled PS DDR4 result buffer: one 16 MB slice per core (specs/software/22 §3)
+        # the modelled PS DDR4 result buffer: one 16 MB slice per core (specs/software/22 §3); none
+        # on an antq_uplink build, which has instead the uplink's PL DDR4 and S2MM models
         self.host_mem = bytearray(m.hostwin_bytes_total)
+        self.dm = DdrModel() if m.params.with_antq_uplink else None
+        self.dio_loop: dict[str, bool] = {}
+        self.ddr_axi: AxiMaster | None = None
 
     def host_write(self, addr: int, data: int, strb: int) -> None:
         """Apply one AXI beat to the modelled buffer. An address outside the buffer is a real bug
@@ -523,6 +748,22 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
         getattr(dut, sig).value = int(value) & 0xFFFF
         await ClockCycles(dut.dspClk, 1)
         return None
+    if op == "dio_loopback":
+        # a wire from the bank's outputs back to its inputs: every scheduled output edge then posts an
+        # input event on the core's up-link (the traffic an uplink tap must not count)
+        name, on = args
+        out_sig, in_sig = f"io_dio_{name}_out", f"io_dio_{name}_in"
+        if not (hasattr(dut, out_sig) and hasattr(dut, in_sig)):
+            raise ValueError(f"no such DIO bank: {name}")
+        st.dio_loop[name] = bool(on)
+        if on:
+            async def _loop():
+                o, i = getattr(dut, out_sig), getattr(dut, in_sig)
+                while st.dio_loop.get(name):
+                    await FallingEdge(dut.dspClk)
+                    i.value = _int_or_zero(o)
+            cocotb.start_soon(_loop())
+        return None
     if op == "read_block":
         addr, nbytes = args
         if nbytes % 4:
@@ -544,6 +785,32 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
             raise ValueError(f"read_host [{off}, {off + nbytes}) outside the "
                              f"{len(st.host_mem)} B host buffer")
         return bytes(st.host_mem[off:off + nbytes])
+    if op in ("ddr_read32", "ddr_write32", "ddr_config", "ddr_mem", "dma_arm", "dma_get"):
+        if st.dm is None:
+            raise ValueError(f"{op}: this build has results_path={st.m.params.results_path!r}, no uplink")
+        if op == "ddr_read32":
+            return await st.ddr_axi.read_word(args[0])
+        if op == "ddr_write32":
+            return await st.ddr_axi.write_word(args[0], args[1])
+        if op == "ddr_config":
+            return st.dm.configure(args[0])
+        if op == "ddr_mem":
+            return st.dm.read(args[0], args[1])
+        if op == "dma_arm":
+            if st.dm.dma is not None and not st.dm.dma.tlast and st.dm.dma.error is None:
+                raise RuntimeError("dma_arm: a transfer is still in flight")
+            st.dm.dma = DmaTransfer(args[0])
+            return None
+        if op == "dma_get":
+            t = st.dm.dma
+            if t is None:
+                raise RuntimeError("dma_get: nothing armed")
+            spent = 0
+            while not t.tlast and t.error is None and spent < args[0]:
+                await ClockCycles(dut.ddrClk, 50)
+                spent += 50
+            st.dm.dma = None
+            return bytes(t.data), bool(t.tlast), t.error
     if op == "set_model":
         st.model = models.build_model(dict(args[0]), st.m)
         return None
@@ -581,9 +848,17 @@ async def cosim_server(dut):
         getattr(dut, f"io_axi_{sig}_valid").value = 0
     dut.io_axi_b_ready.value = 0
     dut.io_axi_r_ready.value = 0
-    dut.io_hostMem_aw_ready.value = 0
-    dut.io_hostMem_w_ready.value = 0
-    dut.io_hostMem_b_valid.value = 0
+    if st.m.params.with_host_window:
+        dut.io_hostMem_aw_ready.value = 0
+        dut.io_hostMem_w_ready.value = 0
+        dut.io_hostMem_b_valid.value = 0
+    else:                                   # antq_uplink: the uplink's own ports, DDR side in reset
+        dut.ddrRst.value = 1
+        dut.ddrCalibDone.value = 0
+        for sig in ("aw", "w", "ar"):
+            getattr(dut, f"s_axi_ddr_ctrl_{sig}_valid").value = 0
+        dut.s_axi_ddr_ctrl_b_ready.value = 0
+        dut.s_axi_ddr_ctrl_r_ready.value = 0
     for i in range(cfg["dac_num"]):
         getattr(dut, f"io_dac_{i}_ready").value = 1
     for i in range(cfg["adc_num"]):
@@ -593,12 +868,21 @@ async def cosim_server(dut):
     cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, units="ns").start())
     cocotb.start_soon(Clock(dut.dspClk, CLK_PERIOD_NS, units="ns").start())
     cocotb.start_soon(_adc_stimulus(dut, st))   # ADC seam (idle until a model is set)
-    cocotb.start_soon(_host_window_slave(dut, st))   # PS DDR4 result buffer (specs/software/22)
+    if st.m.params.with_host_window:
+        cocotb.start_soon(_host_window_slave(dut, st))   # PS DDR4 result buffer (specs/software/22)
+    else:
+        cocotb.start_soon(Clock(dut.ddrClk, DDR_CLK_PERIOD_NS, units="ns").start())
+        cocotb.start_soon(_ddr_slave(dut, st.dm))        # the MIG + PL DDR4
+        cocotb.start_soon(_axis_sink(dut, st.dm))        # axi_dma S2MM
+        st.ddr_axi = AxiMaster(dut, prefix="s_axi_ddr_ctrl", clk=dut.ddrClk, aw_w_together=True)
     if cfg.get("with_white_rabbit", False):
         cocotb.start_soon(_wr_loopback(dut))    # WR phy self-loopback (test_wr.py cosim smoke)
     await Timer(200, units="ns")
     dut.reset.value = 0
     dut.dspRst.value = 0
+    if not st.m.params.with_host_window:
+        dut.ddrCalibDone.value = 1          # the MIG calibrated ...
+        dut.ddrRst.value = 0                # ... and psr_ddr released the ui_clk reset tree
     # refTime (dspCd, free-running) starts counting from this dspRst release — pin the batch-time anchor
     # here. Batch time is monotonic across runs, so this is the single session-wide origin (spec 08).
     st.mirror.set_origin(_cycle())

@@ -76,6 +76,10 @@ class _SimExtras:
         dspClk edge; the bank samples them and posts an edge event with that batch's time)."""
         self._proxy.dio_set(str(name), int(value))
 
+    def dio_loopback(self, name: str, on: bool = True) -> None:
+        """Wire the timed-DIO bank `io_dio_<name>_out` back to its `_in` every dspClk (on) or stop."""
+        self._proxy.dio_loopback(str(name), bool(on))
+
     def set_model(self, spec: dict) -> None:
         """Select/replace the ADC-loop QuantumModel at runtime (spec 05 §3). `spec` is a
         JSON-serializable dict the sim process constructs, e.g. {"kind": "zero"},
@@ -98,6 +102,83 @@ class _SimExtras:
 
     def shutdown(self) -> None:
         self._proxy.shutdown()
+
+    # ── antq_uplink builds (results_path): the uplink's control slave and the modelled PL DDR4 / DMA ──
+    def ddr_read32(self, off: int) -> int:
+        """Read the uplink control register at offset `off` (DdrMap.ctrl_base-relative)."""
+        return int(self._proxy.ddr_read32(int(off)))
+
+    def ddr_write32(self, off: int, value: int) -> None:
+        self._proxy.ddr_write32(int(off), int(value) & 0xFFFFFFFF)
+
+    def ddr_config(self, cfg: dict | None = None) -> dict:
+        """Set the DDR model's knobs (b_delay, aw_stall, ar_stall, b_stall, tready_stall, bresp_next,
+        rresp_next) and return its traffic/stall counters."""
+        return dict(self._proxy.ddr_config(dict(cfg or {})))
+
+    def ddr_mem(self, addr: int, nbytes: int) -> bytes:
+        """The modelled PL DDR4 contents (a test observation, like model_state)."""
+        return _to_bytes(self._proxy.ddr_mem(int(addr), int(nbytes)))
+
+    def dma_arm(self, nbytes: int) -> None:
+        self._proxy.dma_arm(int(nbytes))
+
+    def dma_get(self, timeout_cycles: int = 2_000_000):
+        data, tlast, err = self._proxy.dma_get(int(timeout_cycles))
+        return _to_bytes(data), bool(tlast), err
+
+
+class CosimDdr:
+    """The `riscq.ddr.DdrReadout` driver surface over the co-sim (the co-sim twin of
+    `riscq.board.ddr_board.DdrBoard`): read32/write32 route the uplink control window
+    (`DdrMap.ctrl_base`) to the bench's `s_axi_ddr_ctrl` master and every other address to the SoC's
+    host bus, and `dma_recv_prepare` / `dma_recv_wait` drive the bench's S2MM stand-in. Like the real
+    axi_dma it completes on TLAST; a short or missing packet raises, as `DdrBoard` does."""
+
+    def __init__(self, drv: "CosimDriver", ddr_map=None, timeout_cycles: int = 2_000_000):
+        from riscq.ddr import DdrMap
+        self.drv = drv
+        self.map = ddr_map or DdrMap()
+        self.timeout_cycles = timeout_cycles
+        self._armed = None
+
+    def _ctrl(self, addr: int):
+        if self.map.ctrl_base <= addr < self.map.ctrl_base + self.map.ctrl_size:
+            return addr - self.map.ctrl_base
+        if self.map.dma_base <= addr < self.map.dma_base + self.map.dma_size:
+            raise ValueError(f"{addr:#x}: the DMA registers are not modelled; use dma_recv_*")
+        return None
+
+    def read32(self, addr: int) -> int:
+        off = self._ctrl(addr)
+        return self.drv.read32(addr) if off is None else self.drv.sim.ddr_read32(off)
+
+    def write32(self, addr: int, value: int) -> None:
+        off = self._ctrl(addr)
+        if off is None:
+            self.drv.write32(addr, value)
+        else:
+            self.drv.sim.ddr_write32(off, value)
+
+    def dma_recv_prepare(self, nbytes: int):
+        if self._armed is not None:
+            raise RuntimeError("an S2MM transfer is already in flight")
+        self.drv.sim.dma_arm(nbytes)
+        self._armed = int(nbytes)
+        return self._armed
+
+    def dma_recv_wait(self, handle, nbytes: int) -> bytes:
+        if handle != self._armed or nbytes != self._armed:
+            raise RuntimeError(f"dma_recv_wait({nbytes}) does not match the armed transfer ({self._armed})")
+        self._armed = None
+        data, tlast, err = self.drv.sim.dma_get(self.timeout_cycles)
+        if err:
+            raise RuntimeError(f"S2MM error: {err}")
+        if not tlast:
+            raise RuntimeError(f"S2MM timeout: {len(data)} of {nbytes} B and no TLAST")
+        if len(data) != nbytes:
+            raise RuntimeError(f"S2MM short packet: TLAST after {len(data)} of {nbytes} B")
+        return data
 
 
 class _RemoteExtras:

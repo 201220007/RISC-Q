@@ -34,6 +34,11 @@ import scala.util.Random
  * Run: mill-1.1.0 runMain riscq.ddr.sim.ReadoutDdrUplinkCdcSim
  */
 object ReadoutDdrUplinkCdcSim extends App {
+  // P3b: `runMain riscq.ddr.sim.ReadoutDdrUplinkCdcSim stalls` runs every scenario with random AW / AR / B
+  // stalls injected at the memory (StallInjector; W stays hand-driven for reset_dsp_in_w_backpressure).
+  // The reset_dsp_in_{aw,ar,b}_stall scenarios hold one channel stalled by hand in either mode.
+  val STALLS = args.contains("stalls")
+  val stallTotals = Array.fill(3)(0L)   // AW, AR, B stall cycles the uplink saw, over all scenarios
   import ReadoutDdrRegs._
 
   val NCH = 4
@@ -63,6 +68,7 @@ object ReadoutDdrUplinkCdcSim extends App {
       dut.io.results(i).payload.real #= 0; dut.io.results(i).payload.imag #= 0 }
     dut.io.rd.ready #= true
     dut.io.wStall #= false
+    val stalls = new StallInjector(dut, ddrCd, if (STALLS) StallProfile.addrB else StallProfile.none, rng.nextLong())
     var mons: Seq[ValidReadyMonitor] = Nil
     val axi = mutable.ArrayBuffer[AxiEvent]()
     var mem: AxiMemorySim = null
@@ -247,7 +253,9 @@ object ReadoutDdrUplinkCdcSim extends App {
         val b = new Bench(dut, new Random(seed), memDelay)
         body(b)
         AxiProtocolMonitor.check(b.mons, name)
-        println(s"[P3a-CDC] PASS $name (AXI protocol monitor clean; stall cycles ${AxiProtocolMonitor.summary(b.mons)})")
+        stallTotals(0) += b.stalls.awStalled; stallTotals(1) += b.stalls.arStalled; stallTotals(2) += b.stalls.bStalled
+        println(s"[P3a-CDC] PASS $name (AXI protocol monitor clean; stall cycles ${AxiProtocolMonitor.summary(b.mons)}" +
+                (if (STALLS) s"; ${b.stalls.summary})" else ")"))
       }
   }
 
@@ -598,5 +606,67 @@ object ReadoutDdrUplinkCdcSim extends App {
     fullRun(b, 0xE0000L, 70, 61)
   }
 
-  println("[P3a-CDC] all scenarios PASS")
+  // ── P3b: a DSP reset while the memory holds AW, AR or B stalled. The reset hold (r1) must wait for the
+  //    stalled transaction to complete (AXI forbids dropping a VALID before its handshake, and a B still
+  //    owed would otherwise meet the next run), reset the DDR half with nothing outstanding, and the next run
+  //    must be exact. In P3a these channels never stalled. ──
+  def resetInStall(b: Bench, ch: String, base: Long, salt: Int): Unit = {
+    normalStart(b)
+    b.stalls.enabled = false                          // this scenario drives the stall pins by hand
+    b.dut.io.awStall #= false; b.dut.io.arStall #= false; b.dut.io.bStall #= false
+    val pin = ch match { case "AW" => b.dut.io.awStall; case "AR" => b.dut.io.arStall; case "B" => b.dut.io.bStall }
+    val holdCycles = 150
+    var stalledFor = 0
+    b.startRun(base)
+    val exp = b.push(if (ch == "AR") 64 else 64, salt)
+    if (ch == "AR") {
+      // get a complete bank into DDR, then hold AR while a drain is started, and reset under it
+      b.flushRun()
+      b.dut.io.arStall #= true
+      b.wr(RD_BASE, BigInt(base)); b.wr(RD_SIZE, BigInt(512)); b.wr(RD_START, BigInt(1))
+      while (!b.dut.up.io.ddr.ar.valid.toBoolean) b.ddrCd.waitSampling()
+    } else {
+      pin #= true
+      val probe = ch match { case "AW" => () => b.dut.up.io.ddr.aw.valid.toBoolean; case _ => () => b.dut.io.ddr.b.valid.toBoolean }
+      var n = 0
+      while (!probe() && n < 20000) { b.ddrCd.waitSampling(); n += 1 }
+      assert(probe(), s"$ch never went valid under the stall")
+    }
+    // the channel is now stalled with VALID high: reset the DSP side inside the stall window
+    b.dut.io.dspRst #= true
+    b.waitNs(160)
+    b.dut.io.dspRst #= false
+    for (_ <- 0 until holdCycles) {
+      b.ddrCd.waitSampling()
+      if (ch != "B" || b.dut.io.ddr.b.valid.toBoolean) stalledFor += 1
+      assert(b.applyEvents.isEmpty, s"the DDR half reset while $ch was still stalled (after $stalledFor cycles)")
+    }
+    pin #= false
+    var m = 0
+    while (b.applyEvents.isEmpty && m < 40000) { b.ddrCd.waitSampling(); m += 1 }
+    println(s"[P3a-CDC] reset_dsp_in_${ch.toLowerCase}_stall: $ch held for $stalledFor cycles across the reset; " +
+            s"DDR half reset at ${b.applyEvents}; AW=${b.nAw} B=${b.nB} AR=${b.nAr} RLAST=${b.nRlast}")
+    assert(b.applyEvents.size == 1 && b.applyEvents.head._2 == 0 && b.applyEvents.head._3 == 0 && !b.applyEvents.head._4,
+      s"the DDR half reset with a transaction outstanding: ${b.applyEvents}")
+    assert(b.nB == b.nAw, s"$ch: ${b.nAw} AW vs ${b.nB} B -- a write was abandoned")
+    assert(b.nRlast == b.nAr, s"$ch: ${b.nAr} AR vs ${b.nRlast} RLAST -- a read was abandoned")
+    if (ch == "AW") {
+      // the stalled bank burst was completed with the bank's own data (the hold keeps the writer's bank)
+      val perTag = b.ddrWords(base, 64).groupBy(w => ((w >> 56) & 0xff).toInt)
+      for (i <- 0 until NCH)
+        assert(perTag.getOrElse(i, Nil) == exp(i).map { case (r, im) => tagWord(i, r, im) }, s"core $i: the stalled burst's data")
+    }
+    b.ddrCd.waitSampling(40)
+    b.stalls.enabled = STALLS
+    fullRun(b, base + 0x10000L, 70, salt + 1)
+  }
+  run("reset_dsp_in_aw_stall", 13) { b => resetInStall(b, "AW", 0x100000L, 70) }
+  run("reset_dsp_in_ar_stall", 14) { b => resetInStall(b, "AR", 0x120000L, 72) }
+  run("reset_dsp_in_b_stall",  15) { b => resetInStall(b, "B",  0x140000L, 74) }
+
+  if (STALLS) {
+    println(s"[P3a-CDC] stall injection totals: AW=${stallTotals(0)} AR=${stallTotals(1)} B=${stallTotals(2)} cycles")
+    assert(stallTotals.forall(_ > 0), "a channel was never stalled: the stall pass would be vacuous for it")
+  }
+  println(s"[P3a-CDC] all scenarios PASS${if (STALLS) " (with AW/AR/B stall injection)" else ""}")
 }

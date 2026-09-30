@@ -3,6 +3,9 @@
 report_utilization    -file $BUILD_DIR/util_impl.rpt
 report_timing_summary -file $BUILD_DIR/timing_impl.rpt -max_paths 20
 report_control_sets   -file $BUILD_DIR/control_sets_impl.rpt
+# a route_design can end with nets left unrouted (its in-route phys_opt re-placing cells), after which the
+# post-route phys_opt is skipped and every timing number carries estimated net delays: record the status
+report_route_status   -file $BUILD_DIR/route_status_impl.rpt
 # STA is only meaningful if everything intended is constrained: no unconstrained internal endpoints,
 # no missing clocks (the P3c acceptance compares this against the baseline's own findings).
 check_timing -verbose -file $BUILD_DIR/check_timing_impl.rpt

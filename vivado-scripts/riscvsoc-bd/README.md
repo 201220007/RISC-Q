@@ -37,6 +37,21 @@ RISCQ_QUBITS=3 ./build-riscvsoc-bd.sh    # smaller config (faster)
 ./close-incremental.sh                       # then: the incremental TimingClosure pass on that build
 ```
 
+**Results path (qubic3).** The config's `results_path` decides who owns `S_AXI_HP0_FPD`, and nothing
+else does (`inc/config.tcl` reads it from `RISCQ_CONFIG`, which `build-riscvsoc-bd.sh` exports;
+`create-project.tcl` checks the RTL's ports agree):
+
+- `hostwindow` (default): upstream's flow, unchanged. `M_AXI_HOST` → HP0, 32-bit, hostClk.
+- `antq_uplink`: `RISCQ_CONFIG=software/configs/zcu216-14q-antq.json ./build-riscvsoc-bd.sh`. It adds:
+  - the ZCU216 board part and the DDR4 MIG (`inc/ddr-config.tcl`);
+  - `axi_dma` S2MM, `smc_ddr`, `smc_dma` → HP0 at 128-bit on the MIG ui_clk, and `smc_ctrl` for the
+    control plane at 0x9000_0000 / 0x9001_0000 (`inc/ddr-connect.tcl`);
+  - the ui_clk clock group and the uplink's bus-skew constraints (`inc/ddr-timing.xdc`);
+  - after impl_1, the `[ddr-cdc]` gate, `report_bus_skew` and `report_cdc` (`inc/ddr-check-cdc.tcl`).
+    `inc/ddr-cdc-closed.tcl` re-runs these on `routed_incr.dcp`.
+
+  The old `RISCQ_DDR_READOUT` switch is an error. The BD xsim gates are in `sim/`.
+
 **Re-build, 8 cores (2026-09-18, `x6y3.json` + the wrap-safe `waitTimeCmp` — SOC_TIPS §5):**
 `RISCQ_CONFIG=software/configs/x6y3.json RISCQ_PROJ_NAME=x6y3-bd-wrapfix ./build-riscvsoc-bd.sh` meets
 timing first pass again: dspClk **+0.005 ns** / 0 failing of 844 208 endpoints (WHS +0.010), all

@@ -48,6 +48,21 @@ anywhere else, and **a core's hardware is its channel list** — the shell build
   conversion in Scala, which is what `PulseTableSoc`'s legacy `(qubitNum, dacMap, adcMap, …)` `apply`
   calls.
 
+`results_path` selects, at build time, which results path is built and owns `S_AXI_HP0_FPD`
+(exactly one; qubic3 plan v2 §0.2):
+
+| `results_path` | built | HP0 |
+|---|---|---|
+| `"hostwindow"` (default, also when absent) | upstream's HostWindow: the per-core `HostWindowBridge`, CC FIFO, the `HostWindowFunnel`, `M_AXI_HOST`, the `HOSTWIN_BASE_LO/HI` registers | 32-bit on hostClk |
+| `"antq_uplink"` | the Ant-Q readout uplink (`riscq.ddr.ReadoutDdrUplink`, tapping each decoder's level-valued `ReadoutResultLink.source`), its DDR status word at host-control `0x58` (`0x5C` reserved for STOP); **no** HostWindow chain | `smc_dma`, 128-bit on the MIG ui_clk |
+
+Any other value is an error in both loaders, and so is the pre-SocSpec `ddr_readout` key. Python's
+`to_json` always writes the field, so the remote runner carries it. The BD flow reads it from the same
+JSON (`RISCQ_CONFIG`, `vivado-scripts/riscvsoc-bd/inc/config.tcl`). A `hostwindow` build's RTL is
+unchanged by the field. On an `antq_uplink` build the host-control extent is `0x60` (`hostCtrlBytes`),
+`PynqDriver` allocates no HostWindow CMA, and `Array(host=True)` programs and host-window readback are
+refused.
+
 `with_white_rabbit` / `wr_marker_dac` add the White Rabbit node ([WrNode](../wr/WrNode.md)); `board` /
 `boards` place the build in a multi-board system (board 0 is the barrier root; `boards > 1` needs the
 WR lane — [PutHub](PutHub.md), [PutLane](PutLane.md)). All four default to a single plain board.
@@ -68,8 +83,9 @@ node from 16 up is a system unit for the board hub — [specs/cross-core/02](../
 `SocMap.sinks(core)`, which emits `RQ_SINK_<NAME>` into `riscq_map.h`.
 
 `software/tests/test_spec_scala.py` diffs `PrintSocMap`'s JSON (entries, per-core channel tables,
-`put_addr_width`, `dac_pipe`) against `riscq.map.SocMap` for all **8** configs — the five qubit builds plus
-`sim-mm`, `x6y3-multimode` and `sim-dio`.
+`put_addr_width`, `dac_pipe`, `results_path`) against `riscq.map.SocMap` for **11** configs — the five
+qubit builds, `sim-mm`, `x6y3-multimode`, `sim-dio`, and the `antq_uplink` builds `zcu216-14q-antq`,
+`sim-2q-antq` and `sim-dio-antq`.
 
 ```bash
 mill runMain riscq.soc.spec.PrintSocMap software/configs/sim-2q.json

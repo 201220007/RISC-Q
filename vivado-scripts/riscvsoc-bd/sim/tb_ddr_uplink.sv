@@ -76,7 +76,13 @@ module tb_ddr_uplink;
   // 3.334 ns, exactly the MIG's CONFIG.C0.DDR4_InputClockPeriod (3334 ps, ddr-config.tcl). The old #1666
   // (3.332 ns) ran the memory clock 0.06 % fast: the controller's tRRD_S / tFAW counts, sized for 3.334 ns,
   // then fell 1-9 ps short and the DDR4 model reported them as VIOLATIONs (P3b r1).
+`ifdef G4_SYSCLK_3333
+  // margin probe (RISCQ_G4_SYSCLK_3333=1): the board oscillator's true 300.0 MHz, 3.333 ns, as
+  // 1666 + 1667 ps half-periods (the TB precision is 1 ps)
+  always begin #1666 sysclk300 = 1; #1667 sysclk300 = 0; end
+`else
   always #1667 sysclk300 = ~sysclk300;   // 299.94 MHz = the configured 3334 ps
+`endif
   always #1000 dspclk    = ~dspclk;      // 500.0 MHz
   always #4000 hostclk   = ~hostclk;     // 125.0 MHz
   always #1000 adcclk    = ~adcclk;      // placeholder: nothing in this test uses the RFDC

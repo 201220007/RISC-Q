@@ -81,11 +81,18 @@ if {$MODE eq "phy"} {
            project has `$_sm`. Rebuild the BD with RISCQ_DDR_SIM_PHY=1."
   }
   puts "\[G4b\] verified: riscq_bd_ddr4_0_0 CONFIG.Simulation_Mode = $_sm"
-  set_property verilog_define {G4B_PHY=1} [get_filesets sim_1]
+  set _defs {G4B_PHY=1}
   puts "\[G4b\] full-PHY mode: [llength $_model] model file(s) + ddr4_mem_c0.sv, define G4B_PHY"
 } else {
-  set_property verilog_define {} [get_filesets sim_1]
+  set _defs {}
 }
+# RISCQ_G4_SYSCLK_3333=1: run the 300 MHz reference at 3.333 ns (the board oscillator) instead of the
+# configured 3.334 ns, to see whether the DDR4 model's tRRD/tFAW checks still hold (P3b r1 margin probe)
+if {[info exists ::env(RISCQ_G4_SYSCLK_3333)] && $::env(RISCQ_G4_SYSCLK_3333)} {
+  lappend _defs G4_SYSCLK_3333=1
+  puts "\[G4\] sysclk300 at 3.333 ns (G4_SYSCLK_3333)"
+}
+set_property verilog_define $_defs [get_filesets sim_1]
 
 set_property top tb_ddr_uplink [get_filesets sim_1]
 set_property top_lib xil_defaultlib [get_filesets sim_1]

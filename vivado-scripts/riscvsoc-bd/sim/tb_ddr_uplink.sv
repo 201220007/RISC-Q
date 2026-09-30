@@ -314,6 +314,7 @@ module tb_ddr_uplink;
   reg  [63:0] pexp [0:MAXP-1];
   logic [31:0] ps, pv;
   logic        pb;
+  logic [1:0]  fcode;                 // the forced response code (a force RHS must be a static variable)
 
   task automatic reset_links();
     begin
@@ -701,7 +702,8 @@ module tb_ddr_uplink;
       automatic logic [1:0] code = e ? 2'b11 : 2'b10;    // SLVERR, then DECERR
       p_start(64'h0004_0000 + 64'h1000 * e);
       p_inject(8, 16 + e);
-      force DUT.riscq_bd_i.smc_ddr_M00_AXI_BRESP = code;   // the MIG's write response, at its output
+      fcode = code;
+      force DUT.riscq_bd_i.smc_ddr_M00_AXI_BRESP = fcode;  // the MIG's write response, at its output
       p_flush(sreg);
       release DUT.riscq_bd_i.smc_ddr_M00_AXI_BRESP;
       ps_r32(CTRL + O_STATUS, sreg);
@@ -722,7 +724,8 @@ module tb_ddr_uplink;
       check_clean($sformatf("before the RRESP=%b drain", code));
       reset_links();
       p_dma_arm(PS_DEST2, 64);
-      force DUT.riscq_bd_i.smc_ddr_M00_AXI_RRESP = code;   // the MIG's read response, during the drain
+      fcode = code;
+      force DUT.riscq_bd_i.smc_ddr_M00_AXI_RRESP = fcode;  // the MIG's read response, during the drain
       p_drain_go(base, 64);
       p_dma_wait(POLL_LIMIT, dmasr, sv);
       release DUT.riscq_bd_i.smc_ddr_M00_AXI_RRESP;
@@ -765,24 +768,39 @@ module tb_ddr_uplink;
     $display("[G4] ok-C: the next run is byte-exact at AXIS, S2MM and HP0");
 
     // ============================ P3b phase D: DMA truncation recovery ==========================
+    // The drain is started with the S2MM channel still HALTED (a halted DMA holds TREADY low), so the
+    // uplink's AXIS is valid and stalled, its FIFO full and R back-pressured at the MIG. The DMA is then
+    // armed, and the DSP reset is forced at its first accepted beat: the reset hold discards the R beats
+    // still owed, the DDR half resets, and the AXIS packet stops without TLAST, part-way through.
+    // (Arming first and resetting at beat 4 was tried: the 32-beat drain finished before the reset landed.)
     p_start(64'h000A_0000);
-    p_inject(128, 40);                                        // 1 KiB: a 32-beat drain
+    p_inject(256, 40);                                        // 2 KiB: a 64-beat drain
     p_flush(sreg);
     check_clean("before the truncated drain");
     reset_links();
-    p_dma_arm(PS_DEST2, 1024);
-    p_drain_go(64'h000A_0000, 1024);
-    k = 0;
-    while (axis_beats < 4 && k < 1_000_000) begin #100; k++; end
-    if (axis_beats < 4) fail("the drain never streamed");
-    force DUT.riscq_bd_i.dsp_rst_peripheral_reset = 1'b1;   // DSP reset with the AXIS packet mid-flight
-    #1_000_000;
-    release DUT.riscq_bd_i.dsp_rst_peripheral_reset;
-    // the driver's wait: the DMA wants 1024 B and TLAST; it must NOT complete
+    p_dma_soft_reset();                                      // the previous phases left it running: halt it
+    ps_r32(DMA + O_S2MM_DMASR, dmasr);
+    if (dmasr[0] !== 1'b1) fail($sformatf("the S2MM channel is not halted before the drain (DMASR=0x%08h)", dmasr));
+    p_drain_go(64'h000A_0000, 2048);
+    #2_000_000;                                              // the uplink fills its FIFO against TREADY low
+    // (a halted S2MM still takes a few beats into its input buffer before TREADY drops: measured 4)
+    k = axis_beats;
+    $display("[G4] D: the halted S2MM took %0d beat(s) before holding TREADY low", k);
+    if (k >= 16) fail($sformatf("%0d AXIS beats accepted by a halted DMA", k));
+    fork
+      begin
+        wait (axis_beats >= k + 1);
+        force DUT.riscq_bd_i.dsp_rst_peripheral_reset = 1'b1;   // DSP reset with the packet mid-flight
+        #1_000_000;
+        release DUT.riscq_bd_i.dsp_rst_peripheral_reset;
+      end
+    join_none
+    p_dma_arm(PS_DEST2, 2048);
+    #1_500_000;
     p_dma_wait(50, dmasr, sv);                               // 50 us, the stand-in for ddr_board's timeout
-    $display("[G4] D: after the DSP reset: %0d of 32 AXIS beats, TLAST x%0d, DMASR=0x%08h (idle=%b)",
+    $display("[G4] D: after the DSP reset: %0d of 64 AXIS beats, TLAST x%0d, DMASR=0x%08h (idle=%b)",
              axis_beats, axis_last, dmasr, sv);
-    if (sv === 1'b1 || axis_last != 0 || axis_beats >= 32)
+    if (sv === 1'b1 || axis_last != 0 || axis_beats >= 64 || axis_beats == 0)
       fail($sformatf("the reset did not truncate the packet (%0d beats, TLAST x%0d, idle %b) -- nothing to recover from",
                      axis_beats, axis_last, sv));
     ps_r32(CTRL + O_STATUS, sreg);

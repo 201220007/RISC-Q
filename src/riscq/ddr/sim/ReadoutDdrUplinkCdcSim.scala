@@ -664,6 +664,68 @@ object ReadoutDdrUplinkCdcSim extends App {
   run("reset_dsp_in_ar_stall", 14) { b => resetInStall(b, "AR", 0x120000L, 72) }
   run("reset_dsp_in_b_stall",  15) { b => resetInStall(b, "B",  0x140000L, 74) }
 
+  // ── P3b r1: the injector crossing. The DSP side captures the held payload on the synchronized request and
+  //    consumes it from the captures; the acknowledge (inj_busy falling) comes only after the consumption.
+  //    The memory holds B, so the cbuf, the skid and core 0's FIFO back up (the overflow flag rises), and the
+  //    injection cannot be consumed for a long time: inj_busy must stay up, a payload write in the window must
+  //    be refused and must not change what lands, and after the release the word lands exactly once, last
+  //    in core 0's order. Then BASE_RESET must clear the (now registered) overflow summary ovf_any. ──
+  run("injector_capture_and_ovf_clear", 16) { b =>
+    normalStart(b)
+    b.stalls.enabled = false
+    b.dut.io.awStall #= false; b.dut.io.arStall #= false; b.dut.io.bStall #= false
+    val base = 0x160000L
+    b.startRun(base)
+    b.dut.io.bStall #= true                          // the first bank's B is held: nothing drains
+    val reals = mutable.ArrayBuffer[(Int, Int)]()
+    var k = 0
+    while (!b.bit(b.status(), S_OVF_ANY) && k < 600) {
+      val v = (0x0100000 + 16 * k, 0x0300000 + 16 * k)
+      b.result(0, v._1, v._2); reals += v; k += 1
+    }
+    assert(b.bit(b.status(), S_OVF_ANY), s"core 0 never overflowed after $k results")
+    val INJ_R = 0x7654320; val INJ_I = -0x1234560
+    b.wr(INJ_REAL, BigInt(INJ_R & 0xFFFFFFFFL)); b.wr(INJ_IMAG, BigInt(INJ_I & 0xFFFFFFFFL))
+    b.wr(INJ_CORE, BigInt(0)); b.wr(INJ_FIRE, BigInt(1))
+    var n = 0
+    while (!b.dut.up.dsp.injPending.toBoolean && n < 2000) { b.dspCd.waitSampling(); n += 1 }
+    assert(b.dut.up.dsp.injPending.toBoolean, "the injection was never captured")
+    b.dspCd.waitSampling(400)                        // held: core 0's FIFO is full
+    val s1 = b.status()
+    assert(b.bit(s1, S_INJ_BUSY) && b.dut.up.dsp.injPending.toBoolean,
+      f"acknowledged before the payload was consumed: status=0x$s1%x pending=${b.dut.up.dsp.injPending.toBoolean}")
+    b.wr(INJ_REAL, BigInt(0x55555550L)); b.wr(INJ_IMAG, BigInt(0x55555550L))   // must be refused
+    assert(b.bit(b.status(), S_ERR_INJ_BUSY), "a payload write during the handshake was accepted")
+    b.dut.io.bStall #= false                         // release: everything drains
+    n = 0
+    while (b.bit(b.status(), S_INJ_BUSY) && n < 20000) { b.ddrCd.waitSampling(10); n += 1 }
+    assert(!b.bit(b.status(), S_INJ_BUSY), "inj_busy never fell after the release")
+    val s = b.flushRun()
+    assert(b.bit(s, S_OVF_ANY), "ovf_any lost before the flush")
+    val acc0 = b.rd(ACCEPTED).toInt
+    val landed = acc0 - 1                            // accepted real results; the rest overflowed
+    assert(landed > 0 && landed < reals.size, s"accepted $acc0 of ${reals.size} + 1")
+    val words = b.ddrWords(base, acc0)
+    val want = reals.take(landed).map { case (r, i) => tagWord(0, r, i) } :+ tagWord(0, INJ_R, INJ_I)
+    assert(words == want, "core 0 order: the injected word must land once, last, with the captured payload")
+    println(s"[P3a-CDC] injector_capture_and_ovf_clear: ${reals.size} results offered, $landed accepted before the " +
+            s"overflow; the injection waited ${400}+ cycles with inj_busy held, a write in the window was refused, " +
+            s"and it landed once, last, exact")
+    // run boundary: the registered overflow summary must clear with BASE_RESET (it is a live level, so the
+    // W1C clear of the stickies must NOT clear it, and the long idle gap after the flush must not either)
+    b.wr(STATUS, BigInt(STICKY_MASK))
+    b.ddrCd.waitSampling(200)
+    assert(b.bit(b.status(), S_OVF_ANY), "ovf_any fell before the run boundary")
+    b.startRun(base + 0x10000L)
+    n = 0
+    while (b.bit(b.status(), S_OVF_ANY) && n < 200) { b.ddrCd.waitSampling(); n += 1 }
+    assert(!b.bit(b.status(), S_OVF_ANY), "ovf_any did not clear at BASE_RESET")
+    println(s"[P3a-CDC] injector_capture_and_ovf_clear: ovf_any cleared $n ddr cycles after the new run started")
+    b.flushRun()
+    b.stalls.enabled = STALLS
+    fullRun(b, base + 0x20000L, 70, 80)
+  }
+
   if (STALLS) {
     println(s"[P3a-CDC] stall injection totals: AW=${stallTotals(0)} AR=${stallTotals(1)} B=${stallTotals(2)} cycles")
     assert(stallTotals.forall(_ > 0), "a channel was never stalled: the stall pass would be vacuous for it")

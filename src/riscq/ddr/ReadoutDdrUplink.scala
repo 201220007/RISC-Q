@@ -162,11 +162,16 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
   val xInj   = PulseCross(ddrU, dspU, withDstDone = true)
   // (P3a: no dsp→ddr flush pulse. The flush reaches the writer in band, as the cbuf's FINAL bank.)
 
-  // injector payload: ddrU registers, static from inj_fire until the ack (valid multi-bit CDC)
+  // injector payload: ddrU registers, held from INJ_FIRE until the acknowledge (writes are refused while
+  // the injector is busy). P3b r1: the DSP side does NOT read them directly any more. On xInj's
+  // synchronized request it CAPTURES them into its own registers (dsp.injRealC/ImagC/CoreC), so these
+  // registers' only DSP-domain loads are those capture flops, enabled by the synchronized fire; the payload
+  // is then consumed from the captures, and the acknowledge (xInj dstDone) goes back only after the
+  // consumption (the FIFO push, or the central reject). ddr-timing.xdc bounds payload + request with one
+  // bus-skew group ending at the capture flops and the request synchronizer.
   val injReal = ddrU(Reg(SInt(p.accWidth bits)) init 0)
   val injImag = ddrU(Reg(SInt(p.accWidth bits)) init 0)
   val injCore = ddrU(Reg(UInt(8 bits)) init 0)
-  // deliberate quasi-static crossings (handshake-held): tell the elaboration-time CDC checker
   Seq(injReal, injImag, injCore).foreach(_.addTag(crossClockDomain))
 
   // ───────────────────────────── dsp side ─────────────────────────────
@@ -185,10 +190,14 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     val rejReal = Vec(Bool(), p.numCh)     // a real result arrived while admission was closed (this cycle)
     val rejInj  = Vec(Bool(), p.numCh)     // an injection targeted at this core was rejected
     val injPending = Reg(Bool()) init False
-    val injCoreS   = injCore   // static during the handshake (see above)
-    val injRealS   = injReal
-    val injImagS   = injImag
-    when(xInj.io.fire)(injPending := True)
+    // the DSP-domain captures of the held payload, loaded on the synchronized request only
+    val injRealC   = Reg(SInt(p.accWidth bits)) init 0
+    val injImagC   = Reg(SInt(p.accWidth bits)) init 0
+    val injCoreC   = Reg(UInt(8 bits)) init 0
+    when(xInj.io.fire) {
+      injPending := True
+      injRealC := injReal; injImagC := injImag; injCoreC := injCore
+    }
     val injDone = False
     when(injDone)(injPending := False)
     xInj.io.dstDone := injDone
@@ -205,8 +214,8 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
       when(real.valid && !real.ready)(ovf(i) := True)                  // exact overflow detection
 
       val inj = Stream(Bits(p.wordWidth bits))
-      inj.valid   := injPending && admit && injCoreS === i
-      inj.payload := injRealS.asBits ## injImagS.asBits
+      inj.valid   := injPending && admit && injCoreC === i
+      inj.payload := injRealC.asBits ## injImagC.asBits
       when(inj.fire)(injDone := True)
 
       val arb  = StreamArbiterFactory().lowerFirst.noLock.onArgs(real, inj)
@@ -218,10 +227,10 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     }
     // r08-#4/#5: reject an injection centrally — an out-of-range `inj_core` matches NO per-core arbiter,
     // so without this `injPending` (and therefore `inj_busy` and the flush quiet predicate) hangs forever.
-    val injCoreOk = injCoreS < p.numCh
+    val injCoreOk = injCoreC < p.numCh
     val injReject = injPending && (!admit || !injCoreOk)
     when(injReject) { earlyLate := True; injDone := True }
-    for (i <- 0 until p.numCh) rejInj(i) := injReject && injCoreOk && injCoreS === i
+    for (i <- 0 until p.numCh) rejInj(i) := injReject && injCoreOk && injCoreC === i
 
     // r09-#2 / r10-#2: a late real result and a rejected injection can hit the SAME core in the SAME
     // cycle. Two separate `rej := rej + 1` statements let the later one win (undercount), but summing
@@ -240,6 +249,11 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
       // that can never be applied (and would otherwise survive into the next run).
       rejPend(i) := saturated ? U(0, 3 bits) | ((rest > 7) ? U(7, 3 bits) | rest.resized)
     }
+
+    // the registered overflow summary for the DDR side's STATUS (one flop into the synchronizer). It
+    // follows `ovf` one cycle late, so it clears with the flags at BASE_RESET and with the dspU reset.
+    val ovfAny = Reg(Bool()) init False
+    ovfAny := ovf.asBits.orR
 
     val anyPush     = fifos.map(_.fifo.io.push.fire).orR
     val anyFifoData = fifos.map(_.fifo.io.pop.valid).orR
@@ -381,7 +395,9 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     // P3a F2: the engine itself also refuses a start until TLAST (`idle`); both locks agree.
     val rdLocked = rdBusy || drainInFlight || !mmu.io.idle
     val dspAdmitSync = BufferCC(dsp.admit, init = False, bufferDepth = 2)
-    val ovfAnySync   = BufferCC(dsp.ovf.asBits.orR, init = False, bufferDepth = 2)
+    // P3b r1: the OR of the per-core flags is registered in dspU (dsp.ovfAny), so the synchronizer sees
+    // one flop, not combinational logic (report_cdc CDC-10)
+    val ovfAnySync   = BufferCC(dsp.ovfAny, init = False, bufferDepth = 2)
     val earlyLateSync = BufferCC(dsp.earlyLate, init = False, bufferDepth = 2)
     val skidOvfSync  = BufferCC(dsp.skidOvf, init = False, bufferDepth = 2)
     // P3a F4: the cbuf presents a bank only when it is full or FINAL, and `rdEmpty` reads 1 whenever

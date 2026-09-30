@@ -1,0 +1,7 @@
+# Pinned check_timing -verbose findings a routed riscvsoc-bd image may have (P3c-2). inc/closure-verdict.tcl fails a
+# checkpoint on any finding that is not listed here. One finding per line, tab-separated:
+#   mode <TAB> check <TAB> message <TAB> object <TAB> source
+# mode is `all` or a results path (antq_uplink, hostwindow). Messages are compared in the verdict's normal form
+# (lower case, the count as N, plurals folded), so the line's count does not have to match.
+all	no_input_delay	There is 1 input port with no input delay specified. (HIGH)	user_sysref_clk_p	the closed hostwindow baseline: P1 build/riscvsoc-bd/routed_incr.dcp (sha256 44b94e4b...), evidence/P3c/baseline/check_timing_P1_routed_incr.rpt
+antq_uplink	no_output_delay	There is 1 port with no output delay but user has a false path constraint (MEDIUM)	ddr4_sdram_c0_reset_n	inc/ddr-timing.xdc (62dd63a): the DDR4 RESET_n output has no timing relationship to any clock (JEDEC: held low >= 200 us)

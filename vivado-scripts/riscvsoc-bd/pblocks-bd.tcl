@@ -16,8 +16,11 @@
 # a bare `NAME !~ *_riscvSoc/*`). Needs the per-core `KEEP_HIERARCHY` (PulseTableSoc tags it) so the
 # `_riscvSoc/` boundary survives opt_design.
 #
+# The 14-core antq_uplink build defaults to one band per X0 row instead (`rowband`, RISCQ_ANTQ_FLOORPLAN below).
+#
 # Env: RISCQ_ROW (3), RISCQ_PERROW (3), RISCQ_CONFINE (global|region|none, global),
-#      RISCQ_BD_BASE (riscq_bd_i/top/inst — the IP instance path).
+#      RISCQ_BD_BASE (riscq_bd_i/top/inst — the IP instance path),
+#      RISCQ_ANTQ_FLOORPLAN (antq_uplink only: rowband|bands|relocate|resize; rowband at 14 cores, else bands).
 # ============================================================================================
 
 set base [expr {[info exists ::env(RISCQ_BD_BASE)] ? $::env(RISCQ_BD_BASE) : "riscq_bd_i/top/inst"}]
@@ -76,18 +79,32 @@ puts "\[riscvsoc-bd\] base=$base; $n cores, perRow=$perRow → X0 rows from Y$ba
 #                that row's cores, instead of one band per core: the same SLICE sites, without the per-core band
 #                boundaries. The RAMB/DSP/URAM site-float, EXCLUDE_PLACEMENT, the `mem` exclusion, the coreTime_i
 #                pull-in and the datapath confine stay as they are.
+#      bands:    the per-core bands, as with no variant (any datapath confine).
+#    The default (P3c-3a wrap-up, Codex after-stage review #8) is rowband for the 14-core antq_uplink build, the
+#    floorplan of its closed image (evidence/P3c/REPORT.md §9: −0.046 ns from scratch, against −0.291 for the per-core
+#    bands on the same parent); RISCQ_ANTQ_FLOORPLAN=bands selects the per-core bands there. Every other build keeps the
+#    per-core bands by default: hostwindow, another core count (the 2-qubit antq configs), a non-global confine.
 set antqFp ""
+set antqHasUplink [expr {[llength [get_cells -quiet ${base}/ddrUplink_up]] > 0}]
 if {[info exists ::env(RISCQ_ANTQ_FLOORPLAN)] && $::env(RISCQ_ANTQ_FLOORPLAN) ne ""} {
   set antqFp $::env(RISCQ_ANTQ_FLOORPLAN)
-  if {$antqFp ni {relocate resize rowband}} { error "RISCQ_ANTQ_FLOORPLAN=$antqFp is not one of {relocate, resize, rowband}" }
-  if {$confine != 1} { error "RISCQ_ANTQ_FLOORPLAN needs the global datapath confine (RISCQ_CONFINE=global), not $confineStr" }
-  if {[llength [get_cells -quiet ${base}/ddrUplink_up]] == 0} {
+  if {$antqFp ni {relocate resize rowband bands}} { error "RISCQ_ANTQ_FLOORPLAN=$antqFp is not one of {relocate, resize, rowband, bands}" }
+  if {$confine != 1 && $antqFp ne "bands"} { error "RISCQ_ANTQ_FLOORPLAN needs the global datapath confine (RISCQ_CONFINE=global), not $confineStr" }
+  if {!$antqHasUplink} {
     puts "\[riscvsoc-bd\] RISCQ_ANTQ_FLOORPLAN=$antqFp ignored: no ${base}/ddrUplink_up (not an antq_uplink build)"
     set antqFp ""
   } else {
     puts "\[riscvsoc-bd\] antq_uplink floorplan variant: $antqFp"
   }
+} elseif {$antqHasUplink && $n == 14} {
+  if {$confine == 1} {
+    set antqFp rowband
+    puts "\[riscvsoc-bd\] antq_uplink floorplan variant: rowband (the 14-core default; RISCQ_ANTQ_FLOORPLAN=bands selects the per-core bands)"
+  } else {
+    puts "\[riscvsoc-bd\] antq_uplink 14-core default rowband not applied: it needs RISCQ_CONFINE=global, not $confineStr (per-core bands)"
+  }
 }
+if {$antqFp eq "bands"} { set antqFp "" }
 set antqBandExt [expr {[info exists ::env(RISCQ_ANTQ_BAND_EXT)] ? $::env(RISCQ_ANTQ_BAND_EXT) : 4}]
 # the first k SLICE columns of a clock region, over rows ya..yb
 proc riscq_region_first_cols {region k ya yb} {

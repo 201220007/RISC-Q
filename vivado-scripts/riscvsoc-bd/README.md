@@ -108,7 +108,10 @@ Handled by `build-riscvsoc-bd.sh`: `RISCQ_VIVADO_BIN`, `RISCQ_QUBITS` (14), `RIS
 `RISCQ_PROJ_NAME` (`riscvsoc-bd`), `RISCQ_PLACE_DIRECTIVE` (`ExtraNetDelay_high`), `RISCQ_PHYSOPT_DIRECTIVE` (both phys_opt passes, e.g. `AggressiveExplore`).
 
 Read by `pblocks-bd.tcl`: `RISCQ_ROW` (3), `RISCQ_PERROW` (3), `RISCQ_CONFINE`
-(`global`|`region`|`none`, default `global`), `RISCQ_BD_BASE` (`riscq_bd_i/top/inst`).
+(`global`|`region`|`none`, default `global`), `RISCQ_BD_BASE` (`riscq_bd_i/top/inst`), and
+`RISCQ_ANTQ_FLOORPLAN` (antq_uplink builds only: `rowband`, one hard pblock per X0 row for its cores; `bands`, the
+per-core bands; `relocate`; `resize`). The 14-core antq_uplink build defaults to `rowband`, the floorplan of its
+timing-closed image (P3c-3a); every other build, hostwindow included, defaults to the per-core bands.
 
 > RTL-level levers (`replicateTime`, `df`, `1h`, `linkPipe`, the unconditional `KEEP_HIERARCHY` on each
 > core) are baked into the BD RTL by `GenPulseTableSocJson` (the `PulseTableSoc` defaults = the floorplan

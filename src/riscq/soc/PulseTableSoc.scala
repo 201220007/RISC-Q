@@ -174,6 +174,19 @@ class PulseTableSoc(
       t.setName(s"coreTime_$i")
       t
     }
+    // P3c-3 C1 (timingPipe): the channels take their time from a second per-core replica, not from `coreTime_i`.
+    // The floorplan pins `coreTime_<i>_reg[*]` into the core's X0 band, so the channels' copy went west into the
+    // band and back east to the converters; this one is unpinned and lands between syncTime and the channels.
+    // Same D input as coreTime_i, no reset or enable, so it equals coreTime_i every cycle, timeOffset changes
+    // included: zero latency, value-identical. syncTime gains 14 loads, hence its fanout cap.
+    val chanTimes = timingPipe generate List.tabulate(qubitNum) { i =>
+      val t = RegNext(syncTime(0, 32 bits))
+      t.addAttribute("EQUIVALENT_REGISTER_REMOVAL", "NO")
+      t.addAttribute("MAX_FANOUT", 16)
+      t.setName(s"chanTime_$i")
+      t
+    }
+    if (timingPipe) syncTime.addAttribute("MAX_FANOUT", 16)
 
     def cp(core: CoreSpec) = coreParam.copy(
       fetchPcWidth = Some(log2Up(core.memDepth) + 2),
@@ -182,7 +195,7 @@ class PulseTableSoc(
     val riscqCores = spec.cores.toList.zipWithIndex.map { case (core, i) =>
       RiscqRfWithPulseTableFiber(
         spec = core, plugins = cp(core).plugins(), dspCd = dspCd, hostCd = hostCd, riscqCd = riscqCd,
-        time = coreTimes(i), batchSize = N, dataWidth = w, adcBatch = adcBatch,
+        time = coreTimes(i), chanTime = if (timingPipe) chanTimes(i) else null, batchSize = N, dataWidth = w, adcBatch = adcBatch,
         linkPipe = linkPipe, hostWinAddrWidth = hostWinAddrWidth, withHostWindow = withHostWindow,
         withTestTap = withTest, timingPipe = timingPipe) }
 

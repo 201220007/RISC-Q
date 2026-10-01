@@ -50,6 +50,7 @@ case class RiscqRfWithPulseTableFiber(
     hostCd: ClockDomain,
     riscqCd: ClockDomain,
     time: UInt,
+    chanTime: UInt = null,        // P3c-3 C1: the channels' own time replica (null = `time`, as before)
     batchSize: Int = 16,
     dataWidth: Int = 16,
     timeWidth: Int = 32,
@@ -201,7 +202,7 @@ case class RiscqRfWithPulseTableFiber(
       }
       c.setCompositeName(this, s"${ch.name}Channel")
       c.cmd << PutLink.demux(getPipe(riscvSoc.cmd, linkPipe), k * SocSpecMap.rfChStride, SocSpecMap.rfChStride, 16)
-      c.timeBcast := time
+      c.timeBcast := (if (chanTime != null) chanTime else time)
       c
     }
     val channels: Seq[Channel] = spec.channels.zipWithIndex.map { case (ch, k) => mkChannel(ch, k) }

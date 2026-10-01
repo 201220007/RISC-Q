@@ -53,7 +53,7 @@ and the block design read it from the same file:
 | `results_path` | RTL | block design (HP0) |
 |---|---|---|
 | `hostwindow` (default) | upstream's HostWindow chain, `M_AXI_HOST` | upstream's: `M_AXI_HOST` → HP0, 32-bit, hostClk |
-| `antq_uplink` | `ReadoutDdrUplink` (`m_axi_ddr`, `s_axi_ddr_ctrl`, `m_axis_rd`, `ddrClk`), no HostWindow | DDR4 MIG (`M_AXI_DDR` direct), `axi_dma` S2MM, `smc_dma` / `smc_ctrl`; `smc_dma` → HP0, 128-bit, MIG ui_clk |
+| `antq_uplink` | `ReadoutDdrUplink` (`m_axi_ddr`, `s_axi_ddr_ctrl`, `m_axis_rd`, `ddrClk`), no HostWindow | DDR4 MIG (`M_AXI_DDR` direct), `axi_dma` S2MM, `smc_dma`, the control-plane bridge (`cc_ctrl` + `smc_ctrl`); `smc_dma` → HP0, 128-bit, MIG ui_clk |
 
 ```bash
 cd vivado-scripts/riscvsoc-bd

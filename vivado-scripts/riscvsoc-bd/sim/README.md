@@ -7,7 +7,7 @@ and G3 (`PulseTableSocDdrSim`) drive the SoC's ports against behavioural AXI mod
 | exercised only by G4 | why it can't be covered by G2/G3 |
 |---|---|
 | PS address decode (`0x9000_0000` ctrl, `0x9001_0000` DMA) via **M_AXI_HPM0_LPD** | G2 drives the control slave directly |
-| `smc_ctrl` — the cross-clock SmartConnect from `pl_clk0` into `ui_clk` | there is one clock in G2's control path |
+| the control-plane bridge from `pl_clk0` into `ui_clk` (`cc_ctrl` + `smc_ctrl`; the 2-clock `smc_ctrl` with `RISCQ_ANTQ_CTRL=smartconnect`) | there is one clock in G2's control path |
 | the uplink's `M_AXI_DDR` connected straight to the MIG (P3c: `smc_ddr` removed; the Spinal uplink's bursts are page-bounded) | `AxiMemorySim` accepts illegal bursts silently |
 | the DDR4 MIG's own AXI slave (`Simulation_Mode = BFM`) | ditto |
 | `axi_dma_0` S2MM: AXIS → `smc_dma` (256→128 down-size) → **PS HP0** | G2 collects the AXIS beats in the testbench |
@@ -99,5 +99,5 @@ Stated explicitly so the PASS is not read for more than it is worth (Codex r13-#
 - **No RF.** The stimulus is the register-paced injector. Decoder ⇄ DDR equivalence is G3's job.
 
 What it *does* cover is the plumbing between the SoC's ports and the PS, which exists nowhere else:
-address decode over HPM0_LPD, the `smc_ctrl` clock crossing, the direct uplink → MIG AXI connection,
+address decode over HPM0_LPD, the control-plane clock crossing, the direct uplink → MIG AXI connection,
 the `axi_dma` S2MM path into HP0 memory, and the `ui_clk` reset tree.

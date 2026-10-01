@@ -68,14 +68,14 @@ connect_bd_intf_net [get_bd_intf_pins smc_dma/M00_AXI]       [get_bd_intf_pins z
 # A DEDICATED bridge carries the control plane from the PS clock into the ui_clk domain (QubiC does the
 # same with its ps8_0_axi_periph). Extending the RFDC SmartConnect instead would leave its M02/M03
 # annotated with the PS clock and fail validation. RISCQ_ANTQ_CTRL selects the bridge:
-#   smartconnect (default): smc_ctrl, a 2-clock SmartConnect (1 SI, 2 MI) that crosses and decodes.
-#   lite (P3c-2): the crossing is cc_ctrl, an AXI4-Lite asynchronous axi_clock_converter (one
-#     xpm_cdc_handshake per channel); smc_ctrl becomes a 1-clock SmartConnect on ui_clk that decodes and
-#     converts AXI4-Lite to the uplink's AXI4 slave. The PS SmartConnect converts its M02 to AXI4-Lite,
-#     as it already does for the RFDC's M01. cc_ctrl samples each reset on its own clock, so its s side
-#     gets psr_ctrl, a pl_clk0 proc_sys_reset fed by the same power-up stretcher as psr_ddr: both sides
-#     are held in reset together, from configuration until the stretcher ends, as smc_ctrl is today.
-set ANTQ_CTRL [expr {[info exists ::env(RISCQ_ANTQ_CTRL)] ? $::env(RISCQ_ANTQ_CTRL) : "smartconnect"}]
+#   lite (the default since P3c-2, plan/DECISIONS.md #10): the crossing is cc_ctrl, an AXI4-Lite asynchronous
+#     axi_clock_converter (one xpm_cdc_handshake per channel); smc_ctrl is a 1-clock SmartConnect on ui_clk that
+#     decodes and converts AXI4-Lite to the uplink's AXI4 slave. The PS SmartConnect converts its M02 to AXI4-Lite,
+#     as it already does for the RFDC's M01. cc_ctrl samples each reset on its own clock, so its s side gets
+#     psr_ctrl, a pl_clk0 proc_sys_reset fed by the same power-up stretcher as psr_ddr: both sides are held in
+#     reset together, from configuration until the stretcher ends, as the 2-clock smc_ctrl is.
+#   smartconnect: the original bridge, smc_ctrl as a 2-clock SmartConnect (1 SI, 2 MI) that crosses and decodes.
+set ANTQ_CTRL [expr {[info exists ::env(RISCQ_ANTQ_CTRL)] ? $::env(RISCQ_ANTQ_CTRL) : "lite"}]
 if {$ANTQ_CTRL ni {smartconnect lite}} { error "RISCQ_ANTQ_CTRL=$ANTQ_CTRL: expected smartconnect or lite" }
 puts "\[ddr-connect\] control-plane bridge (RISCQ_ANTQ_CTRL): $ANTQ_CTRL"
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smc_ctrl

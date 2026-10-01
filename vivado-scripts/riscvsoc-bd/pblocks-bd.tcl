@@ -65,7 +65,7 @@ puts "\[riscvsoc-bd\] base=$base; $n cores, perRow=$perRow → X0 rows from Y$ba
 
 # ── P3c-2: antq_uplink-only floorplan variants (RISCQ_ANTQ_FLOORPLAN). They apply only when the design has the Ant-Q
 #    uplink (results_path = antq_uplink); a hostwindow build has no `ddrUplink_up` and keeps this file's floorplan.
-#      relocate: hard pblocks, nested in pb_datapath, put smc_ctrl (the PS -> ui_clk control SmartConnect) into
+#      relocate: hard pblocks, nested in pb_datapath, put smc_ctrl (the control-plane SmartConnect; see ddr-connect.tcl) into
 #                RISCQ_ANTQ_CTRL_REGION (default X1Y0:X1Y1, beside the PS and the main SmartConnect) and the uplink's
 #                MIG-side half (ddrUplink_up/ddr_*) into RISCQ_ANTQ_DDR_REGION (default X3Y0:X3Y1, beside the MIG's
 #                X4Y0:X4Y1). The uplink's FIFOs, poller and accounting stay with the decoders (unconstrained).

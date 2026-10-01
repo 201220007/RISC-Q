@@ -117,6 +117,7 @@ def test_oversize_window_arrays_are_refused(socmap):
 # ── co-sim: the window really carries the results, run after run ──
 
 @pytest.mark.cosim
+@pytest.mark.hostwindow
 def test_window_array_matches_the_ram_array(cosim):
     """One kernel writes both; `rerun` returns both and they are identical."""
     drv, m = cosim
@@ -131,6 +132,7 @@ def test_window_array_matches_the_ram_array(cosim):
 
 
 @pytest.mark.cosim
+@pytest.mark.hostwindow
 def test_second_rerun_overwrites_in_place(cosim):
     """The window is not re-zeroed by `.bss` clearing (it is not RAM), so a second run must
     overwrite every element it reports — a stale value would show up here."""
@@ -145,6 +147,7 @@ def test_second_rerun_overwrites_in_place(cosim):
 
 
 @pytest.mark.cosim
+@pytest.mark.hostwindow
 def test_per_core_slices_are_disjoint(cosim):
     """Both cores run the same program into the same window offsets; each must come back with its
     own data — that is the `core << 24` term of the funnel's address."""
@@ -160,6 +163,7 @@ def test_per_core_slices_are_disjoint(cosim):
 
 
 @pytest.mark.cosim
+@pytest.mark.hostwindow
 def test_seam_op_budget_grows_by_exactly_one_read(cosim):
     """A `host=True` array costs exactly ONE extra seam op per rerun — the `read_host` — over the
     same batch without it (spec 08 §7's budget is per-array, not per-byte)."""

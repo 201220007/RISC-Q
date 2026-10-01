@@ -61,6 +61,10 @@ class PulseTableSoc(
       aluNoFastForward = true, aluResultOneHot = true, pcRegMaxFanout = 16),
     // host window (specs/software/22): the PS physical address width.
     val hostMemAddrWidth: Int = 40,
+    // P3c-3 (qubic3): the antq_uplink timing pipeline (evidence/P3c/PLAN_P3c3_pipelining_v2.md). None = the
+    // results path decides (on for antq_uplink, off for hostwindow, so hostwindow RTL stays upstream's); a sim
+    // passes Some(_) to build either variant of any spec (the lockstep reference and the enabled sims).
+    val timingPipeOverride: Option[Boolean] = None,
 ) extends Zcu216Top(dacNum = spec.dacNum, adcNum = spec.adcNum, dacBatch = 16, adcBatch = 4, dataWidth = 16, vivado = vivado,
                     dio = PulseTableSoc.dioNames(spec), withHostMem = spec.withHostWindow) {
   // Every per-SoC parameter comes from the spec (universal-control/01 P1): the cores' channel lists,
@@ -78,6 +82,8 @@ class PulseTableSoc(
   // the results path (qubic3 plan v2 §0.2): exactly one of the two is built and owns S_AXI_HP0_FPD
   val withHostWindow   = spec.withHostWindow    // HostWindow bridge + CC FIFO + funnel + M_AXI_HOST
   val withAntqUplink   = spec.withAntqUplink    // readout -> PL DDR4 -> PS uplink (riscq.ddr)
+  // P3c-3: every latency-neutral timing change below is generated only when this is on (DECISIONS #5)
+  val timingPipe       = timingPipeOverride.getOrElse(withAntqUplink)
   val N        = 16    // DAC drive batch
   val adcBatch = 4
   val w        = 16
@@ -178,7 +184,7 @@ class PulseTableSoc(
         spec = core, plugins = cp(core).plugins(), dspCd = dspCd, hostCd = hostCd, riscqCd = riscqCd,
         time = coreTimes(i), batchSize = N, dataWidth = w, adcBatch = adcBatch,
         linkPipe = linkPipe, hostWinAddrWidth = hostWinAddrWidth, withHostWindow = withHostWindow,
-        withTestTap = withTest) }
+        withTestTap = withTest, timingPipe = timingPipe) }
 
     // floorplan: keep each core's RiscvSoc a hard synth boundary so opt can't merge logic across the
     // identical cores into a MUXF7/F8 macro that straddles two per-core pblocks. The shared host AXI fans
@@ -510,7 +516,8 @@ object PulseTableSoc {
       hostWinAddrWidth: Int = 24,
       hostMemAddrWidth: Int = 40,
       withWhiteRabbit: Boolean = false,
-      wrMarkerDac: Option[Int] = None): PulseTableSoc =
+      wrMarkerDac: Option[Int] = None,
+      timingPipe: Option[Boolean] = None): PulseTableSoc =
     new PulseTableSoc(
       SocSpec.qubits(qubitNum, dacMap, adcMap, dacNum = dacNum, adcNum = adcNum,
         gatePulseNum = gatePulseNum, envDepth = envDepth, gateInterp = gateInterp,
@@ -518,7 +525,7 @@ object PulseTableSoc {
         withMul = coreParam.withMul, queueDepth = queueDepth, linkPipe = linkPipe,
         hostwinBits = hostWinAddrWidth, robDepth = robDepth, adcPipe = adcPipe)
         .copy(withWhiteRabbit = withWhiteRabbit, wrMarkerDac = wrMarkerDac),
-      withTest, vivado, coreParam, hostMemAddrWidth)
+      withTest, vivado, coreParam, hostMemAddrWidth, timingPipe)
 }
 
 /**

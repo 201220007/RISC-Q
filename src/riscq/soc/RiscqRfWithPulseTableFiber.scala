@@ -68,7 +68,8 @@ case class RiscqRfWithPulseTableFiber(
                                   // a shot at once without stalling
     withHostWindow: Boolean = true, // the HostWindow bridge + CC FIFO (off in an `antq_uplink` build)
     withTestTap: Boolean = false,
-    hubQueueDepth: Int = 16       // ≥ the cores on the board: a same-cycle burst of hub beats never drops
+    hubQueueDepth: Int = 16,      // ≥ the cores on the board: a same-cycle burst of hub beats never drops
+    timingPipe: Boolean = false   // P3c-3 antq timing pipeline (PulseTableSoc.timingPipe)
 ) extends Area {
   val w        = dataWidth
   val memDepth = spec.memDepth

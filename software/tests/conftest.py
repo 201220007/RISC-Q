@@ -13,12 +13,20 @@ def pytest_addoption(parser):
                      help="also run the full-loop anchor tests (minutes each; implies --cosim)")
     parser.addoption("--batch-cap", type=int, default=0, metavar="N",
                      help="fail a co-sim test that simulates more than N batches (0 = report only)")
+    parser.addoption("--results-path", choices=("hostwindow", "antq_uplink"), default="hostwindow",
+                     help="build every co-sim fixture with this results path: antq_uplink loads each "
+                          "config's `-antq` sibling, so the cycle-exact co-sim tiers run on the shipped "
+                          "antq RTL (qubic3 P3c-3 N5); tests marked `hostwindow` are skipped there")
 
 
 def pytest_configure(config):
     if config.getoption("--slow"):
         config.option.cosim = True          # the anchors are co-sim tests: --slow implies --cosim
     config.addinivalue_line("markers", "cosim: verilator co-simulation test (needs --cosim)")
+    config.addinivalue_line(
+        "markers",
+        "hostwindow: needs the HostWindow results path (RAW host readback, the host window itself); "
+        "skipped under --results-path antq_uplink, where an antq image rejects such programs (plan v2 P3b #11)")
     config.addinivalue_line(
         "markers",
         "batch_cap(n): raise this test's simulated-batch cap to n. ONLY for a structural floor "
@@ -37,11 +45,23 @@ def pytest_collection_modifyitems(config, items):
     cosim, slow = config.getoption("--cosim"), config.getoption("--slow")
     skip_cosim = pytest.mark.skip(reason="co-sim test: pass --cosim to run")
     skip_slow = pytest.mark.skip(reason="full-loop anchor: pass --slow to run")
+    antq = config.getoption("--results-path") == "antq_uplink"
+    skip_hw = pytest.mark.skip(reason="needs the HostWindow results path (skipped under --results-path antq_uplink)")
     for item in items:
         if "slow" in item.keywords and not slow:
             item.add_marker(skip_slow)
         elif "cosim" in item.keywords and not cosim:
             item.add_marker(skip_cosim)
+        elif antq and item.get_closest_marker("hostwindow") is not None:   # the marker, not a param id
+            item.add_marker(skip_hw)
+
+
+def _cosim_build(request, name: str):
+    """(config, build dir) of the co-sim fixture `name`: the config itself, or its `-antq` sibling under
+    --results-path antq_uplink (one build dir per config, so the two variants never share a model)."""
+    if request.config.getoption("--results-path") == "antq_uplink":
+        name = f"{name}-antq"
+    return CONFIGS / f"{name}.json", SW_ROOT / "build" / name
 
 
 # ── the simulated-batch meter (specs/software-test-refactor/02 §1, E2) ──
@@ -128,7 +148,7 @@ def cosim(request):
     from riscq.map import SocMap, SocParams
     from riscq.sim import server
 
-    drv = server.start(CONFIGS / "sim-2q.json", SW_ROOT / "build" / "sim-2q")
+    drv = server.start(*_cosim_build(request, "sim-2q"))
     m = SocMap(SocParams.from_json(drv.sim.get_params()))
     yield drv, m
     server.stop(drv)
@@ -143,7 +163,7 @@ def cosim_2q1c(request):
     from riscq.map import SocMap, SocParams
     from riscq.sim import server
 
-    drv = server.start(CONFIGS / "sim-2q1c.json", SW_ROOT / "build" / "sim-2q1c")
+    drv = server.start(*_cosim_build(request, "sim-2q1c"))
     m = SocMap(SocParams.from_json(drv.sim.get_params()))
     yield drv, m
     server.stop(drv)
@@ -158,7 +178,7 @@ def cosim_mm(request):
     from riscq.map import SocMap, SocParams
     from riscq.sim import server
 
-    drv = server.start(CONFIGS / "sim-mm.json", SW_ROOT / "build" / "sim-mm")
+    drv = server.start(*_cosim_build(request, "sim-mm"))
     m = SocMap(SocParams.from_json(drv.sim.get_params()))
     yield drv, m
     server.stop(drv)
@@ -183,9 +203,13 @@ def cosim_antq(request):
 @pytest.fixture(scope="session")
 def cosim_dio(request):
     """A running verilator co-sim of the sim-dio build (universal-control/01 P5): core 0 carries a
-    timed-DIO bank `ttl` next to gate / ro / demod: (CosimDriver, SocMap)."""
+    timed-DIO bank `ttl` next to gate / ro / demod: (CosimDriver, SocMap). Under --results-path
+    antq_uplink its sibling is the sim-dio-antq build `cosim_antq` already runs, so that session is shared."""
     if not request.config.getoption("--cosim"):
         pytest.skip("needs --cosim")
+    if request.config.getoption("--results-path") == "antq_uplink":
+        yield request.getfixturevalue("cosim_antq")
+        return
     from riscq.map import SocMap, SocParams
     from riscq.sim import server
 

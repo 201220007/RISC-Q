@@ -114,13 +114,23 @@ RUNS = [
 ]
 
 
-def test_two_real_kernel_runs_through_the_done_lifecycle(cosim_antq):
+def _dio_restore(drv) -> None:
+    """Leave q0_ttl as a fresh server has it (no loopback, inputs low): the session's sim-dio-antq server is
+    shared, e.g. with test_dio under --results-path antq_uplink. A rerun leaves the core reset asserted, so the
+    input edge back to 0 reaches an event sink held in reset and posts nothing."""
+    drv.sim.dio_loopback("q0_ttl", False)
+    drv.sim.advance(4)                   # the loopback task still copies once on its pending falling edge
+    drv.sim.dio_set("q0_ttl", 0)
+
+
+def test_two_real_kernel_runs_through_the_done_lifecycle(cosim_antq, request):
     drv, m = cosim_antq
     assert m.params.with_antq_uplink
     drv.sim.set_model({"kind": "multi", "models": [
         {"kind": "tone", "adc": m.adc_of(c), "freq_hz": units.code_to_freq(F, m.params), "amp": AMPS[c]}
         for c in (0, 1)]})
     drv.sim.dio_loopback("q0_ttl", True)
+    request.addfinalizer(lambda: _dio_restore(drv))
     port = CosimDdr(drv)
     d = DdrReadout(port, soc_map=m)
     progs = _progs(m)

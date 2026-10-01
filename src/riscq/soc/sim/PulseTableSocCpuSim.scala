@@ -59,7 +59,8 @@ object PulseTableSocCpuSim extends App {
                                                  // host write) so it can't trip a spurious Tilelink decoder-miss —
                                                  // mirrors PulseTableSocSim; on hardware this state powers up defined.
     .compile {
-      val dut = PulseTableSoc(qubitNum, dacMap, adcMap, withTest = false)
+      val dut = PulseTableSoc(qubitNum, dacMap, adcMap, withTest = false,
+        timingPipe = Some(riscq.misc.TimingPipeKnob.enabled))   // RISCQ_TIMING_PIPE=1: the P3c-3 variant
       dut.riscqArea.time.simPublic()
       dut.riscqArea.riscqCores(0).startTime.simPublic()
       dut.riscqArea.riscqCores(0).gatePulse.valid.simPublic()

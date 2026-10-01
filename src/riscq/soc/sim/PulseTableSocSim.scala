@@ -63,7 +63,8 @@ object PulseTableSocSim extends App {
   val tag        = s"posted_pipe$linkPipe"
   SimConfig.addSimulatorFlag("-Wno-MULTIDRIVEN")  // the clock-crossing Bram blackbox arrays are written from clka+clkb
     .addSimulatorFlag("--x-initial 0")            // 0-init the host→dsp CDC FIFO state so its pre-reset X address can't trip a spurious Tilelink decoder-miss assertion
-    .compile(PulseTableSoc(qubitNum, dacMap, adcMap, withTest = true, linkPipe = linkPipe))
+    .compile(PulseTableSoc(qubitNum, dacMap, adcMap, withTest = true, linkPipe = linkPipe,
+      timingPipe = Some(riscq.misc.TimingPipeKnob.enabled)))   // RISCQ_TIMING_PIPE=1: the P3c-3 variant
     .doSim(s"pulseTableSoc_$tag", seed = 42) { dut =>
     val hostCd = dut.clockDomain
     val dspCd  = dut.dspCd

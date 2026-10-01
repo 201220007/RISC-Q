@@ -17,11 +17,18 @@ import riscq.riscv.RiscqParam
  *   mill runMain riscq.soc.GenPulseTableSocJson software/configs/zcu216-14q.json build/rtl vivado
  */
 object GenPulseTableSocJson extends App {
-  require(args.length == 2 || args.length == 3,
-    "usage: GenPulseTableSocJson <config.json> <targetDir> [vivado]")
+  require(args.length >= 2 && args.drop(2).forall(a => a == "vivado" || a.startsWith("timingPipe=")),
+    "usage: GenPulseTableSocJson <config.json> <targetDir> [vivado] [timingPipe=on|off]")
   val spec = riscq.soc.spec.SocSpec.load(args(0))
   val dir = args(1)
-  val vivadoMode = args.lift(2).contains("vivado")
+  val vivadoMode = args.drop(2).contains("vivado")
+  // P3c-3: the timing pipeline follows the results path unless forced (the N1 identity pin builds antq with it off)
+  val timingPipe: Option[Boolean] = args.drop(2).find(_.startsWith("timingPipe=")).map(_.stripPrefix("timingPipe=")) match {
+    case Some("on")  => Some(true)
+    case Some("off") => Some(false)
+    case Some(v)     => throw new IllegalArgumentException(s"timingPipe=$v is not on|off")
+    case None        => None
+  }
 
   // The SoC is built from the channel-list spec directly (universal-control/01 P1): every core's
   // channels, converters and memories come from its CoreSpec; the host map is SocSpecMap(spec).
@@ -36,7 +43,7 @@ object GenPulseTableSocJson extends App {
     // `withMul` is per core, from the spec.
     coreParam = RiscqParam(gshareMem = true, csrWarl = true,
       aluNoFastForward = true, aluResultOneHot = true, pcRegMaxFanout = 16),
-    vivado = vivadoMode)
+    vivado = vivadoMode, timingPipeOverride = timingPipe)
 
   // vivado mode: LUT6 packing + the companion ClockInterface.v BUFG wrapper, matching GenPulseTableSocVivado.
   val spinal = SpinalConfig(mode = Verilog, targetDirectory = dir, romReuse = true)
@@ -46,5 +53,5 @@ object GenPulseTableSocJson extends App {
 
   val extra = if (vivadoMode) " + ClockInterface.v" else ""
   println(s"[GenPulseTableSocJson] emitted $dir/PulseTableSoc.v$extra " +
-    s"(${spec.name}, qubitNum=$qubitNum, vivado=$vivadoMode)")
+    s"(${spec.name}, qubitNum=$qubitNum, vivado=$vivadoMode, timingPipe=${timingPipe.getOrElse(spec.withAntqUplink)})")
 }

@@ -327,6 +327,7 @@ def _qutrit(m):
 # matrix ARITHMETIC — the row-stochastic shape and the `rcorr` inverse — is the host-pure half above.
 
 @pytest.mark.cosim
+@pytest.mark.hostwindow          # riscq.cal.batched keeps its shots in a host=True window array
 def test_ge_preps_reach_levels_0_and_1(cosim):
     """L2 (spec 14 F2) — the |0> and |1> rows of the 3-level confusion come from ONE image whose
     `prep` runtime param picks idle or the GE π (`ReadoutCalibration`'s own `Cond(prep, X90·X90)`
@@ -354,6 +355,7 @@ def test_ge_preps_reach_levels_0_and_1(cosim):
 
 
 @pytest.mark.cosim
+@pytest.mark.hostwindow          # riscq.cal.batched keeps its shots in a host=True window array
 def test_ef_prep_reaches_level_2(cosim):
     """L2 (spec 14 F2) — the |2> row's prep: a GE π followed by an EF π at the config's EF X
     amplitude, on its own image with the carrier retuned mid-shot. It is the sequence

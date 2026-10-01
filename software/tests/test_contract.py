@@ -17,10 +17,13 @@ LOCAL_MAP = SocMap(SocParams.load(CONFIGS / "sim-2q.json"))
 ENTRIES = LOCAL_MAP.entries()
 
 
-def test_server_params_match_local_config(cosim):
+def test_server_params_match_local_config(cosim, request):
     _, m = cosim
-    assert m.params == LOCAL_MAP.params
-    assert m.entries() == ENTRIES
+    # under --results-path antq_uplink the `cosim` fixture runs the config's -antq sibling
+    antq = request.config.getoption("--results-path") == "antq_uplink"
+    local = SocMap(SocParams.load(CONFIGS / "sim-2q-antq.json")) if antq else LOCAL_MAP
+    assert m.params == local.params
+    assert m.entries() == local.entries()
 
 
 def _rw_words(drv, addr: int, seed: int, nwords: int = 4):

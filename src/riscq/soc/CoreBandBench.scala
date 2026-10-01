@@ -41,7 +41,10 @@ case class CoreBandBench(
     coreParam: RiscqParam = CoreBandBench.defaultCoreParam,
     linkPipe: Int = 4,
     memDepth: Int = 4096,
-    readoutAccWidth: Int = 32
+    readoutAccWidth: Int = 32,
+    // P3c-3 (qubic3 Codex gate finding 11): false = the antq_uplink core, which has no HostWindow bridge
+    // (RiscvSoc(withHostWindow = false), as PulseTableSoc builds it for results_path = antq_uplink)
+    withHostWindow: Boolean = true
 ) extends Component {
   val dspClk, dspRst = in Bool()
   val dspCd   = ClockDomain(dspClk, dspRst)
@@ -60,7 +63,7 @@ case class CoreBandBench(
     val cp = coreParam.copy(fetchPcWidth = Some(log2Up(memDepth) + 2), fetchLatency = 4)
 
     val riscvSoc = RiscvSoc(plugins = cp.plugins(), riscqCd = riscqCd,
-      readoutAccWidth = readoutAccWidth, memDepth = memDepth)
+      readoutAccWidth = readoutAccWidth, memDepth = memDepth, withHostWindow = withHostWindow)
     riscvSoc.setName("riscqArea_riscqCores_0_riscvSoc")
     riscvSoc.addAttribute("KEEP_HIERARCHY", "TRUE")
 
@@ -98,7 +101,7 @@ case class CoreBandBench(
 
     // host-window stream tied off: the bridge cells stay inside the core (the pblock target); the CC
     // FIFO and the shared funnel live outside it and are not part of this bench.
-    riscvSoc.hostCmd.ready := True
+    if (withHostWindow) riscvSoc.hostCmd.ready := True
 
     // iLoad tied off by a quiet host master (no program needed for timing)
     val tieILoad = Fiber build { riscvSoc.iLoad.node.bus.a.setIdle(); riscvSoc.iLoad.node.bus.d.ready := True }
@@ -123,7 +126,9 @@ object GenCoreBandBench extends App {
       .map(s => s == "1" || s.equalsIgnoreCase("true")).getOrElse(RiscqParam().btbPredictLate),
     lateBadTarget = sys.env.get("RISCQ_LATE_BADTARGET")
       .map(s => s == "1" || s.equalsIgnoreCase("true")).getOrElse(RiscqParam().lateBadTarget))
+  // RISCQ_BAND_ANTQ=1: the antq_uplink core (no HostWindow bridge), the one the antq 14q image builds
+  val antq = sys.env.get("RISCQ_BAND_ANTQ").exists(v => v == "1" || v.equalsIgnoreCase("true"))
   SpinalConfig(mode = Verilog, targetDirectory = dir, romReuse = true)
-    .generate(CoreBandBench(coreParam = cp))
+    .generate(CoreBandBench(coreParam = cp, withHostWindow = !antq))
   println(s"[GenCoreBandBench] emitted $dir/CoreBandBench.v")
 }

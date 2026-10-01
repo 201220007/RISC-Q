@@ -47,7 +47,8 @@ object XcoreCpuSim extends App {
 
   SimConfig.addSimulatorFlag("-Wno-MULTIDRIVEN").addSimulatorFlag("--x-initial 0")
     .compile {
-      val dut = PulseTableSoc(qubitNum, dacMap, adcMap, withTest = false)
+      val dut = PulseTableSoc(qubitNum, dacMap, adcMap, withTest = false,
+        timingPipe = Some(riscq.misc.TimingPipeKnob.enabled))   // RISCQ_TIMING_PIPE=1: the P3c-3 variant
       dut.riscqArea.time.simPublic()
       for (c <- dut.riscqArea.riscqCores) {
         c.startTime.simPublic()

@@ -155,9 +155,8 @@ report_bus_skew -file $BUILD_DIR/bus_skew_${CDC_SFX}.rpt
 set _bs [report_bus_skew -return_string]
 set _nbs [regexp -all {set_bus_skew} $_bs]
 puts "\[ddr-cdc\] report_bus_skew lists $_nbs set_bus_skew constraint(s) -> $BUILD_DIR/bus_skew_${CDC_SFX}.rpt"
-if {$_nbs < 4} {
-  error "report_bus_skew shows $_nbs set_bus_skew constraint(s); inc/ddr-timing.xdc declares 4"
-}
+# P3c-2: exact coverage of the per-counter Gray groups and the uplink's bus-skew rows and requirements
+source $INC/ddr-check-busskew.tcl
 
 # ---- structural CDC review (plan v2 r2 #13): Vivado's own classification of every crossing --------
 # P3b r1: written AND gated. ddr-cdc-verdict.tcl fails the build on any negative bus-skew slack and on any

@@ -31,15 +31,19 @@ set_clock_groups -asynchronous -name uplink_async_domains \
 # asynchronous to EVERY other clock (`set_clock_groups -asynchronous -group {dspClk_clk_p}`). A clock
 # group outranks set_max_delay, so a `set_max_delay -datapath_only` on these paths would be silently
 # ignored. `set_bus_skew` is not overridden by clock groups, so it is what bounds them. The bound is
-# the faster (dspClk) period, as XPM_CDC_GRAY uses. What each one guarantees:
-#   1. rejected-count Gray pointers (dsp -> ui): all bits of a pointer land within one period, so the
-#      receiver never samples two changing bits.
+# the faster (dspClk) period, as XPM_CDC_GRAY uses, except #3 (P3c-2). What each one guarantees (the derivations
+# of #1 and #3 are in inc/ddr-timing-bus-skew.md):
+#   1. rejected-count Gray counters (dsp -> ui): all bits of ONE counter land within one dspClk period (2.0 ns), so
+#      the receiver never samples two changing bits of that counter. The counters are independent values, so the
+#      bound is per counter: one group per counter, generated per build into <build>/ddr-timing-gray.xdc by
+#      inc/ddr-gray-skew.tcl (P3c-2; before, one group spanned all counters).
 #   2. circular-buffer presentation (dsp -> ui): the bank metadata (bank_sel, last_valid_addr,
 #      bank_used, bank_final) crosses on 2 flops and the presentation toggle on 3. The skew bound
 #      makes the metadata settle at the receiver before the toggle's extra flop lets it be sampled.
-#   3. accounting snapshot (dsp -> ui): accSnap / ovfSnap are frozen, then snapToggle crosses on 2 flops;
-#      the ui side reads them after the synced toggle. Skew against the toggle's own path bounds when
-#      they have settled.
+#   3. accounting snapshot (dsp -> ui): accSnap / ovfSnap and snapToggle load at the same dsp edge; the toggle
+#      crosses on 2 flops, then an edge detect enables the capture, at the earliest two ui_clk edges after the toggle
+#      can first be sampled. A data bit may therefore arrive up to 2 x 3.001 ns - setup - hold (about 5.8 ns) after
+#      the toggle; the bound is one ui_clk period, 3.0 ns, which keeps >= 2.8 ns of that margin (P3c-2; was 2.0).
 #   4. injector payload (ui -> dsp): injReal / injImag / injCore are held from INJ_FIRE until the
 #      acknowledge. The dsp side captures them into dsp.injRealC/ImagC/CoreC, enabled by xInj's synchronized
 #      request, and consumes only the captures (P3b r1). The group ends at those capture flops (no logic in
@@ -48,13 +52,12 @@ set_clock_groups -asynchronous -name uplink_async_domains \
 # The cells are inside the packaged SoC IP, which does not exist as cells during synth_1 of the BD
 # wrapper, so the lookups are -quiet. inc/ddr-check-cdc.tcl re-resolves every set against the
 # routed design and fails the build if one is empty, and report_bus_skew shows each one met.
-set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_rejGray_*_reg[*] && NAME !~ */dsp_rejGray_*_buffercc/*}] \
-             -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_rejGray_*_buffercc/buffers_0_reg[*]}] 2.000
+# (#1, the Gray counters: <build>/ddr-timing-gray.xdc, one group per counter)
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_cbuf/wr_* && IS_SEQUENTIAL}] \
              -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_cbuf/*/buffers_0_reg* && NAME !~ */rd_retTog_buffercc/*}] 2.000
 # (set_bus_skew takes cells/pins/ports only, not clocks: -to names the capturing registers)
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_accSnap_*_reg[*] || NAME =~ */ddrUplink_up/dsp_ovfSnap_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_reg}] \
-             -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/ddr_accSnapDdr_*_reg[*] || NAME =~ */ddrUplink_up/ddr_ovfSnapDdr_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_buffercc/buffers_0_reg}] 2.000
+             -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/ddr_accSnapDdr_*_reg[*] || NAME =~ */ddrUplink_up/ddr_ovfSnapDdr_reg[*] || NAME =~ */ddrUplink_up/dsp_snapToggle_buffercc/buffers_0_reg}] 3.000
 set_bus_skew -from [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/injReal_reg[*] || NAME =~ */ddrUplink_up/injImag_reg[*] || NAME =~ */ddrUplink_up/injCore_reg[*] || NAME =~ */ddrUplink_up/xInj/src_reqReg_reg}] \
              -to   [get_cells -quiet -hier -filter {NAME =~ */ddrUplink_up/dsp_injRealC_reg[*] || NAME =~ */ddrUplink_up/dsp_injImagC_reg[*] || NAME =~ */ddrUplink_up/dsp_injCoreC_reg[*] || NAME =~ */ddrUplink_up/xInj/reqLevel_buffercc/buffers_0_reg}] 2.000
 

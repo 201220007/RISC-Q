@@ -31,9 +31,10 @@ case class PulseDriveChannel(
     realOutput: Boolean,
     queueDepth: Int = 4,          // per-parameter TimedQueue depth (scheduled-ahead pulses per param)
     putAddrWidth: Int = 16,
-    useAligned: Boolean = false   // false = per-parameter lead-time TimedQueues (PulseGenerator);
+    useAligned: Boolean = false,  // false = per-parameter lead-time TimedQueues (PulseGenerator);
                                   // true = QubiC-style single combined params FIFO + SRL alignment
                                   // (PulseGeneratorAligned). Bit-identical pulse; trades alignment HW.
+    preDecode: Boolean = false    // P3c-3 C2: `cmd` is one link stage early; the buffer holds the last stage
 ) extends Component with Channel {
   val N = batchSize; val w = dataWidth
   val io = new Bundle {
@@ -47,7 +48,7 @@ case class PulseDriveChannel(
 
   val buf = PulseParamBuffer(PulseParamBufferParams(
     pulseNum = pulseNum, dataWidth = w, envAddrWidth = envAddrWidth, durWidth = durWidth,
-    timeWidth = timeWidth, addrWidth = putAddrWidth))
+    timeWidth = timeWidth, addrWidth = putAddrWidth, preDecode = preDecode))
   buf.io.cmd << io.cmd
   buf.io.timeBcast := io.timeBcast
 
@@ -136,7 +137,8 @@ case class DemodChannel(
     saturate: Boolean,
     phasorMethod: SinCosMethod,
     queueDepth: Int = 4,          // per-parameter TimedQueue depth (scheduled-ahead pulses per param)
-    putAddrWidth: Int = 16
+    putAddrWidth: Int = 16,
+    preDecode: Boolean = false    // P3c-3 C2: `cmd` is one link stage early; the buffer holds the last stage
 ) extends Component with Channel {
   val N = batchSize; val w = dataWidth
   val io = new Bundle {
@@ -150,7 +152,7 @@ case class DemodChannel(
 
   val buf = PulseParamBuffer(PulseParamBufferParams(
     pulseNum = pulseNum, dataWidth = w, envAddrWidth = envAddrWidth, durWidth = durWidth,
-    timeWidth = timeWidth, addrWidth = putAddrWidth))
+    timeWidth = timeWidth, addrWidth = putAddrWidth, preDecode = preDecode))
   buf.io.cmd << io.cmd
   buf.io.timeBcast := io.timeBcast
 

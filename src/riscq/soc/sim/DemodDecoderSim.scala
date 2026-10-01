@@ -86,7 +86,8 @@ object DemodDecoderSim extends App {
     }
     val demod = DemodChannel(pulseNum = pulseNum, batchSize = N, dataWidth = w, envAddrWidth = envAddrW,
       durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency, prescaleAmp = prescaleAmp,
-      saturate = saturate, phasorMethod = SinCosMethod.Cordic, putAddrWidth = putAddrWidth)
+      saturate = saturate, phasorMethod = SinCosMethod.Cordic, putAddrWidth = putAddrWidth,
+      preDecode = riscq.misc.TimingPipeKnob.enabled)   // P3c-3: RISCQ_TIMING_PIPE=1 builds the antq channel variant
     demod.io.cmd << io.cmd
     demod.io.timeBcast := io.time
     val mem = Mem.fill(content.length)(Bits(N * 2 * w bits)) init (content.map(c => B(c, N * 2 * w bits)))
@@ -161,7 +162,7 @@ object DemodDecoderSim extends App {
       (wrap(sr), wrap(si))
     }
 
-    SimConfig.compile(Tb(prescaleAmp, saturate)).doSim(s"demodDecoder_pre${prescaleAmp}_sat$saturate", seed = 42) { dut =>
+    riscq.misc.TimingPipeKnob.sim(SimConfig).compile(Tb(prescaleAmp, saturate)).doSim(s"demodDecoder_pre${prescaleAmp}_sat$saturate", seed = 42) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       dut.io.cmd.valid #= false; dut.io.cmd.payload.address #= 0; dut.io.cmd.payload.data #= 0

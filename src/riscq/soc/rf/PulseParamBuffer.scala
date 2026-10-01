@@ -39,10 +39,10 @@ case class PulseParamBufferParams(
     startTimeAddr: Int = 0x4100,
     pulseOffset: Int = 0x10,     // 4 words per table entry; entry i at (i+1)*pulseOffset
     bitOffset: Int = 16,         // 16-bit fields packed in data[31:16]
-    useMem: Boolean = true       // table storage: true (default) = distributed-RAM Mem; false = FF Vec
+    useMem: Boolean = true,      // table storage: true (default) = distributed-RAM Mem; false = FF Vec
                                  // register file. Clamped to a register file when pulseNum = 1 (a depth-1
                                  // table has no address, e.g. ro/demod) — see `memTable` in the body.
-) {
+    preDecode: Boolean = false) {  // P3c-3 C2: see the end of this file
   require(pulseNum >= 1)
   require(addrWidth >= log2Up(startTimeAddr + 1), "addrWidth too small for startTimeAddr")
   // the parallel cmd decode splits the address at the 16-byte slot boundary (slot = address >> 4,
@@ -85,8 +85,8 @@ case class PulseParamBuffer(p: PulseParamBufferParams) extends Component {
   // local low-fanout time copy: equal pipeline delay across buffers ⇒ same-startTime same-cycle rise.
   io.time := RegNext(io.timeBcast).addAttribute("EQUIVALENT_REGISTER_REMOVAL", "NO")
 
-  // ── posted register file ──
-  val cmd = io.cmd
+  // ── posted register file ── (P3c-3 C2 preDecode: this buffer holds the link's last stage, PulseParamPreDecode)
+  val pre = preDecode generate new PulseParamPreDecode(p, io.cmd); val cmd = if (preDecode) pre.cmd else io.cmd
   def field(width: Int): Bits = cmd.payload.data(bitOffset, width bits)
 
   val startTime = Reg(UInt(timeWidth bits)) init 0
@@ -118,19 +118,19 @@ case class PulseParamBuffer(p: PulseParamBufferParams) extends Component {
   val addr = cmd.payload.address
   def hit(a: Int): Bool = cmd.valid && addr === a
 
-  val outParamValid = hit(fireAddr)
+  val outParamValid = if (preDecode) pre.fire else hit(fireAddr)
   if (pulseNum > 1) when(outParamValid) { outId := cmd.payload.data(0, log2Up(pulseNum) bits).asUInt }
 
-  val explicitStartWrite = hit(startTimeAddr)   // also gates the fire auto-advance below (explicit wins)
+  val explicitStartWrite = if (preDecode) pre.start else hit(startTimeAddr)   // also gates the fire auto-advance below (explicit wins)
   when(explicitStartWrite)   { startTime   := cmd.payload.data(0, timeWidth bits).asUInt }
-  when(hit(dcOffsetAddr))    { dcOffset    := field(w).asSInt }
-  when(hit(phaseOffsetAddr)) { phaseOffset := field(w).asSInt }
+  when(if (preDecode) pre.dc else hit(dcOffsetAddr))       { dcOffset    := field(w).asSInt }
+  when(if (preDecode) pre.phOff else hit(phaseOffsetAddr)) { phaseOffset := field(w).asSInt }
 
   // table write request, shared by both storage styles; only one field of one entry per beat.
   val slot   = addr >> log2Up(pulseOffset)                  // table slot: entry i lives in slot i+1
-  val tWrEn  = cmd.valid && slot =/= 0 && slot <= pulseNum  // table write enable
+  val tWrEn  = if (preDecode) pre.tWr else cmd.valid && slot =/= 0 && slot <= pulseNum  // table write enable
   val tWrIdx = UInt(log2Up(pulseNum) bit)                   // table write index
-  tWrIdx := (slot - 1).resized  // don't-care outside tWrEn (the rmw read of a garbage index is discarded)
+  tWrIdx := (if (preDecode) pre.tIdx else (slot - 1).resized)  // don't-care outside tWrEn (the rmw read of a garbage index is discarded)
   val fieldSel = addr(3 downto 2)                           // word within the slot
   val wrPhase = fieldSel === 0
   val wrAmp   = fieldSel === 1
@@ -193,7 +193,7 @@ case class PulseParamBuffer(p: PulseParamBufferParams) extends Component {
   // startTime, which is NOT rewritten between the freq write and the fire, so the +1-cycle delay is
   // timing-invisible (the timed queue still captures the same startTime ⇒ bit-exact). valid inits False —
   // reset-clean, no X-driven spurious freq push at t=0 (mirrors outParamFlow above).
-  io.freq.valid   := RegNext(hit(freqAddr)) init False
+  io.freq.valid   := RegNext(if (preDecode) pre.freq else hit(freqAddr)) init False
   io.freq.payload := RegNext(field(w).asSInt)
 
   // fire the popped table entry into the generator's queues.
@@ -201,4 +201,32 @@ case class PulseParamBuffer(p: PulseParamBufferParams) extends Component {
   io.amp.valid   := outParamFlow.valid; io.amp.payload   := outParamFlow.amp.asSInt
   io.addr.valid  := outParamFlow.valid; io.addr.payload  := outParamFlow.env.asUInt
   io.dur.valid   := outParamFlow.valid; io.dur.payload   := outParamFlow.dur.asUInt
+}
+
+/**
+ * P3c-3 C2 (`PulseParamBufferParams.preDecode`, the qubic3 antq timing pipeline; evidence/P3c/
+ * PLAN_P3c3_pipelining_v2.md §1): the shell hands the buffer its posted link's next-to-last stage, and this Area is
+ * the last stage. It registers valid, address and data, plus every address decode the buffer's writes need,
+ * computed in front of the register. They are one register stage with no reset and no enable, exactly the `getPipe`
+ * RegNext it replaces, so validity, address, data and the flags move together and each write lands on the cycle it
+ * did before, for any beat spacing. The decode leaves the critical write-enable / select cone.
+ *
+ * It sits at the end of the file, and the two new parameters share one line, so that PulseParamBuffer's line numbers
+ * stay as they were: Spinal names anonymous `when` conditions after them (`when_PulseParamBuffer_l126`), and the
+ * switch-off RTL must stay byte-identical (G0', N1).
+ */
+class PulseParamPreDecode(p: PulseParamBufferParams, in: Flow[Put]) extends Area {
+  import p._
+  def h(a: Int): Bool = in.valid && in.payload.address === a
+  val slotIn = in.payload.address >> log2Up(pulseOffset)
+  val fire  = RegNext(h(fireAddr))
+  val start = RegNext(h(startTimeAddr))
+  val dc    = RegNext(h(dcOffsetAddr))
+  val phOff = RegNext(h(phaseOffsetAddr))
+  val freq  = RegNext(h(freqAddr))
+  val tWr   = RegNext(in.valid && slotIn =/= 0 && slotIn <= pulseNum)
+  val tIdx  = RegNext((slotIn - 1).resize(log2Up(pulseNum) bits))
+  val cmd   = RegNext(in)
+  for (x <- Seq(fire, start, dc, phOff, freq, tWr)) x.addAttribute("DONT_TOUCH")
+  tIdx.addAttribute("DONT_TOUCH"); cmd.addAttribute("DONT_TOUCH")
 }

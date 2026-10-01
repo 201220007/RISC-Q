@@ -29,7 +29,8 @@ case class TimedDio(
     timeWidth: Int = 32,
     durWidth: Int = 16,
     queueDepth: Int = 4,
-    putAddrWidth: Int = 16
+    putAddrWidth: Int = 16,
+    preDecode: Boolean = false          // P3c-3 C2: `cmd` is one link stage early; the buffer holds the last stage
 ) extends Component with Channel {
   val lines = 16                      // the buffer's 16-bit mask/value fields
   val io = new Bundle {
@@ -46,7 +47,7 @@ case class TimedDio(
 
   val buf = PulseParamBuffer(PulseParamBufferParams(
     pulseNum = slots, dataWidth = lines, envAddrWidth = 1, durWidth = durWidth,
-    timeWidth = timeWidth, addrWidth = putAddrWidth))
+    timeWidth = timeWidth, addrWidth = putAddrWidth, preDecode = preDecode))
   buf.io.cmd << io.cmd
   buf.io.timeBcast := io.timeBcast
 

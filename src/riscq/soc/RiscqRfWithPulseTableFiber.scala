@@ -175,6 +175,7 @@ case class RiscqRfWithPulseTableFiber(
     res
   }
 
+  require(!timingPipe || linkPipe >= 1, "the P3c-3 posted-command pre-decode needs linkPipe >= 1")
   val posted = dspCd { new Composite(this, "posted") {
     // One channel per spec entry off its demuxed sub-window of the (piped) posted command stream — each
     // channel pipes the stream itself (per-channel `linkPipe` copies keep the pipe fanout at one).
@@ -188,9 +189,10 @@ case class RiscqRfWithPulseTableFiber(
           PulseDriveChannel(pulseNum = ch.slots, batchSize = batchSize, dataWidth = w,
             envAddrWidth = envAddrWidth, durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency,
             prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod, realOutput = true,
-            queueDepth = spec.queueDepth)
+            queueDepth = spec.queueDepth, preDecode = timingPipe)
         case "dio" =>
-          TimedDio(slots = ch.slots, timeWidth = timeWidth, durWidth = durWidth, queueDepth = spec.queueDepth)
+          TimedDio(slots = ch.slots, timeWidth = timeWidth, durWidth = durWidth, queueDepth = spec.queueDepth,
+            preDecode = timingPipe)
         case "demod" =>
           // the demod carrier: a scheduled, envelope-shaped complex pulse (a PulseDriveChannel pointed at
           // the decoder). Its posted RF sub-window carries the same fire/freq/table/startTime map as a
@@ -198,10 +200,14 @@ case class RiscqRfWithPulseTableFiber(
           // with the readout window. adcBatch lanes (the ADC batch), not batchSize.
           DemodChannel(pulseNum = ch.slots, batchSize = adcBatch, dataWidth = w,
             envAddrWidth = envAddrWidth, durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency,
-            prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod, queueDepth = spec.queueDepth)
+            prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod, queueDepth = spec.queueDepth,
+            preDecode = timingPipe)
       }
       c.setCompositeName(this, s"${ch.name}Channel")
-      c.cmd << PutLink.demux(getPipe(riscvSoc.cmd, linkPipe), k * SocSpecMap.rfChStride, SocSpecMap.rfChStride, 16)
+      // P3c-3 C2 (timingPipe): the channel's buffer holds the link's last stage itself, with its address decode in
+      // front of it, so the shell pipes one stage fewer and demuxes stage linkPipe-1 (the latency is unchanged)
+      c.cmd << PutLink.demux(getPipe(riscvSoc.cmd, if (timingPipe) linkPipe - 1 else linkPipe),
+        k * SocSpecMap.rfChStride, SocSpecMap.rfChStride, 16)
       c.timeBcast := (if (chanTime != null) chanTime else time)
       c
     }

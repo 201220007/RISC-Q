@@ -16,7 +16,7 @@ import riscq.soc.link.Put
  */
 object TimedDioSim extends App {
   case class Dut() extends Component {
-    val dio = TimedDio(slots = 4)
+    val dio = TimedDio(slots = 4, preDecode = riscq.misc.TimingPipeKnob.enabled)   // P3c-3: RISCQ_TIMING_PIPE=1 = antq variant
     val cmd  = slave port Flow(Put(16))
     val time = in port UInt(32 bits)
     val dout = out port Bits(16 bits)
@@ -30,7 +30,7 @@ object TimedDioSim extends App {
     localTime := dio.io.time
   }
 
-  SimConfig.compile(Dut()).doSim("timedDio", seed = 3) { dut =>
+  riscq.misc.TimingPipeKnob.sim(SimConfig).compile(Dut()).doSim("timedDio", seed = 3) { dut =>
     val cd = dut.clockDomain
     var t = 0L
     dut.cmd.valid #= false; dut.time #= 0; dut.din #= 0

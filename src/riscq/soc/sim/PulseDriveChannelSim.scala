@@ -59,7 +59,8 @@ object PulseDriveChannelSim extends App {
     val ch = PulseDriveChannel(
       pulseNum = pulseNum, batchSize = batchSize, dataWidth = w, envAddrWidth = envAddrW,
       durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency, prescaleAmp = prescaleAmp,
-      saturate = saturate, phasorMethod = SinCosMethod.Cordic, realOutput = false, putAddrWidth = putAddrWidth)
+      saturate = saturate, phasorMethod = SinCosMethod.Cordic, realOutput = false, putAddrWidth = putAddrWidth,
+      preDecode = riscq.misc.TimingPipeKnob.enabled)   // P3c-3: RISCQ_TIMING_PIPE=1 builds the antq channel variant
     ch.io.cmd << cmd
     ch.io.timeBcast := timeBcast
 
@@ -84,7 +85,7 @@ object PulseDriveChannelSim extends App {
   val offset    = Shot(startTime = 600, phase = P,     phaseOffset = D)  // rotation via virtual-Z reg
   val totalCycles = 720
 
-  SimConfig.compile(Dut()).doSim("pulseDriveChannel", seed = 42) { dut =>
+  riscq.misc.TimingPipeKnob.sim(SimConfig).compile(Dut()).doSim("pulseDriveChannel", seed = 42) { dut =>
     val cd = dut.clockDomain
     dut.cmd.valid #= false
     dut.cmd.payload.address #= 0
@@ -168,7 +169,7 @@ object PulseDriveChannelSim extends App {
   {
     val NT      = 3
     val trainAt = 100
-    val compiledT = SimConfig.compile(Dut())
+    val compiledT = riscq.misc.TimingPipeKnob.sim(SimConfig).compile(Dut())
 
     // run one timeBcast ramp after `program` posts its Put beats; return the per-cycle capture.
     def captureRun(program: (((Int, Int) => Unit), (Seq[(Int, Int)] => Unit)) => Unit)

@@ -35,6 +35,7 @@ object PulseParamBufferSim extends App {
   val prescaleAmp = true
   val saturate    = false
   val useMem      = sys.env.get("RISCQ_PARAMBUF_USEMEM").exists(_.toBoolean) // A/B the table storage style
+  val timingPipe  = riscq.misc.TimingPipeKnob.enabled   // P3c-3: RISCQ_TIMING_PIPE=1 builds the antq buffer variant
 
   val N     = batchSize
   val amax  = (BigInt(1) << (w - 1)) - 1
@@ -94,7 +95,7 @@ object PulseParamBufferSim extends App {
 
     val buf = PulseParamBuffer(PulseParamBufferParams(
       pulseNum = pulseNum, dataWidth = w, envAddrWidth = envAddrW, durWidth = durWidth,
-      timeWidth = timeWidth, addrWidth = addrWidth, useMem = useMem))
+      timeWidth = timeWidth, addrWidth = addrWidth, useMem = useMem, preDecode = timingPipe))
     buf.io.cmd << cmd
     buf.io.timeBcast := timeBcast
 
@@ -124,7 +125,7 @@ object PulseParamBufferSim extends App {
 
   def w16(v: BigInt): Int = (((v & 0xFFFF) << 16) & 0xFFFFFFFFL).toInt // 16-bit field in data[31:16]
 
-  SimConfig.compile {
+  riscq.misc.TimingPipeKnob.sim(SimConfig).compile {
     val dut = Dut()
     dut.buf.startTime.simPublic()   // observe the RAW startTime register (io.startTime is now delayed)
     dut
@@ -248,7 +249,7 @@ object PulseParamBufferSim extends App {
     postTight(Seq((0x0, pA.idx), (startTimeAddr, t3b)))
     assert(readStart() == t3b, s"[B0 priority] startTime ${readStart()} != $t3b (explicit write must win)")
 
-    println(s"[PulseParamBufferSim] PASS  pulseNum=$pulseNum N=$N w=$w useMem=$useMem: 2 posted-Put-driven pulses bit-exact " +
+    println(s"[PulseParamBufferSim] PASS  pulseNum=$pulseNum N=$N w=$w useMem=$useMem timingPipe=$timingPipe: 2 posted-Put-driven pulses bit-exact " +
       s"vs the PulseGenerator golden; valid window exactly [startTime+$offA, +dur); uniform bulk latency $offA.")
     simSuccess()
   }
@@ -260,12 +261,12 @@ object PulseParamBufferSim extends App {
     val timeBcast = in    port UInt(timeWidth bits)
     val buf = PulseParamBuffer(PulseParamBufferParams(
       pulseNum = 1, dataWidth = w, envAddrWidth = envAddrW, durWidth = durWidth,
-      timeWidth = timeWidth, addrWidth = addrWidth, useMem = false))
+      timeWidth = timeWidth, addrWidth = addrWidth, useMem = false, preDecode = timingPipe))
     buf.io.cmd << cmd
     buf.io.timeBcast := timeBcast
   }
 
-  SimConfig.compile {
+  riscq.misc.TimingPipeKnob.sim(SimConfig).compile {
     val dut = Dut1()
     dut.buf.startTime.simPublic()
     dut

@@ -63,6 +63,40 @@ if {$n == 0} { error "riscvsoc-bd: found no RiscvSoc cores under ${base}/riscqAr
 if {$perRow <= 0} { set perRow $n }
 puts "\[riscvsoc-bd\] base=$base; $n cores, perRow=$perRow → X0 rows from Y$baseRow; datapath confine=$confine (2=region 1=global 0=none)"
 
+# ── P3c-2: antq_uplink-only floorplan variants (RISCQ_ANTQ_FLOORPLAN). They apply only when the design has the Ant-Q
+#    uplink (results_path = antq_uplink); a hostwindow build has no `ddrUplink_up` and keeps this file's floorplan.
+#      relocate: hard pblocks, nested in pb_datapath, put smc_ctrl (the PS -> ui_clk control SmartConnect) into
+#                RISCQ_ANTQ_CTRL_REGION (default X1Y0:X1Y1, beside the PS and the main SmartConnect) and the uplink's
+#                MIG-side half (ddrUplink_up/ddr_*) into RISCQ_ANTQ_DDR_REGION (default X3Y0:X3Y1, beside the MIG's
+#                X4Y0:X4Y1). The uplink's FIFOs, poller and accounting stay with the decoders (unconstrained).
+#      resize:   each core band of a full row widens east by RISCQ_ANTQ_BAND_EXT (default 4) SLICE columns of the X1
+#                region of its row, removed from pb_datapath; a row with fewer cores than perRow splits into that many
+#                bands. EXCLUDE_PLACEMENT and the hard bands stay as they are.
+set antqFp ""
+if {[info exists ::env(RISCQ_ANTQ_FLOORPLAN)] && $::env(RISCQ_ANTQ_FLOORPLAN) ne ""} {
+  set antqFp $::env(RISCQ_ANTQ_FLOORPLAN)
+  if {$antqFp ni {relocate resize}} { error "RISCQ_ANTQ_FLOORPLAN=$antqFp is not one of {relocate, resize}" }
+  if {$confine != 1} { error "RISCQ_ANTQ_FLOORPLAN needs the global datapath confine (RISCQ_CONFINE=global), not $confineStr" }
+  if {[llength [get_cells -quiet ${base}/ddrUplink_up]] == 0} {
+    puts "\[riscvsoc-bd\] RISCQ_ANTQ_FLOORPLAN=$antqFp ignored: no ${base}/ddrUplink_up (not an antq_uplink build)"
+    set antqFp ""
+  } else {
+    puts "\[riscvsoc-bd\] antq_uplink floorplan variant: $antqFp"
+  }
+}
+set antqBandExt [expr {[info exists ::env(RISCQ_ANTQ_BAND_EXT)] ? $::env(RISCQ_ANTQ_BAND_EXT) : 4}]
+# the first k SLICE columns of a clock region, over rows ya..yb
+proc riscq_region_first_cols {region k ya yb} {
+  set xs {}
+  foreach s [get_sites -quiet -of_objects [get_clock_regions $region] -filter {SITE_TYPE =~ SLICE*}] {
+    if {[regexp {SLICE_X(\d+)Y} $s -> x]} { lappend xs $x }
+  }
+  if {[llength $xs] == 0} { error "riscq_region_first_cols: no SLICE sites in $region" }
+  set xs [lsort -integer -unique $xs]
+  if {[llength $xs] < $k} { error "riscq_region_first_cols: $region has only [llength $xs] SLICE columns" }
+  return "SLICE_X[lindex $xs 0]Y${ya}:SLICE_X[lindex $xs [expr {$k - 1}]]Y${yb}"
+}
+
 # ── datapath confine (BEFORE the core bands, so a coreTime replica that lands here is later MOVED into
 #    its core band by add_cells_to_pblock). The `NAME =~ ${base}/*` clause keeps the Zynq PS / RFDC /
 #    SmartConnect (siblings of the IP) OUT of the datapath group. ──
@@ -110,6 +144,22 @@ if {$confine == 2} {
   resize_pblock $pbd -add CLOCKREGION_X1Y0:CLOCKREGION_X5Y7
   set_property IS_SOFT FALSE $pbd
   puts "\[riscvsoc-bd\] datapath confined globally → X1Y0:X5Y7 ([llength $dpCells] cells)"
+  if {$antqFp eq "relocate"} {
+    set ddrReg  [expr {[info exists ::env(RISCQ_ANTQ_DDR_REGION)]  ? $::env(RISCQ_ANTQ_DDR_REGION)  : "X3Y0:X3Y1"}]
+    set ctrlReg [expr {[info exists ::env(RISCQ_ANTQ_CTRL_REGION)] ? $::env(RISCQ_ANTQ_CTRL_REGION) : "X1Y0:X1Y1"}]
+    foreach {pbn cflt reg} [list pb_antq_uplink_ddr "PRIMITIVE_LEVEL == LEAF && NAME =~ ${base}/ddrUplink_up/ddr_*" $ddrReg \
+                                 pb_antq_smc_ctrl   "PRIMITIVE_LEVEL == LEAF && NAME =~ riscq_bd_i/smc_ctrl/*"  $ctrlReg] {
+      set cs [get_cells -quiet -hierarchical -filter $cflt]
+      if {[llength $cs] == 0} { error "relocate: no cells for $pbn ($cflt)" }
+      lassign [split $reg :] r0 r1
+      set pbx [create_pblock $pbn]
+      add_cells_to_pblock $pbx $cs
+      resize_pblock $pbx -add CLOCKREGION_${r0}:CLOCKREGION_${r1}
+      set_property PARENT pb_datapath $pbx
+      set_property IS_SOFT FALSE $pbx
+      puts "\[riscvsoc-bd\] relocate: $pbn → $reg ([llength $cs] cells), nested in pb_datapath"
+    }
+  }
 }
 
 # ── pin every RiscvSoc core into its X0 band; pull its coreTime replica in with it ──
@@ -131,9 +181,21 @@ foreach i $ids {
   # `coreTime_i_regNext_reg[*]` (which belongs to the confined datapath).
   set tcells [get_cells -quiet -hierarchical -filter "NAME =~ ${base}/*coreTime_${i}_reg\[*"]
   if {[llength $tcells] > 0} { set coreCells [concat $coreCells $tcells] }
-  set rect [riscq_slice_band X0Y${rr} $bandIdx $perRow]
+  set inRow [expr {min($perRow, $n - $rowIdx * $perRow)}]
+  if {$antqFp eq "resize" && $inRow < $perRow} {
+    # a short row: split it into as many bands as it has cores
+    set rect [riscq_slice_band X0Y${rr} $bandIdx $inRow]
+  } else {
+    set rect [riscq_slice_band X0Y${rr} $bandIdx $perRow]
+  }
+  if {$antqFp eq "resize" && $inRow == $perRow && $antqBandExt > 0} {
+    regexp {Y(\d+):SLICE_X\d+Y(\d+)$} $rect -> ya yb
+    set ext [riscq_region_first_cols X1Y${rr} $antqBandExt $ya $yb]
+    resize_pblock [get_pblocks pb_datapath] -remove $ext
+    set rect [list $rect $ext]
+  }
   riscq_make_pblock_sites pb_core${i} $coreCells $rect
-  puts "\[riscvsoc-bd\] core $i → X0Y${rr} band $bandIdx/$perRow ([llength $coreCells] cells, $rect)"
+  puts "\[riscvsoc-bd\] core $i → X0Y${rr} band $bandIdx/[expr {$antqFp eq "resize" && $inRow < $perRow ? $inRow : $perRow}] ([llength $coreCells] cells, $rect)"
   incr idx
 }
 puts "\[riscvsoc-bd\] floorplan applied ($n cores, confine=$confineStr)."

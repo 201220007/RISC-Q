@@ -301,7 +301,15 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
     skid.io.push.valid   := poller.io.wrEn
     skid.io.push.payload := poller.io.wrData
     when(skid.io.push.valid && !skid.io.push.ready)(skidOvf := True)   // must never happen (throttle)
-    throttle := skid.io.occupancy >= p.throttleLevel
+    // P3c-2: the throttle is a register, occupancy(t-1) >= throttleLevel, so the poller's barrel input no longer waits
+    // on the skid's occupancy subtract-and-compare. Headroom (skidDepth = throttleLevel + 3):
+    //  - pipelined poller (numCh > 8, the 14q build): it samples the throttle only in its BARREL phase, the skid is
+    //    pushed only in phase 0 (wrEn) and a push shows in the occupancy in phase 1, so at every BARREL sample
+    //    occupancy(t-1) == occupancy(t) unless a pop lowered it; the worst case stays throttleLevel + 1 (6 of 8);
+    //  - single-cycle poller (numCh <= 8): it can take a word every cycle, so the one-cycle-late throttle lets one more
+    //    word in: throttleLevel + 2 (7 of 8; it was throttleLevel + 1).
+    // G2 skid_headroom_sustained_stall{,_14ch} measures both under sustained W stalls.
+    throttle := RegNext(skid.io.occupancy >= p.throttleLevel) init (False)
 
     val cbuf = CircularBuffer(p.wordWidth, p.axiDataWidth, p.cbufAddrWidth, wrCd = dspU, rdCd = ddrU)
     // the Fork-A backpressure flag, kept under its G2 name (ReadoutDdrUplinkDut makes it simPublic)

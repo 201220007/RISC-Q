@@ -34,6 +34,8 @@ object ReadoutDdrUplinkSim extends App {
   def splitWord(w: BigInt): (Int, BigInt, BigInt) =
     (((w >> 56) & 0xFF).toInt, (w >> 28) & 0x0FFFFFFF, w & 0x0FFFFFFF)
 
+  // P3c-2: the running scenario's stall injector, so a scenario can take the stall pins over (`enabled = false`)
+  var curStalls: StallInjector = null
   def run(name: String, seed: Int, nch: Int = NCH, memDelay: Int = 0, rejW: Int = 16)(body: (ReadoutDdrUplinkDut, Helper) => Unit): Unit = {
     val pp = ReadoutDdrUplinkParams(numCh = nch, rejectedWidth = rejW)
     SimConfig.withConfig(SpinalConfig()).addSimulatorFlag("-Wno-MULTIDRIVEN").addSimulatorFlag("--x-initial 0")
@@ -49,6 +51,7 @@ object ReadoutDdrUplinkSim extends App {
         dut.io.rd.ready #= true
         dut.io.wStall #= false
         val stalls = new StallInjector(dut, ddrCd, if (STALLS) StallProfile.heavy else StallProfile.none, seed)
+        curStalls = stalls
         val mem = AxiMemorySim(dut.io.ddr, ddrCd, AxiMemorySimConfig(
           maxOutstandingReads = 2, maxOutstandingWrites = 2,
           readResponseDelay = memDelay, writeResponseDelay = memDelay))
@@ -381,6 +384,77 @@ object ReadoutDdrUplinkSim extends App {
       println(s"[G2]   core $i: accepted=$acc rejected=$rej overflowed=$lost (in-order subsequence of $N offered)")
     }
   }
+
+  /** 4d. P3c-2: skid headroom under SUSTAINED stalls, for the registered poller throttle. All cores offer at the
+   *  maximum rate while the W channel is held stalled for long random spans (released briefly in between), so the cbuf
+   *  backs up, the poller throttles, and the skid sits at its throttle level for thousands of cycles at a time, against
+   *  every phase alignment of the throttle register and the poller. The skid must never overflow and its occupancy
+   *  must stay within throttleLevel + 1 (the analytical worst case, see ReadoutDdrUplink's throttle); the data
+   *  delivered is an in-order subsequence of each core's offers, exactly accepted[i] long, every loss flagged. */
+  def skidHeadroom(name: String, seed: Int, nch: Int): Unit = run(name, seed, nch = nch) { (dut, h) =>
+    h.startRun()
+    // the scenario drives W itself (long holds); in `stalls` mode the injector would override that every cycle
+    curStalls.enabled = false; dut.io.awStall #= false; dut.io.arStall #= false; dut.io.bStall #= false
+    var sawThrottle = 0L; var maxSkid = 0; var stalled = 0L
+    val watch = fork {
+      while (true) {
+        h.dspCd.waitSampling()
+        if (dut.up.dsp.throttle.toBoolean) sawThrottle += 1
+        val occ = dut.up.dsp.skid.io.occupancy.toInt
+        if (occ > maxSkid) maxSkid = occ
+      }
+    }
+    val stall = fork {
+      while (true) {
+        dut.io.wStall #= true;  val on = 1500 + h.rng.nextInt(2500); h.dspCd.waitSampling(on); stalled += on
+        dut.io.wStall #= false; h.dspCd.waitSampling(50 + h.rng.nextInt(400))
+      }
+    }
+    val N = 3000
+    val offered = Array.tabulate(nch)(i => (0 until N).map(k => (0x60000 + k * 16 + i, 0x70000 + k * 16 + i)))
+    for (k <- 0 until N) {
+      for (i <- 0 until nch) { dut.io.results(i).payload.real #= offered(i)(k)._1
+        dut.io.results(i).payload.imag #= offered(i)(k)._2
+        dut.io.results(i).payload.res #= false; dut.io.results(i).valid #= true }
+      h.dspCd.waitSampling()
+      for (i <- 0 until nch) dut.io.results(i).valid #= false
+      h.dspCd.waitSampling(1 + h.rng.nextInt(2))
+    }
+    stall.terminate(); dut.io.wStall #= false; curStalls.enabled = true
+    h.dspCd.waitSampling(20000)
+    watch.terminate()
+    val s = h.flushRun()
+    // the analytical worst case of the registered throttle: +1 word for the pipelined poller, +2 for the single-cycle one
+    val pp = ReadoutDdrUplinkParams(numCh = nch)
+    val lim = pp.throttleLevel + (if (nch > 8) 1 else 2)
+    println(s"[G2] $name: $nch ch (${if (nch > 8) "pipelined" else "single-cycle"} poller), W stalled $stalled dsp cycles, throttle high $sawThrottle cycles, maxSkid=$maxSkid (limit $lim, depth ${pp.skidDepth})")
+    assert(sawThrottle > 2000, s"the throttle was barely exercised ($sawThrottle cycles)")
+    assert(maxSkid <= lim, s"skid occupancy $maxSkid exceeds throttleLevel + 1 = $lim")
+    assert(!h.bit(s, S_SKID_OVF), "skid overflowed under sustained stalls")
+    val fa = h.finalAddr(); val nwords = ((fa - BASE0) / 8).toInt
+    val S = (0 until nch).map(i => h.accepted(i).toInt).sum
+    assert(nwords - S >= 0 && nwords - S <= 3, s"pad out of range: nwords=$nwords S=$S")
+    val words = h.ddrWords(BASE0, nwords).take(S)
+    val perTag = mutable.Map[Int, mutable.ArrayBuffer[BigInt]]()
+    for (w <- words) perTag.getOrElseUpdate(splitWord(w)._1, mutable.ArrayBuffer()) += w
+    val ovfMask = h.rd(OVERFLOW)
+    for (i <- 0 until nch) {
+      val acc = h.accepted(i).toInt; val rej = h.rejected(i).toInt
+      assert(acc + rej <= N, s"core $i: accepted=$acc + rejected=$rej > offered=$N")
+      val lost = N - acc - rej
+      assert(lost == 0 || ((ovfMask >> i) & 1) == 1, s"core $i lost $lost results with no OVERFLOW flag")
+      val got = perTag.getOrElse(i, mutable.ArrayBuffer())
+      assert(got.size == acc, s"core $i: ${got.size} words in DDR but accepted=$acc")
+      var k = 0
+      for (w <- got) {
+        while (k < N && w != tagWord(i, offered(i)(k)._1, offered(i)(k)._2)) k += 1
+        assert(k < N, f"core $i: DDR word 0x${w}%x is not in the offered sequence, or arrived out of order")
+        k += 1
+      }
+    }
+  }
+  skidHeadroom("skid_headroom_sustained_stall", 43, 4)
+  skidHeadroom("skid_headroom_sustained_stall_14ch", 44, 14)
 
   /** 5. Register validation: bad wr_base, bad rd_size, base_reset while busy. */
   run("regvalidate", 5) { (dut, h) =>

@@ -139,6 +139,13 @@ case class RiscqParam(
     //     addr[1:0] on every valid load and store. Requires aluNoFastForward, so the forwarded RS1_DATA ends at
     //     registered sources. Default off. See SrcPlugin / LsuPlugin.
     lsuByteOffPrecompute: Boolean = false,
+    //   jalrComparePrecompute (P3c-3 C6): the JALR half of BAD_TARGET without the adder. P = NEXT_PC_PRED is
+    //     always even, so `P =/= (rs1 + imm) & ~1` iff rs1 is neither P − imm nor P + 1 − imm (mod
+    //     2^FETCH_PC_WIDTH). Both candidates are formed at regReadAt, and executeAt does two equality compares on
+    //     the registered SRC1 instead of the add → compare chain. Zero IPC, bit-exact: sim-only assertions check
+    //     P[0] = 0 and the new BAD_TARGET against the old compare on every valid instruction. Requires csrWarl
+    //     (mepc[1:0] = 0, so every PC stays even) and !lateBadTarget. Default off. See BranchPlugin.
+    jalrComparePrecompute: Boolean = false,
     // NOTE: several bit-exact levers are now BAKED IN — always on, no longer flags: B3 (parallel per-CSR
     //   commit), B4 (LSU pure-data snapshot select), E1 (registered load down-shift), E2 (mispredict off
     //   the LSU/Mul halt), E3 (pre-decoded env ops), plus the MAX_FANOUT=16 caps on the jumpAt mispredict
@@ -175,6 +182,7 @@ case class RiscqParam(
   def resetPcOffset: BigInt = resetVector & ((BigInt(1) << fetchPcW) - 1)
   require(fetchPcW <= xlen, s"fetchPcWidth ($fetchPcW) must be <= xlen ($xlen)")
   require(!lsuByteOffPrecompute || aluNoFastForward, "lsuByteOffPrecompute requires aluNoFastForward")
+  require(!jalrComparePrecompute || (csrWarl && !lateBadTarget), "jalrComparePrecompute requires csrWarl and !lateBadTarget")
   require(fetchPcW >= 2 + gshareHistoryWidth,
     s"fetchPcWidth ($fetchPcW) must be >= 2 + gshareHistoryWidth (${2 + gshareHistoryWidth}) for the GShare PC hash")
   /** Stage where the fetched instruction word is available (after the `fetchLatency`-cycle memory read). */

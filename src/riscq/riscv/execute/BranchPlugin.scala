@@ -139,10 +139,22 @@ class BranchPlugin(p: RiscqParam) extends FiberPlugin {
       //  only over-constrains the placer. Left un-kept.)
       Execute.TAKE           := take
       Execute.TARGET_ALIGNED := targetAligned
-      if (!p.lateBadTarget) {
+      if (!p.lateBadTarget && !p.jalrComparePrecompute) {
         // baseline: the 32-bit target compare runs here (chained after the JALR adder) and is registered
         // as a single bit into jumpAt — a timing-critical chain.
         Execute.BAD_TARGET := apply(Fetch.NEXT_PC_PRED) =/= targetAligned
+      } else if (p.jalrComparePrecompute) {
+        // P3c-3 C6: JALR compares the registered rs1 with the two precomputed matches (two equality compares,
+        // no adder); BRANCH/JAL compare their registered pc+imm as before. Same bit (RiscqParam).
+        val rs1W     = Execute.SRC1.asUInt.resize(Global.FETCH_PC_WIDTH)
+        val jalrBad  = rs1W =/= apply(Execute.JALR_X) && rs1W =/= apply(Execute.JALR_X1)
+        val badTarget = isJalr ? jalrBad | (apply(Fetch.NEXT_PC_PRED) =/= branchTarget)
+        Execute.BAD_TARGET := badTarget
+        GenerationFlags.simulation {
+          assert(!isValid || !apply(Fetch.NEXT_PC_PRED)(0), "P3c-3 C6: NEXT_PC_PRED is odd", FAILURE)
+          assert(!isValid || badTarget === (apply(Fetch.NEXT_PC_PRED) =/= targetAligned),
+            "P3c-3 C6: the precomputed JALR compare differs from the adder compare", FAILURE)
+        }
       } else {
         // lateBadTarget: keep the 32-bit compare OFF this adder cone — register only TARGET_ALIGNED
         // (already done above) and the cheap direction-mispredict bit; jumpAt runs the compare. The
@@ -217,6 +229,13 @@ class BranchPlugin(p: RiscqParam) extends FiberPlugin {
     val precompute = new cd.Area {
       Execute.BRANCH_TARGET := (apply(Global.PC).asSInt + apply(Decode.IMM).asSInt).asUInt
         .resize(Global.FETCH_PC_WIDTH)
+      // P3c-3 C6 (jalrComparePrecompute): the JALR matches P − imm and P + 1 − imm; P is even, so P + 1 = P | 1.
+      if (p.jalrComparePrecompute) {
+        val pred = apply(Fetch.NEXT_PC_PRED)
+        val imm  = apply(Decode.IMM).asUInt.resize(Global.FETCH_PC_WIDTH)
+        Execute.JALR_X  := pred - imm
+        Execute.JALR_X1 := (pred | U(1, Global.FETCH_PC_WIDTH bits)) - imm
+      }
     }
 
     llock.release()

@@ -223,6 +223,23 @@ object BranchIpcSim extends App {
   assert(shadow.regs(9) == 0, s"shadow: poison load committed (x9=${shadow.regs(9)})")
   assert(shadow.mispredicts > 0, "shadow: expected a JAL cold-miss mispredict (the load's shadow)")
 
+  // ============ Scenario 4 (P3c-3a C6): JALR with an odd rs1 + imm, through rs1 and through imm ============
+  // A JALR drops bit 0 of rs1 + imm, so a predicted target P matches when the sum is P or P + 1. Both odd forms run
+  // every iteration (each jumps over a poison instruction), so jalrComparePrecompute's X + 1 candidate is exercised:
+  // in knob mode against the reference core, cycle for cycle, and by BranchPlugin's simulation-only assertion.
+  def AUIPC(rd: Int, imm20: Int)       = (BigInt(imm20 & 0xfffff) << 12) | (BigInt(rd) << 7) | BigInt(0x17)
+  def JALR(rd: Int, rs1: Int, imm: Int) = i(imm, rs1, 0x0, rd, 0x67)
+  val jalrN = 40
+  val jalrImage = buildImage(Seq(
+    /*0*/ ADDI(1, 0, jalrN), /*1*/ AUIPC(5, 0),     /*2*/ ADDI(6, 5, 17),  // x5 = idx1's PC; x6 = idx5's PC + 1
+    /*3*/ JALR(0, 6, 0),     /*4*/ ADDI(9, 9, 100),                       // odd rs1 -> idx5; idx4 is poison
+    /*5*/ ADDI(7, 5, 28),    /*6*/ JALR(0, 7, 1),                         // x7 = idx8's PC; odd imm -> idx8
+    /*7*/ ADDI(9, 9, 100),   /*8*/ ADDI(1, 1, -1),  /*9*/ BNE(1, 0, -24), /*10*/ ECALL
+  ))
+  val jr = run(jalrImage, param.plugins(), "jalr-odd")
+  sameAsRef(jalrImage, jr, "jalr-odd")
+  assert(jr.regs(9) == 0 && jr.regs(1) == 0, s"jalr-odd: poison executed or wrong count (x9=${jr.regs(9)}, x1=${jr.regs(1)})")
+
   println(
     f"[BranchIpcSim] PASS%n" +
       f"  loop (BTB vs none):     ${full1.commits} commits; ${full1.cycles} cyc IPC $ipcFull%.3f " +
@@ -230,8 +247,9 @@ object BranchIpcSim extends App {
       f"  bias (GShare vs always-taken): ${full2.mispredicts} vs ${btb2.mispredicts} branch mispredicts " +
       f"over ${full2.commits} commits ($notTaken/$biasN fall-throughs); identical commit streams.%n" +
       f"  shadow (E2, baked): poison load in a mispredict shadow never commits, no deadlock " +
-      f"(${shadow.mispredicts} mispred, ${shadow.cycles} cyc)." +
-      (if (riscq.misc.TimingPipeKnob.enabled) f"%n  P3c-3 knob: loop, bias and shadow equal the reference core " +
+      f"(${shadow.mispredicts} mispred, ${shadow.cycles} cyc).%n" +
+      f"  jalr-odd (odd rs1 + imm, both forms): ${jr.commits} commits, ${jr.mispredicts} mispred, ${jr.cycles} cyc." +
+      (if (riscq.misc.TimingPipeKnob.enabled) f"%n  P3c-3 knob: loop, bias, shadow and jalr-odd equal the reference core " +
         f"(aluNoFastForward only) cycle for cycle." else "")
   )
 }

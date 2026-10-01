@@ -192,7 +192,8 @@ class PulseTableSoc(
       fetchPcWidth = Some(log2Up(core.memDepth) + 2),
       fetchLatency = 4,
       withMul = core.withMul,
-      lsuByteOffPrecompute = timingPipe)   // P3c-3 C5
+      lsuByteOffPrecompute = timingPipe,    // P3c-3 C5
+      jalrComparePrecompute = timingPipe)   // P3c-3 C6
     val riscqCores = spec.cores.toList.zipWithIndex.map { case (core, i) =>
       RiscqRfWithPulseTableFiber(
         spec = core, plugins = cp(core).plugins(), dspCd = dspCd, hostCd = hostCd, riscqCd = riscqCd,

@@ -53,6 +53,11 @@ object Execute extends AreaObject {
   //     operand-dependent target (`rs1+imm`) at executeAt. ---
   val BRANCH_TARGET = Payload(UInt(Global.FETCH_PC_WIDTH bits))
 
+  // --- BranchPlugin, jalrComparePrecompute (P3c-3 C6): the two rs1 values whose JALR target matches the
+  //     predicted next PC P (even): P − imm and P + 1 − imm (mod 2^FETCH_PC_WIDTH), formed at regReadAt. ---
+  val JALR_X  = Payload(UInt(Global.FETCH_PC_WIDTH bits))
+  val JALR_X1 = Payload(UInt(Global.FETCH_PC_WIDTH bits))
+
   // --- BranchPlugin: the resolved control-flow decision, computed at executeAt and registered one
   //     stage into jumpAt (VexiiRiscv-style split). The expensive 32-bit *target* compare is done here
   //     and registered as a single bit (BAD_TARGET); only the cheap 1-bit *direction* logic + the

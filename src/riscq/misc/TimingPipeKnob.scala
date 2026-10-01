@@ -18,7 +18,7 @@ object TimingPipeKnob {
 
   /** A core sim's param with the core flags the antq SoC sets (`PulseTableSoc.cp`) when the knob is on. */
   def core(p: riscq.riscv.RiscqParam): riscq.riscv.RiscqParam =
-    if (enabled) p.copy(aluNoFastForward = true, lsuByteOffPrecompute = true) else p
+    if (enabled) p.copy(aluNoFastForward = true, lsuByteOffPrecompute = true, jalrComparePrecompute = true) else p
 
   /** The reference for the zero-cycle checks: the antq core flags without the P3c-3 ones, i.e. the antq SoC's core as
    *  it was before P3c-3 (`aluNoFastForward` and its 1-ahead interlocks). The plain param when the knob is off. */

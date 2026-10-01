@@ -19,10 +19,11 @@ import scala.util.Random
  *
  * One deterministic stimulus drives a `PulseTableSoc` built from the antq spec `sim-dio-antq` with the P3c-3
  * timing pipeline OFF (the reference: today's antq RTL, N1) or ON (`RISCQ_TIMING_PIPE`). Every observable is
- * written to a change log stamped with its clock cycle; `pipe_trace_compare.sh` runs both variants and requires the
- * two logs to be byte-identical. The 3a changes are cycle-exact by construction, so every stream is compared with
- * zero offset, `now()` values and barrier stamps included. Comparing the two designs (not a design with its own
- * sink) makes the readout check independent: the reference's integrals are the ones the decoder goldens verify.
+ * written to a change log stamped with its clock cycle; `scripts/ddr-gates/run-n2.sh` runs both variants and requires
+ * the two logs to be byte-identical, each from a successful simulation and ending in its END line. The 3a changes are
+ * cycle-exact by construction, so every stream is compared with zero offset, `now()` values and barrier stamps
+ * included. Comparing the two designs (not a design with its own sink) makes the readout check independent: the
+ * reference's integrals are the ones the decoder goldens verify.
  *
  * Observables (dspClk unless noted): every DAC and DIO output; each channel's time input; each core's posted
  * command stream and commit stream (PC, rd write); each decoder's res/real/imag/valid; the hub's broadcast; the

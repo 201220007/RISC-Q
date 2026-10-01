@@ -72,10 +72,14 @@ puts "\[riscvsoc-bd\] base=$base; $n cores, perRow=$perRow → X0 rows from Y$ba
 #      resize:   each core band of a full row widens east by RISCQ_ANTQ_BAND_EXT (default 4) SLICE columns of the X1
 #                region of its row, removed from pb_datapath; a row with fewer cores than perRow splits into that many
 #                bands. EXCLUDE_PLACEMENT and the hard bands stay as they are.
+#      rowband:  (P3c-3, evidence/P3c/PLAN_P3c3_pipelining_v2.md §1.3) one hard pblock per X0 row region holds all of
+#                that row's cores, instead of one band per core: the same SLICE sites, without the per-core band
+#                boundaries. The RAMB/DSP/URAM site-float, EXCLUDE_PLACEMENT, the `mem` exclusion, the coreTime_i
+#                pull-in and the datapath confine stay as they are.
 set antqFp ""
 if {[info exists ::env(RISCQ_ANTQ_FLOORPLAN)] && $::env(RISCQ_ANTQ_FLOORPLAN) ne ""} {
   set antqFp $::env(RISCQ_ANTQ_FLOORPLAN)
-  if {$antqFp ni {relocate resize}} { error "RISCQ_ANTQ_FLOORPLAN=$antqFp is not one of {relocate, resize}" }
+  if {$antqFp ni {relocate resize rowband}} { error "RISCQ_ANTQ_FLOORPLAN=$antqFp is not one of {relocate, resize, rowband}" }
   if {$confine != 1} { error "RISCQ_ANTQ_FLOORPLAN needs the global datapath confine (RISCQ_CONFINE=global), not $confineStr" }
   if {[llength [get_cells -quiet ${base}/ddrUplink_up]] == 0} {
     puts "\[riscvsoc-bd\] RISCQ_ANTQ_FLOORPLAN=$antqFp ignored: no ${base}/ddrUplink_up (not an antq_uplink build)"
@@ -182,6 +186,13 @@ foreach i $ids {
   set tcells [get_cells -quiet -hierarchical -filter "NAME =~ ${base}/*coreTime_${i}_reg\[*"]
   if {[llength $tcells] > 0} { set coreCells [concat $coreCells $tcells] }
   set inRow [expr {min($perRow, $n - $rowIdx * $perRow)}]
+  if {$antqFp eq "rowband"} {
+    # rowband: collect the row's cores; their one pblock per row is made after this loop
+    lappend rowCells($rr) {*}$coreCells
+    puts "\[riscvsoc-bd\] core $i → X0Y${rr} (rowband, [llength $coreCells] cells)"
+    incr idx
+    continue
+  }
   if {$antqFp eq "resize" && $inRow < $perRow} {
     # a short row: split it into as many bands as it has cores
     set rect [riscq_slice_band X0Y${rr} $bandIdx $inRow]
@@ -197,6 +208,13 @@ foreach i $ids {
   riscq_make_pblock_sites pb_core${i} $coreCells $rect
   puts "\[riscvsoc-bd\] core $i → X0Y${rr} band $bandIdx/[expr {$antqFp eq "resize" && $inRow < $perRow ? $inRow : $perRow}] ([llength $coreCells] cells, $rect)"
   incr idx
+}
+if {$antqFp eq "rowband"} {
+  foreach rr [lsort -integer [array names rowCells]] {
+    set rect [riscq_slice_band X0Y${rr} 0 1]
+    riscq_make_pblock_sites pb_row${rr} $rowCells($rr) $rect
+    puts "\[riscvsoc-bd\] rowband: X0Y${rr} → pb_row${rr} ([llength $rowCells($rr)] cells, $rect)"
+  }
 }
 puts "\[riscvsoc-bd\] floorplan applied ($n cores, confine=$confineStr)."
 

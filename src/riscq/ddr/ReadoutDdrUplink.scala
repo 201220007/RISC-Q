@@ -236,7 +236,9 @@ case class ReadoutDdrUplink(p: ReadoutDdrUplinkParams, dspCd: ClockDomain) exten
       // (P3c: not forFMax. Its empty/full trackers encode "empty" as a SET msb, so a FIFO that powers up at 0
       // without a reset -- ReadoutDdrUplinkCdcSim start_dsp_dead_no_reset -- reads as non-empty and pops junk;
       // the pointer form reads empty from all-zero.)
-      val fifo = StreamFifo(Bits(p.wordWidth bits), p.fifoDepth)
+      // P3c-2: UplinkResultFifo = StreamFifo's port behaviour with a registered full flag and an unconditional
+      // write of the free slot, so the RAM write enable is a flop (the 14q build's 112 failing WE endpoints)
+      val fifo = UplinkResultFifo(p.wordWidth, p.fifoDepth)
       fifo.io.push << arb
       // P3c: acc counts each push one cycle later, from a registered strobe, so its CE is a flop and not the
       // FIFO-full compare. Its one reader, the snapshot, samples it at least flushQuiet cycles after the last push.

@@ -65,17 +65,42 @@ connect_bd_intf_net [get_bd_intf_pins smc_dma/M00_AXI]       [get_bd_intf_pins z
 # Both live in the LPD window (0x9...) so the Zynq VIP's address dispatch in the G4 xsim selects
 # M_AXI_HPM0_LPD, exactly as production does. These constants are mirrored in software/riscq/ddr.py
 # (DdrMap) and pinned by software/tests/test_ddr_contract.py. ----
-# A DEDICATED cross-clock SmartConnect carries the control plane from the PS clock into the ui_clk
-# domain (QubiC does the same with its ps8_0_axi_periph). Extending the RFDC SmartConnect instead would
-# leave its M02/M03 annotated with the PS clock and fail validation.
+# A DEDICATED bridge carries the control plane from the PS clock into the ui_clk domain (QubiC does the
+# same with its ps8_0_axi_periph). Extending the RFDC SmartConnect instead would leave its M02/M03
+# annotated with the PS clock and fail validation. RISCQ_ANTQ_CTRL selects the bridge:
+#   smartconnect (default): smc_ctrl, a 2-clock SmartConnect (1 SI, 2 MI) that crosses and decodes.
+#   lite (P3c-2): the crossing is cc_ctrl, an AXI4-Lite asynchronous axi_clock_converter (one
+#     xpm_cdc_handshake per channel); smc_ctrl becomes a 1-clock SmartConnect on ui_clk that decodes and
+#     converts AXI4-Lite to the uplink's AXI4 slave. The PS SmartConnect converts its M02 to AXI4-Lite,
+#     as it already does for the RFDC's M01. cc_ctrl samples each reset on its own clock, so its s side
+#     gets psr_ctrl, a pl_clk0 proc_sys_reset fed by the same power-up stretcher as psr_ddr: both sides
+#     are held in reset together, from configuration until the stretcher ends, as smc_ctrl is today.
+set ANTQ_CTRL [expr {[info exists ::env(RISCQ_ANTQ_CTRL)] ? $::env(RISCQ_ANTQ_CTRL) : "smartconnect"}]
+if {$ANTQ_CTRL ni {smartconnect lite}} { error "RISCQ_ANTQ_CTRL=$ANTQ_CTRL: expected smartconnect or lite" }
+puts "\[ddr-connect\] control-plane bridge (RISCQ_ANTQ_CTRL): $ANTQ_CTRL"
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smc_ctrl
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2} CONFIG.NUM_CLKS {2}] [get_bd_cells smc_ctrl]
-connect_bd_intf_net [get_bd_intf_pins $AXI_CONNECT/M02_AXI] [get_bd_intf_pins smc_ctrl/S00_AXI]
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2} \
+                         CONFIG.NUM_CLKS [expr {$ANTQ_CTRL eq "smartconnect" ? 2 : 1}]] [get_bd_cells smc_ctrl]
 connect_bd_intf_net [get_bd_intf_pins smc_ctrl/M00_AXI]     [get_bd_intf_pins $TOP/S_AXI_DDR_CTRL]
 connect_bd_intf_net [get_bd_intf_pins smc_ctrl/M01_AXI]     [get_bd_intf_pins axi_dma_0/S_AXI_LITE]
-connect_bd_net [get_bd_pins zynq_ps/pl_clk0] [get_bd_pins smc_ctrl/aclk]
-connect_bd_net $UI_CLK                       [get_bd_pins smc_ctrl/aclk1]
 connect_bd_net [get_bd_pins psr_ddr/peripheral_aresetn] [get_bd_pins smc_ctrl/aresetn]
+if {$ANTQ_CTRL eq "smartconnect"} {
+  connect_bd_intf_net [get_bd_intf_pins $AXI_CONNECT/M02_AXI] [get_bd_intf_pins smc_ctrl/S00_AXI]
+  connect_bd_net [get_bd_pins zynq_ps/pl_clk0] [get_bd_pins smc_ctrl/aclk]
+  connect_bd_net $UI_CLK                       [get_bd_pins smc_ctrl/aclk1]
+} else {
+  create_bd_cell -type ip -vlnv xilinx.com:ip:axi_clock_converter:2.1 cc_ctrl
+  set_property -dict [list CONFIG.PROTOCOL {AXI4LITE} CONFIG.ACLK_ASYNC {1} CONFIG.DATA_WIDTH {32} \
+                           CONFIG.ADDR_WIDTH {32}] [get_bd_cells cc_ctrl]
+  create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 psr_ctrl
+  connect_bd_intf_net [get_bd_intf_pins $AXI_CONNECT/M02_AXI] [get_bd_intf_pins cc_ctrl/S_AXI]
+  connect_bd_intf_net [get_bd_intf_pins cc_ctrl/M_AXI]        [get_bd_intf_pins smc_ctrl/S00_AXI]
+  connect_bd_net [get_bd_pins zynq_ps/pl_clk0] [get_bd_pins cc_ctrl/s_axi_aclk] [get_bd_pins psr_ctrl/slowest_sync_clk]
+  connect_bd_net $UI_CLK                       [get_bd_pins cc_ctrl/m_axi_aclk] [get_bd_pins smc_ctrl/aclk]
+  connect_bd_net [get_bd_pins ddr_rst_stretch/rst]        [get_bd_pins psr_ctrl/ext_reset_in]
+  connect_bd_net [get_bd_pins psr_ctrl/peripheral_aresetn] [get_bd_pins cc_ctrl/s_axi_aresetn]
+  connect_bd_net [get_bd_pins psr_ddr/peripheral_aresetn]  [get_bd_pins cc_ctrl/m_axi_aresetn]
+}
 
 assign_bd_address -offset 0x90000000 -range 0x00010000 \
   -target_address_space [get_bd_addr_spaces zynq_ps/Data] [get_bd_addr_segs $TOP/S_AXI_DDR_CTRL/reg0] -force

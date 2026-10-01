@@ -60,7 +60,7 @@ source $INC/rfdc-connect.tcl
 # ---- AXI SmartConnect: PS HPM0_LPD -> { top S_AXIS, rfdc s_axi } ----
 set AXI_CONNECT [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smartconnect]
 set_property CONFIG.NUM_SI 1 $AXI_CONNECT
-# antq_uplink: +1 master, feeding the cross-clock smc_ctrl that carries the control plane into ui_clk
+# antq_uplink: +1 master, feeding the control-plane bridge into ui_clk (ddr-connect.tcl: smc_ctrl, or cc_ctrl + smc_ctrl)
 set_property CONFIG.NUM_MI [expr {$ANTQ_UPLINK ? 3 : 2}] $AXI_CONNECT
 set_property CONFIG.NUM_CLKS {2} $AXI_CONNECT
 set_property CONFIG.HAS_ARESETN {0} $AXI_CONNECT

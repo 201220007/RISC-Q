@@ -48,9 +48,14 @@ object BranchIpcSim extends App {
   // RISCQ_FETCH_PC_WIDTH=N narrows the carried PC (IPC-neutral: same control logic, BTB tag keeps its
   // in-region discriminating power). The 4KB region (memWords 1<<10) fits N=12.
   val fetchPcWidth = sys.env.get("RISCQ_FETCH_PC_WIDTH").map(_.toInt).orElse(RiscqParam().fetchPcWidth)
-  val param = RiscqParam(memWords = 1 << 10, gshareMem = gshareMem,
+  // RISCQ_TIMING_PIPE=1 (P3c-3) adds the antq core flags (TimingPipeKnob.core). They include aluNoFastForward, whose
+  // 1-ahead interlocks cost IPC here by design; the P3c-3 flags themselves must cost nothing, so in knob mode every
+  // scenario's full run is repeated on `refParam` (the antq flags without the P3c-3 ones) and must match it exactly.
+  val baseParam = RiscqParam(memWords = 1 << 10, gshareMem = gshareMem,
     aluFastAddOnly = aluFastAddOnly, btbPredictLate = btbPredictLate, lateBadTarget = lateBadTarget,
     skidAfterOverride = Some(skidAfter), fetchPcWidth = fetchPcWidth)
+  val param    = riscq.misc.TimingPipeKnob.core(baseParam)
+  val refParam = riscq.misc.TimingPipeKnob.coreRef(baseParam)
   val base  = param.resetVector.toLong
   val L     = 1 // fixed instruction-memory latency (hidden by the multi-outstanding fetch)
 
@@ -155,8 +160,16 @@ object BranchIpcSim extends App {
     out
   }
 
+  // Knob mode (P3c-3): the same image on the reference core must retire the same instructions in the same cycles.
+  def sameAsRef(image: Array[BigInt], r: Run, label: String): Unit = if (riscq.misc.TimingPipeKnob.enabled) {
+    val ref = run(image, refParam.plugins(), s"$label-ref")
+    assert(ref == r, s"$label: the P3c-3 core flags changed the run (${r.cycles} cyc, ${r.mispredicts} mispred vs " +
+      s"${ref.cycles} cyc, ${ref.mispredicts} mispred on the reference core)")
+  }
+
   // ============ Scenario 1: BTB IPC win on a branch+jump-heavy loop ============
   val full1 = run(loopImage, param.plugins(), "loop-full")
+  sameAsRef(loopImage, full1, "loop")
   val base1 = run(loopImage, param.pluginsNoPredict(), "loop-baseline")
 
   assert(full1.pcs == base1.pcs, "loop: committed-PC streams differ (prediction changed behaviour)")
@@ -171,12 +184,14 @@ object BranchIpcSim extends App {
   // bubble — IPC is lower but still a clear win over no-prediction (it avoids the full multi-cycle
   // mispredict). This loop is the worst case (one taken transfer per tiny iteration); larger basic
   // blocks amortize the bubble.
-  val ipcMin = if (param.btbPredictLate) 0.55 else 0.9
+  // aluNoFastForward (the antq core, knob mode) interlocks this loop's 1-ahead RAW pairs: 0.744 at P3c-3a.
+  val ipcMin = if (param.btbPredictLate) 0.55 else if (param.aluNoFastForward) 0.7 else 0.9
   assert(ipcFull > ipcMin, f"loop: BTB IPC $ipcFull%.3f below expected $ipcMin%.2f (btbLate=${param.btbPredictLate})")
   assert(ipcFull > ipcBase * 1.4, f"loop: BTB IPC $ipcFull%.3f not a clear win over baseline $ipcBase%.3f")
 
   // ============ Scenario 2: GShare direction win on a 1/8-taken branch ============
   val full2 = run(biasImage, param.plugins(), "bias-full")
+  sameAsRef(biasImage, full2, "bias")
   val btb2  = run(biasImage, param.pluginsBtbOnly(), "bias-btbOnly")
 
   assert(full2.pcs == btb2.pcs, "bias: committed-PC streams differ between GShare and BTB-only")
@@ -204,6 +219,7 @@ object BranchIpcSim extends App {
     /*4*/ BNE(1, 0, -12),    /*5*/ ECALL
   ))
   val shadow = run(shadowImage, param.plugins(), "shadow")
+  sameAsRef(shadowImage, shadow, "shadow")
   assert(shadow.regs(9) == 0, s"shadow: poison load committed (x9=${shadow.regs(9)})")
   assert(shadow.mispredicts > 0, "shadow: expected a JAL cold-miss mispredict (the load's shadow)")
 
@@ -214,6 +230,8 @@ object BranchIpcSim extends App {
       f"  bias (GShare vs always-taken): ${full2.mispredicts} vs ${btb2.mispredicts} branch mispredicts " +
       f"over ${full2.commits} commits ($notTaken/$biasN fall-throughs); identical commit streams.%n" +
       f"  shadow (E2, baked): poison load in a mispredict shadow never commits, no deadlock " +
-      f"(${shadow.mispredicts} mispred, ${shadow.cycles} cyc)."
+      f"(${shadow.mispredicts} mispred, ${shadow.cycles} cyc)." +
+      (if (riscq.misc.TimingPipeKnob.enabled) f"%n  P3c-3 knob: loop, bias and shadow equal the reference core " +
+        f"(aluNoFastForward only) cycle for cycle." else "")
   )
 }

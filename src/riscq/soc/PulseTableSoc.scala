@@ -191,7 +191,8 @@ class PulseTableSoc(
     def cp(core: CoreSpec) = coreParam.copy(
       fetchPcWidth = Some(log2Up(core.memDepth) + 2),
       fetchLatency = 4,
-      withMul = core.withMul)
+      withMul = core.withMul,
+      lsuByteOffPrecompute = timingPipe)   // P3c-3 C5
     val riscqCores = spec.cores.toList.zipWithIndex.map { case (core, i) =>
       RiscqRfWithPulseTableFiber(
         spec = core, plugins = cp(core).plugins(), dspCd = dspCd, hostCd = hostCd, riscqCd = riscqCd,

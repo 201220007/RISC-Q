@@ -132,6 +132,13 @@ case class RiscqParam(
     //     `valid → … → mstatusMie → mtvec → mscratch/CE` chain, riscv-fmax spec §2 C1). 0 = off.
     //     Bit-exact (attribute only). See CsrPlugin.
     csrCommitMaxFanout: Int = 0,
+    //   lsuByteOffPrecompute (P3c-3 C5, the qubic3 antq timing pipeline): the LSU's store lane offset and byte
+    //     mask come from `Execute.BYTE_OFF`, the low two bits of rs1 + imm formed at regReadAt from the forwarded
+    //     RS1_DATA and registered into executeAt (the stage register holds it through the access), instead of
+    //     from the 32-bit address adder there. Zero IPC, bit-exact: a sim-only assertion checks BYTE_OFF ==
+    //     addr[1:0] on every valid load and store. Requires aluNoFastForward, so the forwarded RS1_DATA ends at
+    //     registered sources. Default off. See SrcPlugin / LsuPlugin.
+    lsuByteOffPrecompute: Boolean = false,
     // NOTE: several bit-exact levers are now BAKED IN — always on, no longer flags: B3 (parallel per-CSR
     //   commit), B4 (LSU pure-data snapshot select), E1 (registered load down-shift), E2 (mispredict off
     //   the LSU/Mul halt), E3 (pre-decoded env ops), plus the MAX_FANOUT=16 caps on the jumpAt mispredict
@@ -167,6 +174,7 @@ case class RiscqParam(
   /** Reset value of the carried PC offset = the resetVector's in-region low bits (== resetVector when full). */
   def resetPcOffset: BigInt = resetVector & ((BigInt(1) << fetchPcW) - 1)
   require(fetchPcW <= xlen, s"fetchPcWidth ($fetchPcW) must be <= xlen ($xlen)")
+  require(!lsuByteOffPrecompute || aluNoFastForward, "lsuByteOffPrecompute requires aluNoFastForward")
   require(fetchPcW >= 2 + gshareHistoryWidth,
     s"fetchPcWidth ($fetchPcW) must be >= 2 + gshareHistoryWidth (${2 + gshareHistoryWidth}) for the GShare PC hash")
   /** Stage where the fetched instruction word is available (after the `fetchLatency`-cycle memory read). */

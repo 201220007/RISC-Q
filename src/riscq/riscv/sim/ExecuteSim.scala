@@ -23,7 +23,7 @@ import scala.collection.mutable.ArrayBuffer
  * Run with `./.metals/mill runMain riscq.riscv.sim.ExecuteSim`.
  */
 object ExecuteSim extends App {
-  val param = RiscqParam(memWords = 256)
+  val param = riscq.misc.TimingPipeKnob.core(RiscqParam(memWords = 256))   // P3c-3 knob: antq core flags
   val base  = param.resetVector.toLong
 
   // ---- Instruction encoders (build a 32-bit word from fields) ----

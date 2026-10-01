@@ -67,14 +67,15 @@ object RvTestSim extends App {
   // RISCQ_SKID_AFTER=1,3 sets the back-pressure-cut boundaries (skid buffers; transparent ⇒ bit-exact).
   val skidAfter = sys.env.get("RISCQ_SKID_AFTER")
     .map(_.split(",").map(_.trim).filter(_.nonEmpty).map(_.toInt).toSeq).getOrElse(RiscqParam().skidAfter)
-  val param    = RiscqParam(withMul = withMul,
+  // RISCQ_TIMING_PIPE=1 (P3c-3) adds the antq core flags (TimingPipeKnob.core), so RVLS gates the modified core.
+  val param    = riscq.misc.TimingPipeKnob.core(RiscqParam(withMul = withMul,
     gshareMem = gshareMem, csrWarl = csrWarl, aluFastAddOnly = aluFastAddOnly,
     lateWriteback = lateWriteback, pcRegMaxFanout = pcRegMaxFanout,
     csrCommitMaxFanout = csrCommitMaxFanout,
     btbPredictLate = btbPredictLate, pcOneHotRedirect = pcOneHotRedirect,
     lateBadTarget = lateBadTarget, skidAfterOverride = Some(skidAfter),
     aluNoFastForward = aluNoFastForward, aluResultOneHot = aluResultOneHot,
-    deriveImmFromWord = deriveImmFromWord, fetchPcWidth = fetchPcWidth)
+    deriveImmFromWord = deriveImmFromWord, fetchPcWidth = fetchPcWidth))
 
   // Base RV32I suite (rv32ui-p-*) plus, when the M extension is enabled, the multiply tests
   // (rv32um-p-*). DIV/REM aren't implemented yet, so they're left out.

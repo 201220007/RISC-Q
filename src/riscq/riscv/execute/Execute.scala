@@ -28,6 +28,9 @@ object Execute extends AreaObject {
   val SRC1    = Payload(SInt(Global.XLEN bits))
   val SRC2    = Payload(SInt(Global.XLEN bits))
   val ADD_SUB = Payload(SInt(Global.XLEN bits)) // SRC1 + SRC2, or SRC1 - SRC2 when subtracting
+  // lsuByteOffPrecompute (P3c-3 C5): the low two bits of a load/store's rs1 + imm, formed at regReadAt and
+  // registered into executeAt (equal to ADD_SUB[1:0] for loads and stores). Read by LsuPlugin.
+  val BYTE_OFF = Payload(UInt(2 bits))
   val LESS    = Payload(Bool())                 // SRC1 < SRC2 (signed or unsigned per instruction)
   val EQ      = Payload(Bool())                 // SRC1 === SRC2
 

@@ -115,7 +115,7 @@ class LsuPlugin(p: RiscqParam) extends FiberPlugin {
       val snapSel   = !latched
       val addr      = snapSel ? liveAddr      | addrReg          // stable from the first active cycle on
       val rawStore  = snapSel ? liveStoreData | storeDataReg
-      val byteOff   = addr(1 downto 0)
+      val byteOff   = if (p.lsuByteOffPrecompute) apply(Execute.BYTE_OFF) else addr(1 downto 0)  // P3c-3 C5, below
       val shift     = (byteOff << 3).resize(5)                   // 0/8/16/24-bit lane offset
 
       // E1 (baked in): the *load*-result down-shift is taken straight from the *registered* addrReg
@@ -183,6 +183,15 @@ class LsuPlugin(p: RiscqParam) extends FiberPlugin {
       dbgAddr.simPublic()
       dbgSize.simPublic()
       dbgData.simPublic()
+
+      // P3c-3 C5 (lsuByteOffPrecompute): `byteOff` above is the offset precomputed at regReadAt and held by the
+      // stage register through the access, so the 32-bit address adder leaves the store-shift / byte-mask cone.
+      // Checked against the effective address on every active load and store, in simulation only. (Kept here, after
+      // the last `switch`, so the line-named conditions above keep their names with the flag off: G0', N1.)
+      if (p.lsuByteOffPrecompute) GenerationFlags.simulation {
+        assert(!haltActive || byteOff === addr(1 downto 0),
+          "P3c-3 C5: the precomputed BYTE_OFF differs from the effective address's low bits", FAILURE)
+      }
     }
 
     lock.release()

@@ -21,7 +21,7 @@ import scala.util.Random
  * Run with `./.metals/mill runMain riscq.riscv.sim.MulSim`.
  */
 object MulSim extends App {
-  val param = RiscqParam(memWords = 4096, withMul = true)
+  val param = riscq.misc.TimingPipeKnob.core(RiscqParam(memWords = 4096, withMul = true))   // P3c-3 knob: antq core flags
   val base  = param.resetVector.toLong
 
   // ---- Instruction encoders ----

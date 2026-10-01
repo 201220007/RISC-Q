@@ -74,6 +74,11 @@ class SrcPlugin(p: RiscqParam) extends FiberPlugin {
 
       // SRC2 is rs2 for register-register ops and branches; the immediate otherwise.
       Execute.SRC2 := apply(SRC2_RS2) ? rs2 | imm
+
+      // P3c-3 C5 (lsuByteOffPrecompute): a load/store's address offset within the word, rs1 + imm mod 4 (loads
+      // and stores add: SRC1 = rs1, SRC2 = imm), formed here so the LSU's store lane shift skips the adder.
+      if (p.lsuByteOffPrecompute)
+        Execute.BYTE_OFF := apply(Execute.RS1_DATA)(1 downto 0).asUInt + apply(Decode.IMM)(1 downto 0).asUInt
     }
 
     // ---- The shared add/sub + comparators (at executeAt). SRC1/SRC2 are the registered payloads, so

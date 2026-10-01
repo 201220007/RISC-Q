@@ -42,7 +42,7 @@ case class PulseParamBufferParams(
     useMem: Boolean = true,      // table storage: true (default) = distributed-RAM Mem; false = FF Vec
                                  // register file. Clamped to a register file when pulseNum = 1 (a depth-1
                                  // table has no address, e.g. ro/demod) — see `memTable` in the body.
-    preDecode: Boolean = false) {  // P3c-3 C2: see the end of this file
+    preDecode: Boolean = false, foldPhaseOffset: Boolean = false) {  // P3c-3 C2 / C4b: see the end of this file
   require(pulseNum >= 1)
   require(addrWidth >= log2Up(startTimeAddr + 1), "addrWidth too small for startTimeAddr")
   // the parallel cmd decode splits the address at the 16-byte slot boundary (slot = address >> 4,
@@ -186,6 +186,22 @@ case class PulseParamBuffer(p: PulseParamBufferParams) extends Component {
   outParamFlow.payload := outParam
   outParamFlow.valid   := fired
   KeepAttribute(outParamFlow)
+
+  // P3c-3 C4b (foldPhaseOffset): the channel used to add `phaseOffset` after this register, as of the push cycle
+  // (the cycle after this one). Adding it here, with this cycle's `phaseOffset` write bypassed in, gives that same
+  // value one register earlier on every cycle, for any beat spacing, and takes the adder out of the register →
+  // phase-queue RAM path. The add wraps mod 2^w either way. Only for pulse and demod channels: TimedDio uses
+  // `phase` as a bit mask and keeps it raw.
+  if (foldPhaseOffset) {
+    val phOffWrite = if (preDecode) pre.phOff else hit(phaseOffsetAddr)
+    outParamFlow.payload.phase.allowOverride()   // replaces the plain copy of outParam.phase above
+    outParamFlow.payload.phase := (outParam.phase.asSInt + (phOffWrite ? field(w).asSInt | phaseOffset)).asBits
+    GenerationFlags.simulation {
+      val raw = RegNext(outParam.phase)   // the unfolded register
+      assert(!outParamFlow.valid || outParamFlow.phase === (raw.asSInt + phaseOffset).asBits,
+        "P3c-3 C4b: the folded phase differs from the unfolded phase + phaseOffset at a push", FAILURE)
+    }
+  }
 
   // freq is a separate always-driven flow (posted write; pulses valid on the freq write, like driveFlow).
   // One extra register stage on the way out cuts the critical path from the cmd address-decode /

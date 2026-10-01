@@ -20,22 +20,25 @@ import scala.util.Random
  *   - a random body over the whole 16-bit window (mapped and unmapped addresses), mostly adjacent beats;
  *   - random address and data on the idle cycles too, so a decode that ignores `valid` would show.
  * Every output (all five parameter Flows, valid and payload, `time`, `startTime`, `dcOffset`, `phaseOffset`)
- * must be equal on every cycle after reset, for the three buffer shapes the antq SoC builds.
+ * must be equal on every cycle after reset, for the three buffer shapes the antq SoC builds. On the drive and
+ * demod shapes the candidate also folds `phaseOffset` into `phase` (C4b), so its `phase` is compared with the
+ * reference's `phase + phaseOffset`, the value the channel fed the generator, on every cycle.
  *
  * Run with `mill runMain riscq.soc.sim.ParamBufferLockstepSim` (`RISCQ_N3_BEATS` sets the random body length).
  */
 object ParamBufferLockstepSim extends App {
-  case class Cfg(name: String, pulseNum: Int, envAddrWidth: Int)
+  case class Cfg(name: String, pulseNum: Int, envAddrWidth: Int, fold: Boolean)
   val cfgs = Seq(
-    Cfg("gate", pulseNum = 8, envAddrWidth = 10),   // a drive channel: 8-slot table in distributed RAM
-    Cfg("ro",   pulseNum = 1, envAddrWidth = 10),   // ro and demod: a 1-slot register-file table
-    Cfg("dio",  pulseNum = 8, envAddrWidth = 1))    // TimedDio's buffer
+    Cfg("gate", pulseNum = 8, envAddrWidth = 10, fold = true),    // a drive channel: 8-slot table in distributed RAM
+    Cfg("ro",   pulseNum = 1, envAddrWidth = 10, fold = true),    // ro and demod: a 1-slot register-file table
+    Cfg("dio",  pulseNum = 8, envAddrWidth = 1,  fold = false))   // TimedDio's buffer (phase = the line mask)
   val beats = sys.env.get("RISCQ_N3_BEATS").map(_.toInt).getOrElse(100000)
   val startTimeAddr = 0x4100
 
   case class Dut(c: Cfg) extends Component {
     def params(pre: Boolean) = PulseParamBufferParams(pulseNum = c.pulseNum, dataWidth = 16,
-      envAddrWidth = c.envAddrWidth, durWidth = 16, timeWidth = 32, addrWidth = 16, preDecode = pre)
+      envAddrWidth = c.envAddrWidth, durWidth = 16, timeWidth = 32, addrWidth = 16, preDecode = pre,
+      foldPhaseOffset = pre && c.fold)
     val cmd       = slave port Flow(Put(16))
     val timeBcast = in port UInt(32 bits)
 
@@ -48,11 +51,12 @@ object ParamBufferLockstepSim extends App {
     ref.io.timeBcast  := timeBcast
     cand.io.timeBcast := timeBcast
 
-    def flat(b: PulseParamBuffer): Bits = Cat(
-      b.io.phase.valid, b.io.phase.payload, b.io.amp.valid, b.io.amp.payload, b.io.addr.valid, b.io.addr.payload,
+    def flat(b: PulseParamBuffer, phase: SInt): Bits = Cat(
+      b.io.phase.valid, phase, b.io.amp.valid, b.io.amp.payload, b.io.addr.valid, b.io.addr.payload,
       b.io.dur.valid, b.io.dur.payload, b.io.freq.valid, b.io.freq.payload,
       b.io.time, b.io.startTime, b.io.dcOffset, b.io.phaseOffset)
-    val refFlat = flat(ref); val candFlat = flat(cand)
+    val refFlat  = flat(ref, if (c.fold) ref.io.phase.payload + ref.io.phaseOffset else ref.io.phase.payload)
+    val candFlat = flat(cand, cand.io.phase.payload)
     val refOut  = out port Bits(widthOf(refFlat) bits); refOut  := refFlat
     val candOut = out port Bits(widthOf(refFlat) bits); candOut := candFlat
     val same = out port Bool()
@@ -134,7 +138,7 @@ object ParamBufferLockstepSim extends App {
     val minN = beats / 50
     assert(fires >= minN && freqs >= minN && starts >= minN && phOffs >= minN && dcs >= minN,
       s"[N3 ${c.name}] too little activity: fires $fires freq $freqs startTime $starts phaseOffset $phOffs dcOffset $dcs")
-    println(s"[ParamBufferLockstepSim] PASS ${c.name} (pulseNum ${c.pulseNum}): ${sched.length} cycles, ${beats} random " +
+    println(s"[ParamBufferLockstepSim] PASS ${c.name} (pulseNum ${c.pulseNum}, fold ${c.fold}): ${sched.length} cycles, ${beats} random " +
       s"beats + all ordered pairs at offsets 0..3; every output equal every cycle (fires $fires, freq $freqs, " +
       s"startTime changes $starts, phaseOffset $phOffs, dcOffset $dcs)")
     simSuccess()

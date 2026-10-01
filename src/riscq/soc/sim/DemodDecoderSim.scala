@@ -87,7 +87,8 @@ object DemodDecoderSim extends App {
     val demod = DemodChannel(pulseNum = pulseNum, batchSize = N, dataWidth = w, envAddrWidth = envAddrW,
       durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency, prescaleAmp = prescaleAmp,
       saturate = saturate, phasorMethod = SinCosMethod.Cordic, putAddrWidth = putAddrWidth,
-      preDecode = riscq.misc.TimingPipeKnob.enabled)   // P3c-3: RISCQ_TIMING_PIPE=1 builds the antq channel variant
+      preDecode = riscq.misc.TimingPipeKnob.enabled,   // P3c-3: RISCQ_TIMING_PIPE=1 builds the antq channel variant
+      foldPhaseOffset = riscq.misc.TimingPipeKnob.enabled)
     demod.io.cmd << io.cmd
     demod.io.timeBcast := io.time
     val mem = Mem.fill(content.length)(Bits(N * 2 * w bits)) init (content.map(c => B(c, N * 2 * w bits)))

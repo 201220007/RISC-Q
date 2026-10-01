@@ -13,7 +13,8 @@ import riscq.soc.link.Put
  * the shared `time` broadcast); it emits the DAC `pulse` and an external envelope-memory `MemReadPort`.
  * The buffer's memory-mapped `phaseOffset` (virtual Z) is added combinationally to the generator's
  * phase input — the phase Flow stays cycle-aligned with amp/addr/dur, and the add wraps modulo 2^w,
- * which is exactly a phase rotation (a full turn = 2^w), so no saturation is needed. On the way out a
+ * which is exactly a phase rotation (a full turn = 2^w), so no saturation is needed. With
+ * `foldPhaseOffset` (P3c-3 C4b) the buffer adds it one register earlier and the value is the same. On the way out a
  * single `RegNext` stage adds the buffer's memory-mapped `dcOffset` to every real output lane (the
  * imaginary lanes and `valid` are registered alongside to keep the batch aligned).
  */
@@ -34,7 +35,8 @@ case class PulseDriveChannel(
     useAligned: Boolean = false,  // false = per-parameter lead-time TimedQueues (PulseGenerator);
                                   // true = QubiC-style single combined params FIFO + SRL alignment
                                   // (PulseGeneratorAligned). Bit-identical pulse; trades alignment HW.
-    preDecode: Boolean = false    // P3c-3 C2: `cmd` is one link stage early; the buffer holds the last stage
+    preDecode: Boolean = false,   // P3c-3 C2: `cmd` is one link stage early; the buffer holds the last stage
+    foldPhaseOffset: Boolean = false  // P3c-3 C4b: the buffer adds phaseOffset into `phase` (same value)
 ) extends Component with Channel {
   val N = batchSize; val w = dataWidth
   val io = new Bundle {
@@ -48,9 +50,11 @@ case class PulseDriveChannel(
 
   val buf = PulseParamBuffer(PulseParamBufferParams(
     pulseNum = pulseNum, dataWidth = w, envAddrWidth = envAddrWidth, durWidth = durWidth,
-    timeWidth = timeWidth, addrWidth = putAddrWidth, preDecode = preDecode))
+    timeWidth = timeWidth, addrWidth = putAddrWidth, preDecode = preDecode, foldPhaseOffset = foldPhaseOffset))
   buf.io.cmd << io.cmd
   buf.io.timeBcast := io.timeBcast
+  // the generator's phase input: the table phase plus the virtual-Z offset
+  def genPhase: SInt = if (foldPhaseOffset) buf.io.phase.payload else buf.io.phase.payload + buf.io.phaseOffset
 
   val pgParams = PulseGeneratorParams(
     batchSize = N, dataWidth = w, timeWidth = timeWidth, addrWidth = envAddrWidth, durWidth = durWidth,
@@ -67,7 +71,7 @@ case class PulseDriveChannel(
   if (!useAligned) {
     val pg = PulseGenerator(pgParams)
     pg.io.time := buf.io.time; pg.io.startTime := buf.io.startTime
-    pg.io.phase.valid := buf.io.phase.valid; pg.io.phase.payload := buf.io.phase.payload + buf.io.phaseOffset
+    pg.io.phase.valid := buf.io.phase.valid; pg.io.phase.payload := genPhase
     pg.io.amp << buf.io.amp; pg.io.addr << buf.io.addr
     pg.io.dur << buf.io.dur; pg.io.freq << buf.io.freq
     io.memPort.cmd.valid   := pg.io.memPort.cmd.valid
@@ -80,7 +84,7 @@ case class PulseDriveChannel(
     // amp/phase/addr/dur all fire on buf's shared outParamFlow.valid ⇒ one combined params Flow.
     pg.io.params.valid         := buf.io.amp.valid
     pg.io.params.payload.amp   := buf.io.amp.payload
-    pg.io.params.payload.phase := buf.io.phase.payload + buf.io.phaseOffset
+    pg.io.params.payload.phase := genPhase
     pg.io.params.payload.addr  := buf.io.addr.payload
     pg.io.params.payload.dur   := buf.io.dur.payload
     pg.io.freq << buf.io.freq
@@ -138,7 +142,8 @@ case class DemodChannel(
     phasorMethod: SinCosMethod,
     queueDepth: Int = 4,          // per-parameter TimedQueue depth (scheduled-ahead pulses per param)
     putAddrWidth: Int = 16,
-    preDecode: Boolean = false    // P3c-3 C2: `cmd` is one link stage early; the buffer holds the last stage
+    preDecode: Boolean = false,   // P3c-3 C2: `cmd` is one link stage early; the buffer holds the last stage
+    foldPhaseOffset: Boolean = false  // P3c-3 C4b: the buffer adds phaseOffset into `phase` (same value)
 ) extends Component with Channel {
   val N = batchSize; val w = dataWidth
   val io = new Bundle {
@@ -152,7 +157,7 @@ case class DemodChannel(
 
   val buf = PulseParamBuffer(PulseParamBufferParams(
     pulseNum = pulseNum, dataWidth = w, envAddrWidth = envAddrWidth, durWidth = durWidth,
-    timeWidth = timeWidth, addrWidth = putAddrWidth, preDecode = preDecode))
+    timeWidth = timeWidth, addrWidth = putAddrWidth, preDecode = preDecode, foldPhaseOffset = foldPhaseOffset))
   buf.io.cmd << io.cmd
   buf.io.timeBcast := io.timeBcast
 
@@ -161,7 +166,8 @@ case class DemodChannel(
     memLatency = memLatency, prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod,
     realOutput = false, queueDepth = queueDepth))
   pg.io.time := buf.io.time; pg.io.startTime := buf.io.startTime
-  pg.io.phase.valid := buf.io.phase.valid; pg.io.phase.payload := buf.io.phase.payload + buf.io.phaseOffset
+  pg.io.phase.valid := buf.io.phase.valid
+  pg.io.phase.payload := (if (foldPhaseOffset) buf.io.phase.payload else buf.io.phase.payload + buf.io.phaseOffset)
   pg.io.amp << buf.io.amp; pg.io.addr << buf.io.addr
   pg.io.dur << buf.io.dur; pg.io.freq << buf.io.freq
   io.memPort.cmd.valid   := pg.io.memPort.cmd.valid

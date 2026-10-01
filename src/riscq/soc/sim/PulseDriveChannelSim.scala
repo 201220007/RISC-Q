@@ -60,7 +60,8 @@ object PulseDriveChannelSim extends App {
       pulseNum = pulseNum, batchSize = batchSize, dataWidth = w, envAddrWidth = envAddrW,
       durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency, prescaleAmp = prescaleAmp,
       saturate = saturate, phasorMethod = SinCosMethod.Cordic, realOutput = false, putAddrWidth = putAddrWidth,
-      preDecode = riscq.misc.TimingPipeKnob.enabled)   // P3c-3: RISCQ_TIMING_PIPE=1 builds the antq channel variant
+      preDecode = riscq.misc.TimingPipeKnob.enabled,   // P3c-3: RISCQ_TIMING_PIPE=1 builds the antq channel variant
+      foldPhaseOffset = riscq.misc.TimingPipeKnob.enabled)
     ch.io.cmd << cmd
     ch.io.timeBcast := timeBcast
 

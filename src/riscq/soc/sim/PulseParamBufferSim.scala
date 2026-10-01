@@ -95,7 +95,8 @@ object PulseParamBufferSim extends App {
 
     val buf = PulseParamBuffer(PulseParamBufferParams(
       pulseNum = pulseNum, dataWidth = w, envAddrWidth = envAddrW, durWidth = durWidth,
-      timeWidth = timeWidth, addrWidth = addrWidth, useMem = useMem, preDecode = timingPipe))
+      timeWidth = timeWidth, addrWidth = addrWidth, useMem = useMem, preDecode = timingPipe,
+      foldPhaseOffset = timingPipe))   // phaseOffset is 0 at every push here, so the folded phase is the table phase
     buf.io.cmd << cmd
     buf.io.timeBcast := timeBcast
 
@@ -261,7 +262,7 @@ object PulseParamBufferSim extends App {
     val timeBcast = in    port UInt(timeWidth bits)
     val buf = PulseParamBuffer(PulseParamBufferParams(
       pulseNum = 1, dataWidth = w, envAddrWidth = envAddrW, durWidth = durWidth,
-      timeWidth = timeWidth, addrWidth = addrWidth, useMem = false, preDecode = timingPipe))
+      timeWidth = timeWidth, addrWidth = addrWidth, useMem = false, preDecode = timingPipe, foldPhaseOffset = timingPipe))
     buf.io.cmd << cmd
     buf.io.timeBcast := timeBcast
   }

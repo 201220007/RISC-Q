@@ -189,7 +189,7 @@ case class RiscqRfWithPulseTableFiber(
           PulseDriveChannel(pulseNum = ch.slots, batchSize = batchSize, dataWidth = w,
             envAddrWidth = envAddrWidth, durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency,
             prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod, realOutput = true,
-            queueDepth = spec.queueDepth, preDecode = timingPipe)
+            queueDepth = spec.queueDepth, preDecode = timingPipe, foldPhaseOffset = timingPipe)
         case "dio" =>
           TimedDio(slots = ch.slots, timeWidth = timeWidth, durWidth = durWidth, queueDepth = spec.queueDepth,
             preDecode = timingPipe)
@@ -201,7 +201,7 @@ case class RiscqRfWithPulseTableFiber(
           DemodChannel(pulseNum = ch.slots, batchSize = adcBatch, dataWidth = w,
             envAddrWidth = envAddrWidth, durWidth = durWidth, timeWidth = timeWidth, memLatency = memLatency,
             prescaleAmp = prescaleAmp, saturate = saturate, phasorMethod = phasorMethod, queueDepth = spec.queueDepth,
-            preDecode = timingPipe)
+            preDecode = timingPipe, foldPhaseOffset = timingPipe)
       }
       c.setCompositeName(this, s"${ch.name}Channel")
       // P3c-3 C2 (timingPipe): the channel's buffer holds the link's last stage itself, with its address decode in

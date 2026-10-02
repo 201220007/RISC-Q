@@ -154,11 +154,53 @@ def test_the_audit_refuses_a_non_silent_experiment_and_a_run_time_amplitude():
                    "core 0: set_dc_offset(RF_CH1, ...5) writes DAC 14 at run time"], got
     unnamed = K.compile_nomark(M2, [0])[0]
     unnamed.tables = {"mystery": [(0, 0, 0, 0)]}
-    assert "no channel of that name" in BR.audit_programs({0: unnamed}, M2)[0]
+    assert "no channel of that name" in BR.audit_programs({0: unnamed}, M2, {0: unnamed.c_source})[0]
 
 
-def test_the_bt_kernels_pass_the_audit():
-    """Every BT kernel plays the demod only: its table is the demod channel's (no DAC)."""
+def _srcs(progs):
+    return {c: p.c_source for c, p in progs.items()}
+
+
+def test_the_bt_kernels_pass_the_audit_and_a_missing_source_fails_it():
+    """Every BT kernel plays the demod only: its table is the demod channel's (no DAC), and its source writes no
+    amplitude. Without its C source a program fails the audit (Codex BT kit gate r1 #6): nothing shows that it
+    writes no amplitude or DC offset at run time."""
     progs = K.compile_bt(M2, [0, 1])
-    assert BR.audit_programs(progs, M2) == []
-    assert BR.audit_programs(K.compile_nomark(M2, [0, 1]), M2) == []
+    nomark = K.compile_nomark(M2, [0, 1])
+    assert BR.audit_programs(progs, M2, _srcs(progs)) == []
+    assert BR.audit_programs(nomark, M2, _srcs(nomark)) == []
+    assert BR.audit_programs(progs, M2, None) == ["core 0: no C source recorded, so its run-time writes cannot be "
+                                                  "audited", "core 1: no C source recorded, so its run-time writes "
+                                                  "cannot be audited"]
+    assert len(BR.audit_programs(progs, M2, {0: progs[0].c_source})) == 1
+
+
+def test_progs_bt_carries_every_c_source_and_the_audit_needs_them():
+    """`compile_experiment` keeps every program's generated C, which the wire form drops (the heralded and dual
+    k_batched); a progs_bt-shaped blob with every set's sources passes the audit, and fails it with one set's
+    sources stripped or none recorded (`bt_kernels.py compile` stores `c_sources`; S0's audit runs on it). The
+    heralded image's posting path has 2 conditional branches from its herald read: B = 23."""
+    cfg = BR.cal14(M2)
+    dual, herald = K.experiments(cfg, M2, [0, 1])
+    hp, _, _, _ = K.compile_experiment(herald, M2, herald_slack=True)
+    dp, _, _, _ = K.compile_experiment(dual, M2)
+    progs = {"k_bt": K.compile_bt(M2, [0, 1]), "k_herald": hp, "k_dual": dp}
+    blob = {"progs": {k: {c: rq._prog_to_wire(p) for c, p in v.items()} for k, v in progs.items()},
+            "c_sources": {k: _srcs(v) for k, v in progs.items()}}
+    assert all(src for v in blob["c_sources"].values() for src in v.values())
+    assert BR.audit_progs_bt(blob, M2) == []
+    stripped = dict(blob, c_sources={k: v for k, v in blob["c_sources"].items() if k != "k_herald"})
+    assert [b[:26] for b in BR.audit_progs_bt(stripped, M2)] == ["progs_bt k_herald: core 0:", "progs_bt k_herald: core 1:"]
+    assert len(BR.audit_progs_bt({"progs": blob["progs"]}, M2)) == 6
+    t = K.herald_c3(hp[0])
+    assert t["branches"] == 2 and t["B"] == 23 and t["post_lead"] == K.POST_LEAD, t
+
+
+def test_the_herald_timing_rule():
+    """Codex BT kit gate r1 #4: the heralded drive's lead (min slack + LEAD) must cover the post lead plus the
+    posting path's predictor bound and the host margin; otherwise UNPROVEN, never a pass."""
+    t = {"post_lead": K.POST_LEAD, "B": 23, "host_margin": 2}
+    need = K.POST_LEAD + 23 + 2
+    assert K.herald_timing(need - K.LEAD, t) == {"lead": need, "required": need, "verdict": "PROVEN"}
+    assert K.herald_timing(need - K.LEAD - 1, t)["verdict"].startswith("UNPROVEN: lead")
+    assert K.herald_timing(None, t)["verdict"] == "UNPROVEN: no drive was posted"

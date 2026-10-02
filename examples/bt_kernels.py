@@ -20,14 +20,15 @@ whose DAC-bound pulses all play at amplitude 0 (`Experiment(rf_silent=True)` on 
   k_bt_poll   `k_bt` that also reads `word[0]` every shot, after its post (`poll` = 1, compile-time):
               `pollc` = [values other than 0 and 0xFFFF_FFFF, value changes] (B4b's collision hammer).
   k_nomark    no completion marker, so its run is UNPROVEN: one demod read now, and one more due
-              `ahead` batches later (1 s), never waited for. The flush before the next release must
-              cancel it.
+              `ahead` batches later (1 s), never waited for; its absolute start time is out[1]. The
+              flush before the next release must cancel it.
   k_batched   P6 C2's dual capture (mode RAW in core RAM, rerun through the uplink), and the heralded
               COUNTS kernel. The heralded one is `riscq.cal.batched.k_batched` itself; its sequence
               header's `seq_shot` gains one now() read after the drive's posts (`slack_header`), into
               `bt_slack` = [min d, posts, histogram as above, the first drive's deadline (its release
               phase)], with d = (the first drive pulse's start - LEAD) - now(): the first pulse starts at
-              t_ro - SEP - seq_len (`base.herald_offset`).
+              t_ro - SEP - seq_len (`base.herald_offset`). Its timing is PROVEN only if min d + LEAD
+              covers POST_LEAD plus its posting path's bound and HOST_MARGIN (`herald_timing`).
 
 C3 (PLAN_BT_v2 T6, P4 REPORT §3.4): B_C3 = 9 cycles per conditional branch on the posting path plus
 5 (one AT request's stalls). `posting_branches` takes n from the disassembly of the compiled image:
@@ -59,6 +60,11 @@ NBINS, BIN_LOG2 = 16, 5
 SLACK_WORDS = 2 + NBINS  # [min d, posts, 16 bins]
 BRANCH_CYCLES, AT_STALL = 9, 5     # P4 REPORT §3.4: per mispredicted branch; one AT request (M1)
 RESULT_LATENCY = 30      # batches from a demod window's end-of-lead to its result at the sink (<= 29 measured)
+POST_LEAD = 15           # batches: the shortest lead from now() after a gate post to its start at which the pulse
+                         # still starts on time; shorter ones start late or drop (co-sim: test_bt_cosim's lead sweep
+                         # asserts this value; the post itself takes ~29 cycles)
+HOST_MARGIN = 2          # cycles: host accesses that can stall a herald's posting window (M1: one cycle each; a
+                         # heralded run has no policy, its host polls HOST_DONE outside the core's RAM)
 
 
 @kernel
@@ -125,13 +131,16 @@ def k_bt(demod: ParamTable, grp: Group, rq_epoch: int, rq_stop_epoch: int, rq_st
 @kernel
 def k_nomark(demod: ParamTable, out: Array, code: int, ahead: int):
     """UNPROVEN on purpose: no completion marker. One demod now, read; one more due `ahead` batches
-    later, not waited for (phase 14: the flush before the next release must cancel it)."""
+    later, not waited for, its absolute start time (the 32-bit batch time of this run's time base) in
+    out[1] (phase 14: the flush before the next release must cancel it, and the kit observes past
+    that time in both time bases)."""
     init_pulse_params(demod.pulses)  # noqa: F821
     set_freq(demod, code)  # noqa: F821
     t = now() + LEAD  # noqa: F821
     play(demod, demod["sq"], t)  # noqa: F821
     wait_until(t + READOUT_LEAD)  # noqa: F821
     out[0] = read_res()  # noqa: F821
+    out[1] = t + ahead
     play(demod, demod["sq"], t + ahead)  # noqa: F821
 
 
@@ -157,7 +166,7 @@ def compile_bt(m, cores, poll=0):
 
 
 def compile_nomark(m, cores):
-    return {c: compile_kernel(k_nomark, m, core=c, tables=dict(demod=demod_table(m, c)), out=Array(1),
+    return {c: compile_kernel(k_nomark, m, core=c, tables=dict(demod=demod_table(m, c)), out=Array(2),
                               code=demod_code(m)) for c in sorted(cores)}
 
 
@@ -200,12 +209,26 @@ def _target(args: str) -> int:
     return int(args.rsplit(",", 1)[-1], 16)
 
 
-def posting_branches(prog, objdump: str | None = None) -> dict:
+def _tested(ins, i) -> bool:
+    """Whether the result loaded by ins[i] is compared by the first conditional branch after it, with no
+    store in between (the heralded k_batched's `h = read_res(); if (h == 0) ...`)."""
+    rd = ins[i][2].split(",", 1)[0]
+    for _, op, x in ins[i + 1:]:
+        if op in STORES:
+            return False
+        if op in COND:
+            return rd in x.split(",")[:2]
+    return False
+
+
+def posting_branches(prog, objdump: str | None = None, herald: bool = False) -> dict:
     """The conditional branches between a shot's result read and the next post (PLAN_BT_v2 T6, P4
     REPORT §3.4): from the shot loop's result read (`lw rd, 0x200(rs)`, CTRL_RES) every control-flow
     path is followed to its first store (the post's first write), within the shot loop (the span of
     the backward branches and jumps of `main`); the most conditional branches on any such path is n,
-    and B_C3 = 9 n + 5."""
+    and B_C3 = 9 n + 5. k_bt has exactly one result read in its shot loop. `herald` (the heralded
+    k_batched, two reads per shot) starts instead at the herald read, the one whose value the next
+    conditional branch tests: its drive is posted after it."""
     ins = disassemble(prog, objdump)
     at = {a: i for i, (a, _, _) in enumerate(ins)}
     back = [(_target(x), a) for a, op, x in ins if (op in COND or op == "jal") and _target(x) < a]
@@ -214,8 +237,10 @@ def posting_branches(prog, objdump: str | None = None) -> dict:
     lo, hi = min(t for t, _ in back), max(a for _, a in back)
     reads = [i for i, (a, op, x) in enumerate(ins) if op == "lw" and lo <= a <= hi
              and re.match(rf"x\d+,{RES_OFFSET}\(x\d+\)$", x)]
+    if herald:
+        reads = [i for i in reads if _tested(ins, i)]
     if len(reads) != 1:
-        raise ValueError(f"expected one result read in the shot loop, found {len(reads)}")
+        raise ValueError(f"expected one {'tested ' if herald else ''}result read in the shot loop, found {len(reads)}")
     best, paths = -1, []
 
     def walk(i, n, seen, path):
@@ -271,25 +296,58 @@ def slack_header(hdr: str, lead_before_t_ro: int) -> str:
     return hdr[:i] + prelude + hdr[i:j] + "\n" + note + hdr[j:]
 
 
+def herald_timing(min_slack, timing: dict) -> dict:
+    """The heralded k_batched's drive-post timing (Codex BT kit gate r1 #4): its post lead is min_slack +
+    LEAD (the first drive pulse starts LEAD after the deadline its slack is measured against, and the
+    slack is read after the posts). PROVEN only if that lead covers the hardware's post lead (POST_LEAD,
+    measured in co-sim on a gate channel and by the non-silent twin) plus the posting path's predictor
+    bound (B, from the disassembly, as B_C3) and the host stalls (HOST_MARGIN); otherwise UNPROVEN,
+    never a pass."""
+    need = int(timing["post_lead"]) + int(timing["B"]) + int(timing["host_margin"])
+    lead = None if min_slack is None else int(min_slack) + LEAD
+    ok = lead is not None and lead >= need
+    return {"lead": lead, "required": need, "verdict": "PROVEN" if ok else
+            f"UNPROVEN: lead {lead} < {need} (post lead {timing['post_lead']} + B {timing['B']} + host "
+            f"{timing['host_margin']})" if lead is not None else "UNPROVEN: no drive was posted"}
+
+
+def herald_c3(prog, objdump: str | None = None) -> dict:
+    """The heralded image's posting-path bound: the most conditional branches on any path from its herald
+    read to a first store (the drive's post, or the next shot's herald readout when the herald fails), as
+    `posting_branches`, with the post lead and host margin the timing rule adds."""
+    c3 = posting_branches(prog, objdump, herald=True)
+    return {"branches": c3["conditional_branches"], "B": c3["B_C3"], "worst_path": c3["worst_path"],
+            "post_lead": POST_LEAD, "host_margin": HOST_MARGIN}
+
+
 def compile_experiment(exp, m, herald_slack=False):
     """Compile an Experiment offline (its `rq.setup` lands in bt_record's RecordingDriver) and return its
-    programs, the params of its first rerun, its timeout and its point count. `herald_slack` instruments
-    the heralded sequence header."""
+    programs (with their C sources: the RF audit reads them), the params of its first rerun, its timeout
+    and its point count. `herald_slack` instruments the heralded sequence header."""
     from riscq import run as rq
     from riscq.cal import base, experiment as X
     from bt_record import RecordingDriver
     drv = RecordingDriver(m)                   # its `rq.setup` lands in the recording remote; nothing runs
-    orig = X.emit_header
+    orig, orig_setup, srcs = X.emit_header, rq.setup, {}
     if herald_slack:
         def emit(comp, core, meas, label=""):
             return slack_header(orig(comp, core, meas, label), base.SEP + comp.seq_len)
         X.emit_header = emit
+
+    def setup(d, mm, ps):                      # the sources do not cross the wire: keep them from the setup
+        if d is drv:
+            srcs.clear()
+            srcs.update({int(c): p.c_source for c, p in ps.items()})
+        return orig_setup(d, mm, ps)
+    rq.setup = setup
     try:
         progs, _signs, timeout = exp.compile(drv)
     finally:
-        X.emit_header = orig
+        X.emit_header, rq.setup = orig, orig_setup
     wire = [c for c in drv.remote.calls if c["op"] == "setup"][-1]["args"]["progmap"]
     progs = {int(c): rq._prog_from_wire(w) for c, w in wire.items()}
+    for c, p in progs.items():
+        p.c_source = srcs.get(c)
     comp, axes, rcore, npts = exp.compiled[exp.keys[0]]
     words = exp._pairs(axes, ())
     params = {c: {k: v for k, v in words.items() if k in progs[c].params} for c in progs}
@@ -338,17 +396,24 @@ def cmd_compile(args):
                                                           "shots": dual.shots}
             p, par, timeout, npts = compile_experiment(herald, m, herald_slack=True)
             progs[f"k_herald{name}"], meta[f"k_herald{name}"] = p, {"params": par, "timeout": timeout,
-                                                                    "npts": npts, "shots": herald.shots}
+                                                                    "npts": npts, "shots": herald.shots,
+                                                                    "timing": herald_c3(p[min(p)], args.objdump)}
+    srcs = {k: {c: p.c_source for c, p in v.items()} for k, v in progs.items()}
+    missing = sorted(k for k, v in srcs.items() if any(not s for s in v.values()))
+    if missing:                                # the RF audit fails without them (Codex BT kit gate r1 #6)
+        sys.exit(f"no C source for {missing}: the RF audit needs every program's generated source")
     blob = {"config": Path(args.config).name, "c3": c3, "meta": meta,
-            "designed_slack_1us": designed_slack(BATCHES_PER_US),
+            "designed_slack_1us": designed_slack(BATCHES_PER_US), "c_sources": srcs,
             "progs": {k: {c: rq._prog_to_wire(p) for c, p in v.items()} for k, v in progs.items()}}
     with open(args.out, "wb") as f:
         pickle.dump(blob, f)
     for k, v in progs.items():
         p = next(iter(v.values()))
         print(f"[BT] compiled {k}: cores {sorted(v)}, image {len(p.image.data)} B, runtime params "
-              f"{sorted(x for x, y in p.params.items() if y is None)}" + (f", C3 {c3[k]}" if k in c3 else ""))
-    print(f"[BT] designed slack at 1 us: {blob['designed_slack_1us']} batches; -> {args.out}")
+              f"{sorted(x for x, y in p.params.items() if y is None)}" + (f", C3 {c3[k]}" if k in c3 else "")
+              + (f", timing {meta[k]['timing']}" if "timing" in meta.get(k, {}) else ""))
+    print(f"[BT] designed slack at 1 us: {blob['designed_slack_1us']} batches; C sources kept for {len(srcs)} "
+          f"program sets; -> {args.out}")
 
 
 def main(argv=None):

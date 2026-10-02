@@ -21,7 +21,8 @@
 4. The RF audit (`audit_programs`), of every recorded setup and of every program of progs_bt.pkl: every
    table slot of a channel with a DAC plays at amplitude 0, and the C source writes no amplitude
    (`set_amp`) and no DC offset (`set_dc_offset`) other than 0 to a channel with a DAC, so no rerun param
-   can write one. A table whose channel cannot be named fails the audit."""
+   can write one. A table whose channel cannot be named, or a program whose C source is missing, fails
+   the audit."""
 
 from __future__ import annotations
 
@@ -222,8 +223,10 @@ def record(name, factory, m) -> dict:
 _SET = re.compile(r"\b(set_amp|set_dc_offset)\s*\(\s*(RF_CH\d+)\s*,([^;]*)\)\s*;")
 
 
-def audit_programs(progs: dict, m, c_sources: dict | None = None) -> list:
-    """Every violation of RF silence in one setup's programs ([] = silent)."""
+def audit_programs(progs: dict, m, c_sources: dict | None) -> list:
+    """Every violation of RF silence in one setup's programs ([] = silent). `c_sources` (core -> the
+    generated C) is required: a program whose source is missing cannot be shown to write no amplitude or
+    DC offset at run time, so it fails the audit (Codex BT kit gate r1 #6)."""
     bad = []
     for core, prog in sorted(progs.items()):
         names = {ch.name: ch for ch in m.channels(core)}
@@ -236,8 +239,8 @@ def audit_programs(progs: dict, m, c_sources: dict | None = None) -> list:
                 bad.append(f"core {core} table {sym} (DAC {ch.dac}): amplitude codes "
                            f"{[int(s[1]) for s in slots]}")
         src = (c_sources or {}).get(core)
-        if c_sources is not None and src is None:
-            bad.append(f"core {core}: no C source recorded")
+        if not src:
+            bad.append(f"core {core}: no C source recorded, so its run-time writes cannot be audited")
         for fn, cname, rest in _SET.findall(src or ""):
             ch = cnames.get(cname)
             value = rest.split(",")[-1].strip() if fn == "set_amp" else rest.strip()
@@ -263,7 +266,8 @@ def audit_progs_bt(blob: dict, m) -> list:
     bad = []
     for name, wires in blob["progs"].items():
         progs = {int(c): rq._prog_from_wire(w) for c, w in wires.items()}
-        bad += [f"progs_bt {name}: {b}" for b in audit_programs(progs, m, (blob.get("c_sources") or {}).get(name))]
+        srcs = (blob.get("c_sources") or {}).get(name)
+        bad += [f"progs_bt {name}: {b}" for b in audit_programs(progs, m, srcs)]
     return bad
 
 

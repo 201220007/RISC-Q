@@ -373,11 +373,13 @@ def test_t6_k_bt_poll_under_the_poll_writer_sees_no_torn_word(t6):
 
 @pytest.mark.batch_cap(210_000)
 def test_t6_k_nomark_is_unproven_and_the_flush_cancels_its_queued_demod(t6):
-    """T6 (kit phase 14) and P6 C2: `k_nomark` posts one demod now and one due AHEAD = 6·10^4 batches later and
-    has no marker: the run certifies UNPROVEN with a flush pending. The next setup (P6 C2's dual capture) takes the
-    flush, its pulse landing before the due time; past the due time in the new time base (a recover() first keeps
-    the due time small in both) REJECTED and early_late are still 0. The dual run then finds no stray result and
-    certifies exactly: every core's uplink words - 8 equal its RAM IQ >> 4 << 4, with a tone on ADC 0.
+    """T6 (kit phase 14) and P6 C2: `k_nomark` posts one demod now and one due AHEAD = 6·10^4 batches later,
+    storing that absolute start time, and has no marker: the run certifies UNPROVEN with a flush pending. The
+    next setup (P6 C2's dual capture) takes the flush, its pulse landing before every core's recorded due time
+    in the old time base; the pulse restarts refTime, so the due time is then observed in the new base too
+    (a recover() first keeps it small in both), and REJECTED and early_late are still 0 past it. The dual run
+    then finds no stray result and certifies exactly: every core's uplink words - 8 equal its RAM IQ >> 4 << 4,
+    with a tone on ADC 0.
 
     FLOOR: two 3-core image loads (~30 k batches each), two flushes (FLUSH_ALLOWANCE), the k_nomark uplink run
     (~16 k), the advance past the due time (~4·10^4 after the setup), and the dual uplink run (~16 k) of 16
@@ -390,9 +392,10 @@ def test_t6_k_nomark_is_unproven_and_the_flush_cancels_its_queued_demod(t6):
     rq.recover(drv, m)                       # restarts the batch time: the due time stays small in either base
     cores = sorted(progs)
     t_before = drv.sim.batch_time()
-    rq.rerun(drv, m, progs, params={c: {"ahead": AHEAD} for c in cores}, results=["out"], timeout=200_000,
-             uplink=rq.UplinkRun(expected={c: 1 for c in cores}, base=fx.base()))
-    t_after = drv.sim.batch_time()
+    nm = rq.rerun(drv, m, progs, params={c: {"ahead": AHEAD} for c in cores}, results=["out"], timeout=200_000,
+                  uplink=rq.UplinkRun(expected={c: 1 for c in cores}, base=fx.base()))
+    due = {c: int(nm[c]["out"][1]) & 0xFFFF_FFFF for c in cores}          # each core's absolute start time
+    assert all(t_before + AHEAD < d < drv.sim.batch_time() + AHEAD for d in due.values()), (t_before, due)
     run = s.runs[-1]
     assert run.outcome == S.CERTIFIED and run.proven is False, (run.outcome, run.proven)
     assert s.pending_flush is not None and s.pending_flush.reason == S.FLUSH_UNPROVEN
@@ -402,8 +405,8 @@ def test_t6_k_nomark_is_unproven_and_the_flush_cancels_its_queued_demod(t6):
     dprogs, par, timeout, npts = K.compile_experiment(dual, m)
     fx.load("dual", dprogs)                  # its setup takes the UNPROVEN flush
     snap = drv.sim.pl_reset_snapshot()
-    assert snap["n"] == n0 + 1 and snap["batch_time"] < t_before + AHEAD, (snap["batch_time"], t_before + AHEAD)
-    drv.sim.advance(max(0, t_after + AHEAD + 500 - drv.sim.batch_time()))
+    assert snap["n"] == n0 + 1 and snap["batch_time"] < min(due.values()), (snap["batch_time"], due)
+    drv.sim.advance(max(0, max(due.values()) + DUR + K.RESULT_LATENCY + 500 - drv.sim.batch_time()))   # new base
     rej, early_late = rd.rejected(), rd.status() >> R.S_EARLY_LATE & 1
     assert not any(rej) and not early_late, (rej, early_late)
     _tone(drv, m, cores)
@@ -421,8 +424,8 @@ def test_t6_k_nomark_is_unproven_and_the_flush_cancels_its_queued_demod(t6):
         field = (ram.astype(np.int32) >> 4 << 4).astype(np.int64)
         assert len(up) == 2 * k and np.array_equal(up - 8, field), c
         assert np.abs(ram).max() > 0, c
-    print(f"\n[BT T6] k_nomark UNPROVEN; the flush pulse at batch {snap['batch_time']}, before the due time "
-          f"(> {t_before + AHEAD}); REJECTED {rej}, early_late 0 past it; dual capture: {k} shots per core, "
+    print(f"\n[BT T6] k_nomark UNPROVEN; the flush pulse at batch {snap['batch_time']}, before the recorded due "
+          f"times {sorted(set(due.values()))}; REJECTED {rej}, early_late 0 past them in the new base; dual capture: {k} shots per core, "
           f"uplink - 8 == RAM >> 4 << 4 on cores {cores}")
 
 
@@ -855,3 +858,97 @@ def test_cd_completion_order_on_sim_2q1c_antq(cosim_2q1c, monkeypatch):
     assert extra == 1
     print(f"\n[BT C-D] sim-2q1c-antq: {len(report)} runs; per label (min marker - last activity, min DONE - marker) "
           f"{_summary(report)}; > {extra} extra 14q stages; nothing moved outside the runs")
+
+
+# ── the heralded drive's post lead (Codex BT kit gate r1 #4) ───────────────────────────────────────
+
+LEADS = list(range(0, 62, 2))             # the sweep's post leads, batches from now() before the post
+
+
+@kernel
+def k_lead(gate: ParamTable, leads: Array, out: Array, n: int):
+    """The post→start lead sweep: shot i posts the gate pulse at now() + leads[i], keeps that start time and the
+    lead left after the post (the start minus now() read right after it, as the heralded drive's slack is), and
+    waits past the pulse."""
+    init_pulse_params(gate.pulses)  # noqa: F821
+    set_freq(gate, gate.freq)  # noqa: F821
+    for i in range(n):
+        t = now() + leads[i]  # noqa: F821
+        play(gate, gate["g"], t)  # noqa: F821
+        out[2 * i + 1] = t - now()  # noqa: F821
+        out[2 * i] = t
+        wait_until(t + 400)  # noqa: F821
+    out[2 * n] = 1
+
+
+def _on_time(stretches, starts, window=300):
+    """Per scheduled start: "on time" (a stretch starts exactly there), "late" (one starts after it, inside the
+    shot's window) or "dropped"."""
+    got = []
+    for t in starts:
+        s = [a for a, _ in stretches if t <= a < t + window]
+        got.append("on time" if s and s[0] == t else "late" if s else "dropped")
+    return got
+
+
+@pytest.mark.batch_cap(260_000)
+def test_the_heralded_drive_keeps_the_measured_post_lead(cosim_antq):
+    """Codex BT kit gate r1 #4 on sim-dio-antq. (1) The hardware's post lead: core 0 posts a gate pulse at now() +
+    L for L = 0..60 under a watch of DAC 0, each lead measured after the post as the heralded drive's slack is;
+    every pulse with an after-post lead >= POST_LEAD starts exactly on time and every shorter one does not, and
+    POST_LEAD is bt_kernels.POST_LEAD. (2) The non-silent heralded twin (the kit's heralded k_batched compiled the
+    same way, on cal14 with its amplitudes): every drive pulse on DACs 0 and 1 starts at its scheduled time, the
+    first at its bt_slack deadline + LEAD, and its after-post lead min_slack + LEAD covers POST_LEAD. The kit's
+    rule then adds the posting path's predictor bound and the host margin (`bt_kernels.herald_timing`).
+
+    FLOOR: the 1-core sweep image load (~10 k batches) and its run (31 shots at ~430 batches), the twin's 2-core
+    image load (~20 k) and its uplink-free run of 8 heralded shots, all under the per-batch watch."""
+    drv, m = cosim_antq
+    drv.sim.set_model({"kind": "zero"})
+    gate = ParamTable(m.channel_named("gate", 0), 50e6, {"g": Pulse(envelopes.square(64), freq_hz=50e6, amp=0.5)})
+    prog = compile_kernel(k_lead, m, core=0, tables=dict(gate=gate), leads=Array(len(LEADS), input=True),
+                          out=Array(2 * len(LEADS) + 1))
+    prog.marker = ("out", 2 * len(LEADS))
+    rq.setup(drv, m, {0: prog})
+    h = drv.sim.dac_watch_start([m.channel_named("gate", 0).dac])
+    try:
+        out = rq.rerun(drv, m, {0: prog}, params={0: {"n": len(LEADS)}}, arrays={0: {"leads": LEADS}},
+                       results=["out"], timeout=200_000)
+    finally:
+        seen = drv.sim.dac_watch_stop(h)
+    o = [_s32(x) for x in out[0]["out"]]
+    starts, after = o[0:2 * len(LEADS):2], o[1:2 * len(LEADS):2]
+    got = _on_time(seen[m.channel_named("gate", 0).dac]["stretches"], starts)
+    ok = [d for d, g in zip(after, got) if g == "on time"]
+    assert ok, list(zip(LEADS, after, got))
+    post_lead = min(ok)
+    assert all((g == "on time") == (d >= post_lead) for d, g in zip(after, got)), list(zip(LEADS, after, got))
+    assert post_lead == K.POST_LEAD, (post_lead, K.POST_LEAD, list(zip(LEADS, after, got)))
+    cores = [0, 1]
+    cfg = _loud(_cal14(m), m)
+    herald = _herald_exp(cfg, cores, 8, silent=False)
+    hprogs, hpar, htimeout, npts = K.compile_experiment(herald, m, herald_slack=True)
+    rq.setup(drv, m, hprogs)
+    gates = {c: m.channel_named("gate", c).dac for c in cores}
+    h = drv.sim.dac_watch_start(sorted(gates.values()))
+    try:
+        hout = rq.rerun(drv, m, hprogs, params=hpar, results=["out"], timeout=htimeout)
+    finally:
+        seen = drv.sim.dac_watch_stop(h)
+    timing = K.herald_c3(hprogs[0])
+    rows = {}
+    for c, p in sorted(hprogs.items()):
+        a, size = p.image.symbols["bt_slack"]
+        raw = drv.read_block(m.to_host_addr(c, a), size)
+        w = [_s32(int.from_bytes(raw[i:i + 4], "little")) for i in range(0, size, 4)]
+        kept = int(hout[c]["out"][1])
+        st_ = [x for x, _ in seen[gates[c]]["stretches"]]
+        assert w[1] == kept == herald.shots * npts and len(st_) == kept, (c, w[1], kept, st_)
+        assert st_[0] == w[-1] + LEAD, (c, st_[0], w[-1])                # the first drive: on time at its deadline
+        gaps = {b - a for a, b in zip(st_, st_[1:])}
+        assert len(gaps) == 1, (c, st_)                                    # the rest on the shot grid
+        assert w[0] + LEAD >= post_lead, (c, w[0], post_lead)
+        rows[c] = (w[0], w[0] + LEAD, K.herald_timing(w[0], timing)["verdict"])
+    print(f"\n[BT herald lead] post lead {post_lead} batches after the post (sweep {list(zip(LEADS, after, got))[:6]}"
+          f"...); twin: drives on time on DACs {sorted(gates.values())}, (min slack, lead, verdict) per core {rows}; "
+          f"path bound B {timing['B']} ({timing['branches']} branches), host {timing['host_margin']}")

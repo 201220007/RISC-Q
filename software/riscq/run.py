@@ -261,6 +261,8 @@ def _prog_to_wire(prog: Program) -> dict:
         "envelopes": {int(chan): [_env_to_wire(line0, lines) for line0, lines in image]
                       for chan, image in prog.envelopes.items()},
         "marker": None if prog.marker is None else [str(prog.marker[0]), int(prog.marker[1])],
+        # qubic3 P4: the stop convention, only when present (other programs keep their S0 identity)
+        **({} if prog.stop is None else {"stop": dict(prog.stop)}),
     }
 
 
@@ -285,6 +287,8 @@ def _prog_from_wire(wire: dict) -> Program:
                    host_arrays=host_arrays)
     marker = wire.get("marker")
     prog.marker = None if marker is None else (str(marker[0]), int(marker[1]))
+    stop = wire.get("stop")
+    prog.stop = None if stop is None else dict(stop)
     return prog
 
 

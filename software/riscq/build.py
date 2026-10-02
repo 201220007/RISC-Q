@@ -59,6 +59,9 @@ class Program:
     - `marker`: `(array, index)` of the program's completion-marker word, or None (qubic3 S0/P6:
       the kernel stores 1 there after its last pulse has ended; `riscq.run.rerun` writes
       0xFFFF_FFFF there before the release and requires 1 after DONE).
+    - `stop`: the stop convention of a stoppable kernel (qubic3 P4, `riscq.lang.StopConvention`):
+      `{"shots": name, "n": bound n or None, "at": bool, "lead": L, "reads": r or None}`, or None.
+      Its marker is `("rq_status", 2)`, which must read the run's epoch after DONE.
 
     Hand-written C uses `Program.from_image(img)` — everything empty, same runner."""
 
@@ -75,6 +78,7 @@ class Program:
         self.c_source = c_source
         self.bindings: dict[str, int] = dict(bindings or {})
         self.marker: tuple[str, int] | None = None
+        self.stop: dict | None = None
 
     @classmethod
     def from_image(cls, image: Image) -> "Program":

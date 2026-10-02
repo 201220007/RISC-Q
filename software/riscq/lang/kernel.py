@@ -164,6 +164,57 @@ class Array:
         self.host = bool(host)
 
 
+class StopConvention:
+    """The stop convention of a stoppable kernel (qubic3 P4, plan P4 v2 §5.2-§5.3): what its author
+    states, passed as `compile_kernel(..., stop=StopConvention(...))`. The kernel declares the four
+    reserved parameters `rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int` (unbound: the run
+    layer writes them before every release, and the stop words during the run) and `rq_status:
+    Array` (bound to Array(3) here: [posted shots, reads, fin]); its shot loop checks
+    `rq_stop_epoch == e and s >= rq_stop_at` before posting a shot, and after the loop it waits out
+    its last pulse and stores `rq_status[2] = e` (`e = rq_epoch`, read once before the loop).
+
+    - `shots`: the int parameter holding the shot count n (bound, or a runtime param).
+    - `at`: the kernel meets C1-C3, so AT(S) may be requested: every participating core starts from
+      one barrier's t0 and gates the posting of shot k by `wait_until` on the grid t0 + kP of one
+      integer period P (C1), no core's posted count leads another's by more than `lead` (C2), and
+      every fire is posted with LEAD to spare, under stop traffic too (C3). False: NEXT only.
+    - `lead`: L of C2 (1 for a read-every-shot kernel, 1 + ceil(AHEAD/P) for a post-ahead one).
+    - `reads_per_shot`: r of a fixed-read kernel (the run layer checks reads == shots x r), or None
+      (heralded: the reads are only counted)."""
+
+    def __init__(self, shots: str, at: bool = False, lead: int = 1, reads_per_shot: int | None = None):
+        if not isinstance(shots, str) or not shots:
+            raise ValueError(f"StopConvention(shots=...) names the kernel's shot-count parameter, got {shots!r}")
+        if isinstance(lead, bool) or not isinstance(lead, int) or lead < 1:
+            raise ValueError(f"lead L must be an int >= 1, got {lead!r}")
+        if reads_per_shot is not None and (isinstance(reads_per_shot, bool)
+                                           or not isinstance(reads_per_shot, int) or reads_per_shot < 0):
+            raise ValueError(f"reads_per_shot must be an int >= 0 or None, got {reads_per_shot!r}")
+        self.shots = shots
+        self.at = bool(at)
+        self.lead = int(lead)
+        self.reads_per_shot = reads_per_shot
+
+    def record(self, n: int | None) -> dict:
+        """The serpent-safe `Program.stop` record; `n` is the bound shot count, or None (runtime)."""
+        return {"shots": self.shots, "n": n, "at": self.at, "lead": self.lead,
+                "reads": self.reads_per_shot}
+
+
+# P4 (plan P4 v2 §5.2): the stop convention's reserved names, and the calls a stoppable kernel may make
+STOP_INTS = ("rq_epoch", "rq_stop_epoch", "rq_stop_at")
+STOP_STATUS = "rq_status"
+STOP_NAMES = STOP_INTS + (STOP_STATUS,)
+_STOP_WORDS = ("rq_stop_epoch", "rq_stop_at")
+# riscq.h primitives that never wait on a peer or an external input
+STOP_ALLOWED = frozenset({
+    "now", "wait_until", "set_freq", "set_phase", "set_amp", "set_env", "set_dur", "set_start",
+    "set_phase_offset", "set_dc_offset", "fire", "play", "init_pulse_params", "read_res", "read_real",
+    "read_imag", "dio_slot", "publish", "remote", "signal"})
+STOP_PRE_LOOP = frozenset({"barrier", "wait_signal"})     # halt on a peer: the pre-loop rendezvous only
+STOP_EVENT_READS = frozenset({"pop_event", "event_word", "event_time", "event_seq", "event_count"})
+
+
 class Kernel:
     """The @kernel wrapper: stays callable as plain python (host-side golden interpretation)
     and hands its source to compile_kernel."""
@@ -196,7 +247,8 @@ class _RTable:
 
 
 def compile_kernel(k: Kernel, soc_map: SocMap, tables: dict[str, ParamTable] | None = None,
-                   include=(), core: int = 0, **bindings) -> build.Program:
+                   include=(), core: int = 0, stop: StopConvention | None = None,
+                   **bindings) -> build.Program:
     """Compile one specialization of `k` for `core`: python -> IR -> C -> flat image.
 
     `core` picks the core whose channel geometry (`soc_map.channel(index, core)`) and header
@@ -211,8 +263,20 @@ def compile_kernel(k: Kernel, soc_map: SocMap, tables: dict[str, ParamTable] | N
     #included after riscq.h and hashed into the build-cache key; `bindings` bake int parameters
     as constants and size Array parameters (`counts=Array(31)`). Returns a Program carrying the
     params layout, the array table, the per-channel envelope images, and each live table's slot
-    codes for riscq.run to upload."""
-    fe = _FrontEnd(k, soc_map, dict(tables or {}), dict(bindings), int(core))
+    codes for riscq.run to upload.
+
+    `stop` (qubic3 P4) compiles a stoppable kernel (`StopConvention`): the four reserved names
+    must be declared, `rq_status` is bound to Array(3), and the body may call only the allow-list
+    `STOP_ALLOWED`, with `barrier`/`wait_signal` only in top-level statements before the first
+    one that reads the stop words (the pre-loop rendezvous); every other name, the event reads and
+    any helper of an included header among them, is refused. The Program carries `stop` (the
+    stated convention) and the completion marker `rq_status[2]`, whose value is the run's epoch."""
+    bindings = dict(bindings)
+    if stop is not None:
+        if not isinstance(stop, StopConvention):
+            raise KernelCompileError(f"stop= takes a StopConvention, got {type(stop).__name__}")
+        bindings.setdefault(STOP_STATUS, Array(3))
+    fe = _FrontEnd(k, soc_map, dict(tables or {}), bindings, int(core), stop)
     kir = fe.compile()
     extra_headers = {}
     for inc in include:
@@ -227,9 +291,13 @@ def compile_kernel(k: Kernel, soc_map: SocMap, tables: dict[str, ParamTable] | N
     params: dict[str, int | None] = {name: None for name in kir.params}
     envelopes = {ch: alloc.image() for ch, alloc in fe.allocs.items() if alloc.image()}
     prog_tables = {t.name: list(t.slot_codes) for t in kir.tables}
-    return build.Program(image, params=params, arrays=dict(kir.arrays), envelopes=envelopes,
+    prog = build.Program(image, params=params, arrays=dict(kir.arrays), envelopes=envelopes,
                          tables=prog_tables, c_source=c_source, bindings=dict(fe.bound),
                          host_arrays=dict(kir.host_arrays), core=fe.core)
+    if stop is not None:
+        prog.stop = stop.record(fe.bound.get(stop.shots))
+        prog.marker = (STOP_STATUS, 2)
+    return prog
 
 
 def _wrap32(v: int) -> int:
@@ -240,7 +308,8 @@ _XCORE_OPS = ("publish", "remote", "barrier", "signal", "wait_signal")
 
 
 class _FrontEnd:
-    def __init__(self, k: Kernel, soc_map: SocMap, tables: dict, bindings: dict, core: int):
+    def __init__(self, k: Kernel, soc_map: SocMap, tables: dict, bindings: dict, core: int,
+                 stop: StopConvention | None = None):
         if not isinstance(k, Kernel):
             raise KernelCompileError(
                 f"compile_kernel needs an @kernel function, got {type(k).__name__}")
@@ -249,6 +318,7 @@ class _FrontEnd:
         self.core = core              # the core this specialization is compiled for
         self.tables = tables          # name -> ParamTable, from tables=
         self.bindings = bindings
+        self.stop = stop              # qubic3 P4: the stated stop convention, or None
 
         self.file = inspect.getsourcefile(self.fn) or "<unknown>"
         self._src_lines, self._first_line = inspect.getsourcelines(self.fn)
@@ -275,6 +345,7 @@ class _FrontEnd:
 
     def compile(self) -> ir.KernelIR:
         self._classify_params()
+        self._check_stop_convention()
         body = self._block(self.fdef.body, drop_docstring=True)
         for tname in self.tables:            # bound but unreferenced tables are emitted too
             self._resolve_table(self.fdef, tname)
@@ -286,6 +357,88 @@ class _FrontEnd:
             input_arrays=set(self.input_arrays), host_arrays=self._host_offsets(),
             locals=dict(self.locals),
             tables=tables, body=body)
+
+    # ── qubic3 P4: the stop convention (plan P4 v2 §5.2) ──
+
+    def _check_stop_convention(self):
+        """A kernel declaring the stop convention's names needs `stop=`; a stoppable kernel declares
+        all four, checks both stop words inside a loop, publishes rq_status[0..2], and calls only the
+        allow-list, with peer waits only in top-level statements before the first one that reads the
+        stop words. The compiler passes included headers to clang as text and calls by name, so a
+        helper's body is never seen: any name off the list is refused rather than trusted."""
+        declared = [n for n in STOP_NAMES if n in self.param_names]
+        if self.stop is None:
+            if declared:
+                self._err(self.fdef, f"parameter {declared[0]!r} is a name of the stop convention "
+                                     f"(qubic3 P4): compile with stop=StopConvention(...), or rename it")
+            return
+        for name in STOP_INTS:
+            if name in self.bound:
+                self._err(self.fdef, f"{name!r} cannot be bound: the run layer writes it before every "
+                                     f"release (and the stop words during the run)")
+            if name not in self.uparams:
+                self._err(self.fdef, f"a stoppable kernel declares rq_epoch: int, rq_stop_epoch: int, "
+                                     f"rq_stop_at: int and rq_status: Array; {name!r} is missing")
+        if STOP_STATUS not in self.arrays:
+            self._err(self.fdef, f"a stoppable kernel declares {STOP_STATUS}: Array ([shots, reads, fin])")
+        if (self.arrays[STOP_STATUS] != 3 or STOP_STATUS in self.input_arrays
+                or STOP_STATUS in self.host_arrays):
+            self._err(self.fdef, f"{STOP_STATUS} must be a plain Array(3) in core RAM (.bss: start.S zeroes "
+                                 f"it at boot over the run layer's sentinel)")
+        shots = self.stop.shots
+        if shots in STOP_NAMES or (shots not in self.bound and shots not in self.uparams):
+            self._err(self.fdef, f"StopConvention(shots={shots!r}) must name an int parameter of the "
+                                 f"kernel holding the shot count")
+        body = [s for i, s in enumerate(self.fdef.body)
+                if not (i == 0 and isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+
+        def reads(node, names):
+            return any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in names
+                       for n in ast.walk(node))
+
+        boundary = next((i for i, s in enumerate(body) if reads(s, _STOP_WORDS)), None)
+        loops = [n for s in body for n in ast.walk(s) if isinstance(n, (ast.While, ast.For))]
+        for word in _STOP_WORDS:
+            if not any(reads(lp, (word,)) for lp in loops):
+                self._err(self.fdef, f"a stoppable kernel checks `rq_stop_epoch == e and s >= rq_stop_at` "
+                                     f"at the top of every shot of its loop; {word!r} is never read in a loop")
+        if not any(reads(s, ("rq_epoch",)) for s in body):
+            self._err(self.fdef, "a stoppable kernel reads rq_epoch (once, before its shot loop) and "
+                                 "publishes it as fin, rq_status[2]")
+        stored = {n.slice.value for s in body for n in ast.walk(s)
+                  if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)
+                  and isinstance(n.value, ast.Name) and n.value.id == STOP_STATUS
+                  and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, int)}
+        missing = [i for i in (0, 1, 2) if i not in stored]
+        if missing:
+            self._err(self.fdef, f"a stoppable kernel publishes rq_status[0] (posted shots), [1] (reads) "
+                                 f"and [2] (fin, the epoch, after its last pulse); no store to "
+                                 f"rq_status{missing}")
+        for i, s in enumerate(body):
+            for node in ast.walk(s):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                    continue
+                name = node.func.id
+                if name in ("ptr", "range") or name in STOP_ALLOWED:
+                    continue
+                if name in STOP_PRE_LOOP:
+                    if i >= boundary:
+                        self._err(node, f"{name}() halts until a peer arrives or signals: a stoppable "
+                                        f"kernel may call it only in top-level statements before the "
+                                        f"first one that reads the stop words (the pre-loop rendezvous); "
+                                        f"in or after the shot loop the cores may have stopped at "
+                                        f"different shots, and a core waiting on one that stopped "
+                                        f"would hang until the timeout")
+                    continue
+                if name in STOP_EVENT_READS:
+                    self._err(node, f"{name}() is refused in a stoppable kernel: pop_event halts until an "
+                                    f"external event is queued (event_word(sink, 0) is the same pop), and "
+                                    f"the other event reads are useless without it")
+                self._err(node, f"{name}() is not on the allow-list of a stoppable kernel: the compiler "
+                                f"never parses a C helper's body (an included header's function may "
+                                f"halt on a peer or an external input), so only these riscq.h "
+                                f"primitives are accepted: {', '.join(sorted(STOP_ALLOWED))}, and "
+                                f"barrier/wait_signal before the shot loop")
 
     def _host_offsets(self) -> dict:
         """Host-window arrays packed from offset 0 in declaration order: name -> (byte offset, n).

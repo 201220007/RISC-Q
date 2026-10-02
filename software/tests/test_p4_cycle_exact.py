@@ -2,7 +2,9 @@
 full-period sweep; after-stage r1 #1), on the bench's deterministic scheduling.
 
 `sim.lockstep(True)` keeps the bench from free-running between requests, so sim time moves only
-inside them and a run repeats cycle for cycle (`test_lockstep_repeats_a_run_cycle_for_cycle`).
+inside them and host accesses land on the cycles chosen; a run released at the same batch-time phase
+repeats cycle for cycle once the CPU's branch predictor has seen it
+(`test_lockstep_repeats_a_run_cycle_for_cycle`).
 `sim.sched` issues host accesses at absolute cycles. `Sched`, a driver wrapper, records the
 release cycle R of a run, arms DAC captures there and issues scheduled accesses at R + offset:
 traffic lands on the cycle chosen, in any run.
@@ -82,12 +84,18 @@ def k_probe(gate: ParamTable, demod: ParamTable, grp: Group, rq_epoch: int, rq_s
     rq_status[2] = e
 
 
+ALIGN = 1024     # every run is released at a batch time that is a multiple of this
+
+
 class Sched:
     """A driver wrapper for one cycle-exact run (lockstep on). At the release (HOST_RESET <- 0) it
-    arms `captures` [(dac, batches)], records the release cycle R and the batch time there, issues
-    the release, then the accesses `ops(R, run_id)` returns, at their absolute cycles. With `trace`
-    it records the start cycle of every later read32/write32 (zero sim time in lockstep). Every
-    other attribute forwards to the driver, its run session included."""
+    first advances to the next batch time that is a multiple of ALIGN: the SoC's own timing depends a
+    little on where a run falls in absolute time (the ADC and decoder alignment, carrier phases), and
+    runs released at different batch times can differ by a few cycles, so every run starts at the
+    same phase. Then it arms `captures` [(dac, batches)], records that release cycle R and the batch
+    time there, issues the release, then the accesses `ops(R, run_id)` returns, at their absolute
+    cycles. With `trace` it records the start cycle of every later read32/write32 (zero sim time in
+    lockstep). Every other attribute forwards to the driver, its run session included."""
 
     def __init__(self, drv, m, ops=None, captures=(), trace=False):
         self._drv, self._reset = drv, m.host_ctrl + m.HOST_RESET
@@ -102,8 +110,10 @@ class Sched:
     def write32(self, addr, value):
         if int(addr) == self._reset and not int(value) & 1 and self.R is None:
             sim = self._drv.sim
-            self.handles = [sim.dac_capture_arm(d, n) for d, n in self.captures]
             c, _, _, bt = sim.sched([(None, "advance", 0)])[0]
+            c, _, _, bt = sim.sched([(c + (-bt) % ALIGN, "advance", 0)])[0]
+            assert bt % ALIGN == 0, bt
+            self.handles = [sim.dac_capture_arm(d, n) for d, n in self.captures]
             self.R, self.bt_R = c, bt
             self._drv.write32(addr, value)
             if self.ops is not None:
@@ -196,15 +206,19 @@ def _request(kind, S_=None):
 
 # ── determinism ──
 
-@pytest.mark.batch_cap(40_000)
+@pytest.mark.batch_cap(50_000)
 def test_lockstep_repeats_a_run_cycle_for_cycle(probe):
-    """The same stoppable run twice under lockstep (P4's issuer at the same scheduled cycle): equal
-    StopRecords (v_pre, v_post, S, counts) and equal kernel timelines relative to the release.
+    """The same stoppable run, released at the same batch-time phase with P4's issuer at the same
+    scheduled cycle, repeats cycle for cycle under lockstep once the CPU's branch predictor has seen
+    it: after one warm-up run, three runs give equal StopRecords (v_pre, v_post, S, counts) and equal
+    kernel timelines relative to the release. (The GShare counters survive the core reset, so the
+    first run of a new branch pattern, here the check that starts to see the request, can take a few
+    cycles more; the M-tests measure within a run or against warmed references.)
 
-    FLOOR: the module's 2-core image load (~13 k batches) and two runs of ~4 k."""
+    FLOOR: four runs of ~5 k batches (12 shots at 256, the record read, the phase alignment)."""
     drv, m, progs = probe
     got = []
-    for _ in range(2):
+    for _ in range(4):
         w = Sched(drv, m)
 
         def policy(ctx, w=w, fired=[]):
@@ -216,8 +230,8 @@ def test_lockstep_repeats_a_run_cycle_for_cycle(probe):
         out, rec = _go(probe, w, stop=st.spec(policy, margin=2))
         times = [w.cycle(int(x)) - w.R for x in out[0]["rec"][:1 + 2 * rec.shots[0]]]
         got.append((rec.outcome, rec.shots, {k: rec.request[k] for k in ("v_pre", "v_post", "S", "verified")}, times))
-    assert got[0] == got[1], got
-    assert got[0][0] == S.FIRED
+    assert got[1] == got[2] == got[3], got[1:]
+    assert got[1][0] == S.FIRED
 
 
 # ── M1: stall cycles per host access type on port1 ──
@@ -284,7 +298,7 @@ def _m4_write_sweep(probe, S_, js, ref_top):
     return res
 
 
-@pytest.mark.batch_cap(150_000)
+@pytest.mark.batch_cap(185_000)
 def test_m4_an_epoch_write_against_the_check_load(probe):
     """M4 (write against load): core 0's rq_stop_epoch write swept cycle by cycle across its check of
     shot 6. Before some cycle it stops at 6 (it saw the request), from it on at 7 (the check read the
@@ -306,7 +320,7 @@ def test_m4_an_epoch_write_against_the_check_load(probe):
           f"its check misses; the same offset predicts shot 9")
 
 
-@pytest.mark.batch_cap(190_000)
+@pytest.mark.batch_cap(220_000)
 def test_m4_a_progress_read_against_the_count_store(probe):
     """M4 (read against store): a read of core 0's rq_status[0] swept cycle by cycle across its store
     of the count after shot 5's posts returns 5 (old) and then 6 (new), with one transition and no
@@ -460,7 +474,7 @@ def _at_pattern(m, progs, R, e, x):
     return ops + [(None, "read32", c0("rq_status"))]
 
 
-@pytest.mark.batch_cap(430_000)
+@pytest.mark.batch_cap(530_000)
 def test_m3_the_at_pattern_across_a_critical_window_is_bit_exact(probe):
     """M3: the 14-core AT pattern started at every cycle from 8 before the top of shot 6 to 8 after
     its posts on core 0, the span in which core 0 executes (the check and the posts) and a stolen
@@ -564,7 +578,7 @@ def _harmless_pattern(m, progs, R, x):
     return ops + [(None, "read32", magic)]
 
 
-@pytest.mark.batch_cap(460_000)
+@pytest.mark.batch_cap(530_000)
 def test_m2_m3_k_batched_drives_under_host_traffic(cosim):
     """M2 and M3 on k_batched (plan P4 v2 §6), the calibration kernel P4 keeps non-stoppable (Q3):
     how much host traffic its drive fire takes, heralded (the drive is posted when the herald read

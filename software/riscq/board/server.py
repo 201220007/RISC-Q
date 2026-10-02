@@ -33,6 +33,19 @@ def _locked(fn):
     return wrapper
 
 
+def _wire_errors(fn):
+    """qubic3 S0: see riscq.sim.bench._wire_errors (Pyro carries builtin exception classes only)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if type(e).__module__ == "builtins":
+                raise
+            raise RuntimeError(f"{type(e).__name__}: {e}") from None
+    return wrapper
+
+
 @Pyro5.api.expose
 class BoardServer:
     """One Pyro5 object; serpent on the wire (Pyro5 default), LAN-trust security model.
@@ -111,6 +124,7 @@ class BoardServer:
     # ── server-side batch runner: the SAME riscq.run functions next to the MMIO window, one RPC
     # per batch (spec 08 §5). poll_done takes its hardware branch (no `.sim` here). ──
 
+    @_wire_errors
     @_locked
     def remote_setup(self, params_json, progmap):
         from riscq import run as _run
@@ -126,6 +140,7 @@ class BoardServer:
         _run.setup(self._driver(), self._m, self._progs)
         return None
 
+    @_wire_errors
     @_locked
     def remote_rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None):
         """qubic3 S0: `identities` are the client's setup identities, checked by the loaded-set
@@ -136,6 +151,8 @@ class BoardServer:
             raise RuntimeError("remote_rerun before remote_setup on this bundle")
         progs = {int(c): self._progs[int(c)] for c in cores}
         up = None if uplink is None else _run.UplinkRun.from_wire(dict(uplink))
+        if up is not None:
+            up.remote_reply = True                      # the IQ goes back over serpent: the preflight counts it
         out = _run.rerun(self._driver(), self._m, progs,
                          params={int(c): v for c, v in dict(params).items()},
                          arrays={int(c): v for c, v in dict(arrays).items()},
@@ -146,6 +163,7 @@ class BoardServer:
         return {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()}
                 for c, d in out.items()}
 
+    @_wire_errors
     @_locked
     def remote_recover(self):
         from riscq import run as _run

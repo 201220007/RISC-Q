@@ -4,7 +4,12 @@
 the reading core's ro/demod slots and the `MeasInfo` the sequence header needs (base.readout_tables
 is the source of every code); `decode()` turns a core's `out` into the population / IQ array the
 analyses consume, res-sign and herald pairs folded (base.population*). A `levels` measure
-captures in the classifier's zero frame — the invariant the six old call sites restated."""
+captures in the classifier's zero frame — the invariant the six old call sites restated.
+
+`host=True` means off-core capture (qubic3 P6, plan P6 v2 §4.1): the HostWindow on a hostwindow
+build, the readout uplink on an antq_uplink build (`backend`). The uplink records one decoder
+result per demod window, so it carries RAW and levels IQ as 28-bit fields (multiples of 16 counts);
+COUNTS, IQSUM and `host=False` keep their results in core RAM on both builds."""
 
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from riscq.cal import base
-from riscq.cal.batched import COUNTS, IQSUM, RAW
+from riscq.cal.batched import COUNTS, IQSUM, RAW, UPLINK
 from riscq.cal.sequence import Meas, MeasInfo
 
 
@@ -26,7 +31,7 @@ class Measure:
     classifiers: dict | None = None
     level: int = 2
     sh: int = 0
-    host: bool = False             # put `out` in the host window (spec 22) — big raw captures
+    host: bool = False             # off-core capture: the host window (spec 22) or the antq uplink
     meas: Meas = Meas()
     reads: tuple = ()              # the qubits that read out (default: the key itself); a pair
     #                                experiment reads both members, each on its own core
@@ -51,6 +56,30 @@ class Measure:
     @property
     def kernel_mode(self) -> int:
         return {"counts": COUNTS, "raw": RAW, "levels": RAW, "iqsum": IQSUM}[self.mode]
+
+    def backend(self, m) -> str:
+        """Where this measure's results go on the build `m` (P6 v2 §4.1): "ram" for `host=False`;
+        for `host=True`, "hostwindow" on a hostwindow build and "uplink" on an antq_uplink build. The
+        uplink carries one decoder result per demod window, so only RAW and levels IQ can take it."""
+        if not self.host:
+            return "ram"
+        if m.params.with_host_window:
+            return "hostwindow"
+        if m.params.with_antq_uplink:
+            if self.mode in ("raw", "levels"):
+                return "uplink"
+            raise ValueError(f"Measure.{self.mode}(host=True) on {m.params.name}: the uplink carries one "
+                             f"decoder result per shot, not {self.mode} aggregates; use host=False")
+        raise ValueError(f"Measure(host=True) needs an off-core capture path, but {m.params.name} has "
+                         f"results_path={m.params.results_path!r}, with neither the HostWindow nor the uplink")
+
+    def kernel_mode_for(self, m) -> int:
+        return UPLINK if self.backend(m) == "uplink" else self.kernel_mode
+
+    def out_size_for(self, m, npts: int, shots: int) -> int:
+        """The result words `k_batched` stores in `out` on the build `m` (the completion marker, when
+        the build has one, comes after them): 0 for the uplink, else `out_size`."""
+        return 0 if self.backend(m) == "uplink" else self.out_size(npts, shots)
 
     def out_size(self, npts: int, shots: int) -> int:
         if self.mode == "counts":

@@ -37,13 +37,30 @@ class DdrBoard:
     PynqDriver's convention). Pass `None` to use this object only for the uplink windows.
     """
 
-    def __init__(self, soc=None, m: DdrMap | None = None, cma_bytes: int = 8 << 20):
+    def __init__(self, soc=None, m: DdrMap | None = None, cma_bytes: int = 8 << 20, buffer=None):
+        """`buffer` (qubic3 P6, plan P6 v2 §4.5): a DMA buffer owned by the caller (the G6' kit's
+        owner allocates one before it forks). It is FIXED: never reallocated, never freed here, and
+        `max_transfer()` returns its size, so the drain chunks to it."""
         self.soc = soc
         self.map = m or DdrMap()
         self._cma_bytes = cma_bytes
-        self._buf = None
+        self._buf = buffer
+        self._fixed = buffer is not None
         self._active = None      # (buffer, nbytes) while a transfer is in flight, else None
         self._mmio = {}
+
+    def fix_buffer(self):
+        """Mark the held buffer fixed (see `buffer=`): `_cma` then raises, before any MMIO, for a
+        transfer larger than it instead of reallocating."""
+        if self._buf is None:
+            raise RuntimeError("fix_buffer(): no buffer is held yet")
+        self._fixed = True
+
+    def max_transfer(self) -> int:
+        """The largest single S2MM transfer this driver takes: the fixed buffer's size, else the
+        32 MiB of the DMA's length register (`riscq.ddr.MAX_RD_SIZE`)."""
+        from riscq.ddr import MAX_RD_SIZE
+        return min(int(self._buf.nbytes), MAX_RD_SIZE) if self._fixed else MAX_RD_SIZE
 
     # ── lazily-imported pynq objects ───────────────────────────────────────────────────
     def _win(self, base, size):
@@ -120,6 +137,11 @@ class DdrBoard:
         numpy2_pynq_shim()
 
     def _cma(self, nbytes):
+        if self._fixed:
+            if nbytes > self._buf.nbytes:
+                raise RuntimeError("a %d B transfer exceeds the fixed %d B DMA buffer (it is never "
+                                   "reallocated): drain in chunks of max_transfer()" % (nbytes, self._buf.nbytes))
+            return self._buf
         import pynq
         self._numpy2_pynq_shim()
         if self._buf is None or self._buf.nbytes < nbytes:
@@ -147,6 +169,13 @@ class DdrBoard:
                                    "(DMACR=0x%08x)" % dma.read(self.S2MM_DMACR))
             time.sleep(0.001)
         self._active = None
+
+    def dma_idle(self) -> bool:
+        """qubic3 S0 quiesce: no transfer armed here, and the S2MM channel halted or idle."""
+        if self._active is not None:
+            return False
+        sr = self._dma_win().read(self.S2MM_DMASR)
+        return bool(sr & (self.DMASR_HALTED | self.DMASR_IDLE))
 
     def dma_recv_prepare(self, nbytes):
         """Arm an S2MM transfer of `nbytes`. Returns the buffer to hand back to `dma_recv_wait`.
@@ -280,6 +309,6 @@ class DdrBoard:
                               "-- a live DMA writing freed pages would corrupt unrelated memory")
                 return
         self._active = None
-        if self._buf is not None:
+        if self._buf is not None and not self._fixed:      # a fixed buffer belongs to its owner
             self._buf.freebuffer()
             self._buf = None

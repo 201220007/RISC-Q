@@ -373,13 +373,16 @@ class UplinkRun:
     flush_timeout: float = 5.0
     settle_s: float = 200e-6
     sim_settle: int = SIM_SETTLE_BATCHES
+    mem_budget: int | None = None        # the preflight's PS-memory budget (None: half of MemAvailable)
+    remote_reply: bool = False           # set server-side: the result goes back over Pyro (preflight)
 
     def to_wire(self) -> dict:
         nominal = None if self.nominal is None else {int(c): int(n) for c, n in self.nominal.items()}
         return {"expected": {int(c): int(n) for c, n in self.expected.items()}, "base": int(self.base),
                 "nominal": nominal, "prepare_timeout": float(self.prepare_timeout),
                 "flush_timeout": float(self.flush_timeout), "settle_s": float(self.settle_s),
-                "sim_settle": int(self.sim_settle)}
+                "sim_settle": int(self.sim_settle),
+                "mem_budget": None if self.mem_budget is None else int(self.mem_budget)}
 
     @classmethod
     def from_wire(cls, w: dict, readout=None) -> "UplinkRun":
@@ -390,7 +393,8 @@ class UplinkRun:
                    readout=readout, prepare_timeout=float(w.get("prepare_timeout", 1.0)),
                    flush_timeout=float(w.get("flush_timeout", 5.0)),
                    settle_s=float(w.get("settle_s", 200e-6)),
-                   sim_settle=int(w.get("sim_settle", SIM_SETTLE_BATCHES)))
+                   sim_settle=int(w.get("sim_settle", SIM_SETTLE_BATCHES)),
+                   mem_budget=None if w.get("mem_budget") is None else int(w["mem_budget"]))
 
 
 def rerun(drv, m: SocMap, progs: dict[int, Program],
@@ -461,6 +465,12 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                 quiesce(drv, m, rd=rd, certify=True)
                 if len(s.flushes) > n_flush:
                     run.flushed = s.flushes[-1][0]
+                run.stage = "PREFLIGHT"
+                from riscq.ddr import preflight
+                nominal = uplink.expected if uplink.nominal is None else uplink.nominal
+                span = {int(c): max(int(n), int(nominal.get(c, 0))) for c, n in uplink.expected.items()}
+                run.preflight = preflight(span, uplink.base, rd.bank_bytes, rd.chunk_bytes(),
+                                          remote_reply=uplink.remote_reply, budget=uplink.mem_budget)
             elif s.pending_flush is not None and s.pending_flush.reason == FLUSH_FAILED:
                 run.stage = "FLUSH_HW"
                 _flush_or_poison(drv, m, s)
@@ -498,7 +508,7 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                                  else read_array(drv, m, core, prog, name))
                           for name in (list(prog.arrays) if results is None else results)}
                    for core, prog in progs.items()}
-            run.proven = _check_markers(drv, m, progs)
+            run.proven = _check_markers(drv, m, progs, out)
             if uplink is not None:
                 run.stage = "FLUSH"
                 st = rd.flush(timeout=uplink.flush_timeout)
@@ -546,13 +556,17 @@ def _marker_addr(m: SocMap, core: int, prog: Program) -> int:
     return m.to_host_addr(core, prog.var_addr(name) + 4 * index)
 
 
-def _check_markers(drv, m: SocMap, progs: dict[int, Program]) -> bool:
-    """After DONE, with the reset held: every marker must read MARKER_DONE (P6 v2 §4.2). Returns
-    whether the run is queue-proven, i.e. every programmed core carries a marker."""
+def _check_markers(drv, m: SocMap, progs: dict[int, Program], out: dict | None = None) -> bool:
+    """After DONE, with the reset held: every marker must read MARKER_DONE (P6 v2 §4.2), taken from
+    the results already read when they hold the marker's array, else read. Returns whether the run
+    is queue-proven, i.e. every programmed core carries a marker."""
     bad = {}
     for core, prog in progs.items():
         if prog.marker is not None:
-            v = drv.read32(_marker_addr(m, core, prog))
+            name, index = prog.marker
+            got = (out or {}).get(core, {}).get(name)
+            v = int(got[index]) & 0xFFFF_FFFF if got is not None and name not in prog.host_arrays \
+                else drv.read32(_marker_addr(m, core, prog))
             if v != MARKER_DONE:
                 bad[core] = v
     if bad:

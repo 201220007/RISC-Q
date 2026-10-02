@@ -64,6 +64,20 @@ def raw_iq(z) -> np.ndarray:
     return np.stack([z.real, z.imag], axis=1).reshape(-1).astype(np.int64)
 
 
+def uplink_iq(core: int, iq) -> np.ndarray:
+    """RAW `out` values as they come back through the antq uplink (qubic3 P6): packed into the
+    uplink's words `[tag8, real[31:4], imag[31:4]]`, then decoded by `riscq.ddr.parse_words` and
+    interleaved [re0, im0, re1, im1, ...]."""
+    from riscq.ddr import parse_words
+    v = np.asarray(iq, dtype=np.int64).reshape(-1, 2) & 0xFFFF_FFFF
+    words = (np.uint64(core) << np.uint64(56)) | ((v[:, 0] >> 4).astype(np.uint64) << np.uint64(28)) \
+        | (v[:, 1] >> 4).astype(np.uint64)
+    _, re, im = parse_words(words)
+    out = np.empty(2 * len(re), dtype=np.int32)
+    out[0::2], out[1::2] = re, im
+    return out
+
+
 def iq_sum(z, shots: int, sh: int) -> np.ndarray:
     """IQSUM mode: one (Σreal, Σimag) pair per point — `shots` identical integrals, each shifted
     right by `sh` before it is accumulated, exactly as k_vna's `out[2i] += read_real() >> sh`
@@ -133,6 +147,7 @@ class Responder:
         self.drv = _Drv(params_json)
         self.setups: list[dict] = []       # every `setup`: {core: Program}
         self.reruns: list[tuple] = []      # every `rerun`: (progs, params)
+        self.uplinks: list = []            # every `rerun`'s `uplink=` (None without; qubic3 P6)
         self.slot_writes: list[tuple] = []  # every `write_slot`: (core, table, slot, field, value)
         self._answer = None
         for name, fn in (("setup", self._setup), ("rerun", self._rerun),
@@ -149,9 +164,11 @@ class Responder:
     def _setup(self, drv, m, progs):
         self.setups.append(dict(progs))
 
-    def _rerun(self, drv, m, progs, params=None, arrays=None, results=None, timeout=0):
+    def _rerun(self, drv, m, progs, params=None, arrays=None, results=None, timeout=0, uplink=None,
+               stop=None, identities=None):
         params = dict(params or {})
         self.reruns.append((dict(progs), params))
+        self.uplinks.append(uplink)
         if self._answer is None:
             raise AssertionError("Responder has no answer function — call responder.answer(fn)")
         out = self._answer(progs, params)
@@ -159,7 +176,20 @@ class Responder:
         if missing:
             raise AssertionError(f"answer returned no data for core(s) {sorted(missing)}; "
                                  f"a cal reads every core it programmed")
-        return {core: {k: np.asarray(v) for k, v in d.items()} for core, d in out.items()}
+        res = {core: {k: np.asarray(v) for k, v in d.items()} for core, d in out.items()}
+        if uplink is not None:
+            # qubic3 P6: an UPLINK reader's answer is what its RAW `out` would hold; the run layer would
+            # return it as `__uplink`, decoded by riscq.ddr.parse_words from the 64-bit words the uplink
+            # writes, i.e. truncated to the 28-bit fields
+            for core, n in uplink.expected.items():
+                if n:
+                    iq = np.asarray(res[core].pop("out"), dtype=np.int64)
+                    if len(iq) != 2 * n:
+                        raise AssertionError(f"core {core}: the answer has {len(iq)} IQ values, the run "
+                                             f"expects {n} uplink words")
+                    res[core]["__uplink"] = uplink_iq(core, iq)
+                    res[core]["out"] = np.array([1])
+        return res
 
     def _run(self, drv, m, progs, params=None, arrays=None, results=None, timeout=0):
         self._setup(drv, m, progs)

@@ -459,15 +459,29 @@ class DdrReadout:
                 out[core] = (real[sel], imag[sel])
         return out
 
+    def chunk_bytes(self):
+        """The drain chunk (qubic3 P6, plan P6 v2 §4.5): MAX_RD_SIZE (the DMA's 26-bit length
+        register), or less when the driver's buffer is smaller (`drv.max_transfer()`, e.g. a fixed,
+        externally owned buffer). Whole beats."""
+        c = MAX_RD_SIZE
+        cap = getattr(self.drv, "max_transfer", None)
+        if cap is not None:
+            c = min(c, int(cap()))
+        c -= c % BEAT_BYTES
+        if c <= 0:
+            raise ValueError("the driver's max_transfer() is below one %d-B beat" % BEAT_BYTES)
+        return c
+
     def _read_ddr(self, base, nbytes):
-        """Pull `nbytes` from DDR through mmu2 + the DMA, in <= 32 MiB chunks (the DMA's simple-mode
-        length register is 26 bits). Completion is the DMA's, never `rd_done`."""
+        """Pull `nbytes` from DDR through mmu2 + the DMA, in chunks of `chunk_bytes()` (<= 32 MiB, the
+        DMA's simple-mode length register is 26 bits). Completion is the DMA's, never `rd_done`."""
         if base % RD_BASE_ALIGN or nbytes % BEAT_BYTES:
             raise ValueError("drain base/size must be %d-B aligned: 0x%x/%d"
                              % (RD_BASE_ALIGN, base, nbytes))
+        chunk = self.chunk_bytes()
         chunks, off = [], 0
         while off < nbytes:
-            n = min(nbytes - off, MAX_RD_SIZE)
+            n = min(nbytes - off, chunk)
             self._wr(RD_BASE, base + off)
             self._wr(RD_SIZE, n)
             buf = self.drv.dma_recv_prepare(n)
@@ -531,3 +545,51 @@ def readout_for(drv, m):
     else:
         return None
     return attach_readout(drv, DdrReadout(port, soc_map=m))
+
+
+def _mem_available():
+    """MemAvailable of the executing side, in bytes (Linux), or None."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def preflight(expected, base, bank_bytes, chunk, remote_reply=False, budget=None, mem_available=None):
+    """The many-shot preflight (qubic3 P6, plan P6 v2 §4.5), host-side arithmetic run before
+    `prepare` so a refusal costs no hardware state. W = Σ expected words; the footprint F =
+    bank·⌈8W/bank⌉ (`max_bytes`) must fit the ring from a `WR_BASE_ALIGN`-aligned `base`; the drain
+    reads F_read = 32·⌈8W/32⌉ in K = ⌈F_read/chunk⌉ chunks; the PS memory the drain needs is modelled
+    on today's code as 2·F_read (the chunk list and its join) + 32W (the parse_words temporaries and
+    outputs, about 3·8W, and the interleaved result, 8W), plus, when the result is sent back over
+    Pyro (`remote_reply`), its serpent encoding (4/3 of 8W) and a copy (8W). The model must stay
+    below `budget`, by default half of MemAvailable (`mem_available` overrides the reading). Returns
+    the numbers; raises `riscq.session.PreflightRefused` listing every violation."""
+    from riscq.session import PreflightRefused
+    w = sum(int(n) for n in expected.values())
+    fp = -(-w * WORD_BYTES // bank_bytes) * bank_bytes
+    f_read = -(-w * WORD_BYTES // BEAT_BYTES) * BEAT_BYTES
+    k = -(-f_read // chunk)
+    peak = 2 * f_read + 32 * w
+    if remote_reply:
+        peak += (4 * 8 * w) // 3 + 8 * w
+    if budget is None:
+        avail = _mem_available() if mem_available is None else int(mem_available)
+        budget = None if avail is None else avail // 2
+    out = {"words": w, "footprint": fp, "read_bytes": f_read, "chunk": chunk, "chunks": k,
+           "peak_bytes": peak, "budget": budget}
+    bad = []
+    if base % WR_BASE_ALIGN or base < 0:
+        bad.append("base 0x%x is not %d-B aligned" % (base, WR_BASE_ALIGN))
+    if base + fp > RING_LIMIT:
+        bad.append("the run's %d B footprint from base 0x%x ends at 0x%x, past the ring limit 0x%x"
+                   % (fp, base, base + fp, RING_LIMIT))
+    if budget is not None and peak > budget:
+        bad.append("the drain needs about %d B of PS memory (%d chunk(s) of %d B), over the %d B budget"
+                   % (peak, k, chunk, budget))
+    if bad:
+        raise PreflightRefused("preflight refused the rerun before any hardware access: " + "; ".join(bad))
+    return out

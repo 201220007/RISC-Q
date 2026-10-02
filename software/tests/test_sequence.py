@@ -190,7 +190,7 @@ def test_header_compiles_with_k_batched(socmap):
     from riscq.lang import Group
     prog = compile_kernel(k_batched, m, core=0, grp=Group([0]), tables=comp.tables.for_core(0),
                           include=[("seq_core0.h", hdr)], out=Array(5), npts=5, shots=2,
-                          period=400, mode=COUNTS, herald=0, hoff=0, sh=0)
+                          period=400, mode=COUNTS, herald=0, hoff=0, sh=0, fin=0, tend=0, nout=0)
     assert set(prog.tables) == {"tbl_gate", "tbl_ro", "tbl_demod"}
     assert '#include "seq_core0.h"' in prog.c_source
     assert set(prog.params) == {"x0", "dx0", "x1", "dx1", "r0", "r1", "r2", "r3"}

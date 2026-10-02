@@ -230,6 +230,22 @@ class Config:
     def to_dict(self) -> dict:
         return copy.deepcopy(self._data)
 
+    def rf_silent(self) -> "Config":
+        """A copy for an RF-silent board session (qubic3 P6, plan P6 v2 §8): every gate and readout
+        drive amplitude 0 and every DC offset 0; the demod (no DAC) keeps its amplitude, so the
+        decoder still integrates. Sweeps that write an amplitude at run time are not covered: an
+        RF-silent session runs only cals without one (`Experiment(rf_silent=True)` refuses them)."""
+        dup = self.copy()
+
+        def zero(node, under_demod):
+            for k, v in node.items():
+                if isinstance(v, dict):
+                    zero(v, under_demod or k == "demod")
+                elif not under_demod and (k == "amp" or k in ("dc", "dc_offset")):
+                    node[k] = 0.0
+        zero(dup._data, False)
+        return dup
+
     @staticmethod
     def _keys(path) -> list[str]:
         keys = [k for k in str(path).split("/") if k != ""]

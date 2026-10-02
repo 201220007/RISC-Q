@@ -2,7 +2,13 @@
 `npts × shots` readouts and calls the generated sequence header (`seq_init / seq_point /
 seq_shot / seq_meas / meas_tail`, riscq.cal.sequence) for every pulse. Two on-core affine axes
 (`a`, `b`, from the runtime pairs x0/dx0, x1/dx1), four runtime params (`r0..r3`), and the
-compile-time `mode` / `herald` folds the 14 retired per-experiment kernels carried."""
+compile-time `mode` / `herald` folds the 14 retired per-experiment kernels carried.
+
+qubic3 P6 (plan P6 v2 §4.2): mode UPLINK is RAW's shot path without its stores (on an antq_uplink
+build the IQ leaves through the readout uplink), and the compile-time `fin` adds the completion
+epilogue: after the last shot, wait until its last pulse has ended (`tend` batches after its t_ro,
+LEAD included) and store the marker `out[nout] = 1`. `fin` is 1 on every core of every Experiment
+on an antq_uplink build and 0 on hostwindow builds, where it folds away with the UPLINK branch."""
 
 from riscq.lang import Array, Group, kernel
 
@@ -10,12 +16,13 @@ COUNTS = 0
 RAW = 1
 IQSUM = 2
 NONE = 3        # a core that only carries lines: no readout, no result
+UPLINK = 4      # RAW's shot path, no stores: the IQ leaves through the antq uplink (qubic3 P6)
 
 
 @kernel
 def k_batched(grp: Group, out: Array, npts: int, shots: int, period: int, mode: int, herald: int,
               hoff: int, sh: int, x0: int, dx0: int, x1: int, dx1: int, r0: int, r1: int, r2: int,
-              r3: int):
+              r3: int, fin: int, tend: int, nout: int):
     """One batched sweep: `npts` points × `shots` shots on a `period` grid whose idle head is the
     relax reset (spec 08 §2.2). COUNTS accumulates the hardware res bit per point (heralded:
     interleaved (count, kept) pairs); RAW writes per-shot IQ through a cursor; IQSUM sums the
@@ -69,6 +76,11 @@ def k_batched(grp: Group, out: Array, npts: int, shots: int, period: int, mode: 
                     read_res()  # noqa: F821
                     out[2 * i] += read_real() >> sh  # noqa: F821
                     out[2 * i + 1] += read_imag() >> sh  # noqa: F821
+                elif mode == UPLINK:
+                    read_res()  # noqa: F821   (RAW's timing: the result settles before the next shot)
             t_ro = t_ro + period  # noqa: F821
         a = a + dx0
         b = b + dx1
+    if fin == 1:
+        wait_until(t_ro - period + tend)  # noqa: F821   (the last shot's pulses have ended)
+        out[nout] = 1

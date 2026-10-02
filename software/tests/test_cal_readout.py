@@ -327,7 +327,7 @@ def _qutrit(m):
 # matrix ARITHMETIC — the row-stochastic shape and the `rcorr` inverse — is the host-pure half above.
 
 @pytest.mark.cosim
-@pytest.mark.hostwindow          # riscq.cal.batched keeps its shots in a host=True window array
+@pytest.mark.batch_cap(60_000)
 def test_ge_preps_reach_levels_0_and_1(cosim):
     """L2 (spec 14 F2) — the |0> and |1> rows of the 3-level confusion come from ONE image whose
     `prep` runtime param picks idle or the GE π (`ReadoutCalibration`'s own `Cond(prep, X90·X90)`
@@ -339,7 +339,11 @@ def test_ge_preps_reach_levels_0_and_1(cosim):
     elsewhere. Nothing is fitted and nothing is sampled — |2> is invisible to the `res` bit, so the
     populations come off `model_state()`, one noiseless shot per prep (the Experiment's
     `before`/`after` hooks re-plant the model per rerun, so each point starts from |0> in zero
-    simulated cycles)."""
+    simulated cycles).
+
+    qubic3 P6 (C1 of plan P6 v2 §7): no longer HostWindow-only. Under --results-path antq_uplink the
+    RAW `out` is captured by the readout uplink instead (`Measure(host=True)` on an antq build).
+    FLOOR there: an image load (~7 k) and two uplink reruns at about 16 k batches each in co-sim."""
     drv, m = cosim
     q = 0
     cal = ReadoutCalibration(_cfg3(m, q), q, shots=1)
@@ -355,7 +359,7 @@ def test_ge_preps_reach_levels_0_and_1(cosim):
 
 
 @pytest.mark.cosim
-@pytest.mark.hostwindow          # riscq.cal.batched keeps its shots in a host=True window array
+@pytest.mark.batch_cap(40_000)
 def test_ef_prep_reaches_level_2(cosim):
     """L2 (spec 14 F2) — the |2> row's prep: a GE π followed by an EF π at the config's EF X
     amplitude, on its own image with the carrier retuned mid-shot. It is the sequence
@@ -364,7 +368,10 @@ def test_ef_prep_reaches_level_2(cosim):
     Both rates are planted exact (GE: the two-X90 prep is a π in {|0>, |1>}; EF: the EF X is a π in
     {|1>, |2>}), so the analytic target is a clean |2> — which also makes it the sharpest available
     statement about the mid-shot GE→EF retune: any slip in WHEN the new carrier takes effect leaves
-    population behind in |1>."""
+    population behind in |1>.
+
+    qubic3 P6 (C1): under --results-path antq_uplink the shot leaves through the uplink. FLOOR there:
+    an image load (~7 k) and one uplink rerun (~16 k batches in co-sim)."""
     drv, m = cosim
     q = 0
     ef = [Gate("x90"), Gate("x90"), Gate("EF/x")]        # ReadoutFidelity._run_3level's |2> prep

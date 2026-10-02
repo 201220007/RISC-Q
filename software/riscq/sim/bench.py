@@ -238,6 +238,44 @@ async def _capture_run(dut, m: SocMap, mirror: TimeMirror, cap: DacCapture) -> N
         cap.done = True
 
 
+class DacWatch:
+    """qubic3 P6: a test observation of whole DAC outputs over a run of unknown length. Per DAC: the
+    batches watched, the peak |sample|, the first and last batch stamp with a nonzero sample, and
+    the stamp where the last nonzero stretch began (the start of the last pulse)."""
+
+    def __init__(self, dac_ids):
+        self.dac_ids = list(dac_ids)
+        self.stats = {d: {"batches": 0, "peak": 0, "first": None, "last": None, "last_rise": None}
+                      for d in self.dac_ids}
+        self.stop = False
+        self.done = False
+
+
+async def _watch_run(dut, st: "_BenchState", w: DacWatch) -> None:
+    prev = {d: False for d in w.dac_ids}
+    try:
+        while not w.stop:
+            await FallingEdge(dut.dspClk)
+            if st.mirror.origin_cycle is None:
+                continue
+            t = st.mirror.time_of_cycle(_cycle())
+            for d in w.dac_ids:
+                lanes = _read_dac(dut, d)
+                peak = int(np.abs(lanes).max())
+                rec = w.stats[d]
+                rec["batches"] += 1
+                if peak:
+                    stamp = t - st.m.dac_pipe(d)
+                    rec["peak"] = max(rec["peak"], peak)
+                    rec["first"] = stamp if rec["first"] is None else rec["first"]
+                    rec["last"] = stamp
+                    if not prev[d]:
+                        rec["last_rise"] = stamp
+                prev[d] = bool(peak)
+    finally:
+        w.done = True
+
+
 def _read_dac(dut, dac_id: int) -> np.ndarray:
     """The current io_dac_<id> payload as BATCH_SIZE signed int16 lanes (lane k = bits [16k+15:16k])."""
     raw = int(getattr(dut, f"io_dac_{dac_id}_payload").value)
@@ -546,6 +584,23 @@ class _Req:
         self.error: Exception | None = None
 
 
+def _wire_errors(fn):
+    """qubic3 S0: a server-side runner's exception crosses Pyro only if its class is a builtin; any
+    other (DdrUplinkError, SessionPoisoned, ...) is re-raised as RuntimeError naming it, so the client
+    sees what failed instead of a deserialisation error."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if type(e).__module__ == "builtins":
+                raise
+            raise RuntimeError(f"{type(e).__name__}: {e}") from None
+    return wrapper
+
+
 @Pyro5.api.expose
 class DriverServer:
     """Pyro5 face of the bench: marshals every call onto the request queue the cocotb
@@ -606,6 +661,12 @@ class DriverServer:
     def dac_capture_get(self, handle):
         return self._submit("dac_get", int(handle))
 
+    def dac_watch_start(self, dac_ids):
+        return self._submit("watch_start", [int(d) for d in dac_ids])
+
+    def dac_watch_stop(self, handle):
+        return self._submit("watch_stop", int(handle))
+
     def dio_capture_arm(self, name, n_batches, start_batch=None):
         return self._submit("dio_arm", str(name), int(n_batches),
                             None if start_batch is None else int(start_batch))
@@ -658,6 +719,7 @@ class DriverServer:
     # go straight onto the request queue (self._submit — no network hop); `self.sim = self` gives
     # run.poll_done its `.sim.poll_word`, and DriverServer has no `.remote` attr so run.setup/rerun
     # take their LOCAL per-op path here.
+    @_wire_errors
     def remote_setup(self, params_json, progmap):
         from riscq import run as _run
         from riscq.map import SocMap, SocParams
@@ -666,10 +728,13 @@ class DriverServer:
         _run.setup(self, self._m, self._progs)
         return None
 
+    @_wire_errors
     def remote_rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None):
         from riscq import run as _run
         progs = {int(c): self._progs[int(c)] for c in cores}
         up = None if uplink is None else _run.UplinkRun.from_wire(dict(uplink))
+        if up is not None:
+            up.remote_reply = True
         out = _run.rerun(self, self._m, progs,
                          params={int(c): v for c, v in dict(params).items()},
                          arrays={int(c): v for c, v in dict(arrays).items()},
@@ -688,6 +753,7 @@ class DriverServer:
         r = _run.current_run(self)
         return None if r is None else list(r)
 
+    @_wire_errors
     def remote_recover(self):
         from riscq import run as _run
         return _run.recover(self, self._m or SocMap(SocParams.from_json(self._params)))
@@ -764,6 +830,22 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
         data = b"".join(v.to_bytes(lane_bytes, "little") for v in cap.vals)
         del st.captures[args[0]]
         return t0, cap.n_batches, data
+    if op == "watch_start":
+        for d in args[0]:
+            if not hasattr(dut, f"io_dac_{d}_payload"):
+                raise ValueError(f"no such DAC port: io_dac_{d}_payload")
+        w = DacWatch(args[0])
+        handle = st.new_capture(w)
+        cocotb.start_soon(_watch_run(dut, st, w))
+        return handle
+    if op == "watch_stop":
+        w = st.captures.pop(args[0], None)
+        if not isinstance(w, DacWatch):
+            raise ValueError(f"unknown watch handle {args[0]}")
+        w.stop = True
+        while not w.done:
+            await ClockCycles(dut.dspClk, 1)
+        return {str(d): rec for d, rec in w.stats.items()}
     if op == "dio_arm":
         name, n_batches, start_batch = args
         sig = f"io_dio_{name}_out"

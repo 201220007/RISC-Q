@@ -180,13 +180,16 @@ def _ro_cfg(m, qubits, code, x90_amp=0.5):
 
 
 @pytest.mark.cosim
-@pytest.mark.batch_cap(40_000)
+@pytest.mark.batch_cap(48_000)
 def test_cross_core_shot_alignment(cosim_2q1c):
     """L2 — ONE run drives TWO cores, and each core's own qubit responds to its OWN gate DAC and is
     read back out of the SHARED, frequency-multiplexed readout.
 
     FLOOR: ~22 k = 2 core images (~10 k each over AXI) + 2 reruns. A cross-core claim needs one
-    image per core by definition; the module docstring's table has the full accounting.
+    image per core by definition; the module docstring's table has the full accounting. Under
+    --results-path antq_uplink (qubic3 S0/P6) each setup adds the run layer's quiesce reads (about
+    3 k co-sim batches) and each rerun the completion marker's write per core and the epilogue's wait
+    (36 k before S0, 41 k with both).
 
     Two production raw-capture images (one per core, through `Experiment`) are loaded once and run
     together under the SAME `prep = 1`. The two models are planted with DIFFERENT rates — `rabi_for` π/2 per X90 on

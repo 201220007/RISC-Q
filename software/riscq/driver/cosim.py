@@ -73,6 +73,15 @@ class _SimExtras:
         samples = np.frombuffer(_to_bytes(data), dtype="<i2").reshape(int(n), 16).copy()
         return int(t0), samples
 
+    def dac_watch_start(self, dac_ids) -> int:
+        """Start watching whole DAC outputs (qubic3 P6, a test observation): every batch from now
+        until `dac_watch_stop`, which returns {dac: {batches, peak, first, last, last_rise}} with the
+        batch stamps of the first and last nonzero sample and of the start of the last pulse."""
+        return int(self._proxy.dac_watch_start([int(d) for d in dac_ids]))
+
+    def dac_watch_stop(self, handle: int) -> dict:
+        return {int(d): dict(rec) for d, rec in dict(self._proxy.dac_watch_stop(int(handle))).items()}
+
     def dio_capture_arm(self, name: str, n_batches: int, start_batch: int | None = None) -> int:
         """ARM a timed-DIO capture of the board port `io_dio_<name>_out` (`<core>_<channel>`), like
         dac_capture_arm; the stamps have DIO_PIPE modelled out, so an entry scheduled at batch t
@@ -151,11 +160,15 @@ class CosimDdr:
     axi_dma it completes on TLAST; a short or missing packet raises, as `DdrBoard` does."""
 
     def __init__(self, drv: "CosimDriver", ddr_map=None, timeout_cycles: int = 2_000_000):
-        from riscq.ddr import DdrMap
+        from riscq.ddr import MAX_RD_SIZE, DdrMap
         self.drv = drv
         self.map = ddr_map or DdrMap()
         self.timeout_cycles = timeout_cycles
         self._armed = None
+        self.max_bytes = MAX_RD_SIZE     # the S2MM stand-in's buffer; a test lowers it to force chunks
+
+    def max_transfer(self) -> int:
+        return int(self.max_bytes)
 
     def _ctrl(self, addr: int):
         if self.map.ctrl_base <= addr < self.map.ctrl_base + self.map.ctrl_size:

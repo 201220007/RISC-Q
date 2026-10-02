@@ -120,6 +120,7 @@ class RunRecord:
     mailbox: "StopMailbox | None" = None
     wrote: bool = False           # the run wrote to the hardware (its params): a failure then needs the flush
     policy_error: bool = False    # the stop policy raised
+    preflight: dict | None = None # the many-shot preflight's numbers (P6 v2 §4.5)
 
     def to(self, state: str) -> None:
         self.stage = state

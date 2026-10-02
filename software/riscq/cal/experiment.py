@@ -2,7 +2,16 @@
 the sequence's gates, compile it (riscq.cal.sequence), size the grid period ONCE from its
 longest point (R9), compile `k_batched` for every core it touches with the generated header,
 then `rq.setup` + one `rq.rerun` per point of the Params' cartesian product, decoding each
-reading core's `out` through the Measure. What 31 `run()`s did by hand."""
+reading core's `out` through the Measure. What 31 `run()`s did by hand.
+
+qubic3 P6 (plan P6 v2 §4): on an antq_uplink build a `host=True` RAW or levels Measure takes its IQ
+from the readout uplink (`Measure.backend`): the readers compile in mode UPLINK, every rerun passes
+`uplink=UplinkRun(...)` with one word per shot per reading core and 0 elsewhere, and the IQ is
+decoded from `out[c]["__uplink"]`. The uplink needs exactly one decoder result per shot, so a
+heralded or ActiveReset sequence is refused there before any setup. Every core on an antq_uplink
+build carries the completion epilogue and marker (`k_batched`'s `fin`), whose wait `tend` is the
+latest pulse end after t_ro maximised over the whole sweep. `rf_silent=True` zeroes every DAC-bound
+amplitude (the demod has no DAC) and refuses amplitude sweeps (P6 v2 §8)."""
 
 from __future__ import annotations
 
@@ -13,11 +22,12 @@ import numpy as np
 
 from riscq import run as rq
 from riscq.cal import base
-from riscq.cal.axes import Param
+from riscq.cal.axes import Axis, Lin, Param
 from riscq.cal.batched import NONE, k_batched
 from riscq.cal.measure import Measure
 from riscq.cal.sequence import compile_sequence, emit_header
 from riscq.lang import Array, Group, compile_kernel
+from riscq.map import LEAD
 from riscq.pulses import units
 
 
@@ -41,8 +51,9 @@ class Series:
 
 class Experiment:
     def __init__(self, cfg, keys, sequences: dict, axes: dict, params: tuple, measure,
-                 shots: int, label: str = ""):
+                 shots: int, label: str = "", uplink_base: int = 0, rf_silent: bool = False):
         self.cfg, self.keys = cfg, list(keys)
+        self.uplink_base, self.rf_silent = int(uplink_base), bool(rf_silent)
         self.sequences, self.axes = sequences, axes
         self.params = tuple(params)
         # one Measure for every key, or {key: Measure} when each qubit's readout carries its own
@@ -88,18 +99,30 @@ class Experiment:
                     par[core] = {k: v for k, v in words.items() if k in progs[core].params}
             if before is not None:
                 before(vals[self.keys[0]])
-            out = rq.rerun(drv, m, progs, params=par, results=["out"], timeout=timeout)
+            if self.uplink is None:
+                out = rq.rerun(drv, m, progs, params=par, results=["out"], timeout=timeout)
+            else:
+                out = rq.rerun(drv, m, progs, params=par, results=["out"], timeout=timeout,
+                               uplink=rq.UplinkRun(expected=dict(self.uplink), base=self.uplink_base))
             if after is not None:
                 after(vals[self.keys[0]])
             for q in self.keys:
                 comp, axes, rcore, npts = self.compiled[q]
-                y = {r: self.measures[q].decode(out[c]["out"], r, npts, self.shots, signs[q][r])
+                y = {r: self.measures[q].decode(self._result(out[c], c, npts), r, npts, self.shots,
+                                                signs[q][r])
                      for c, r in rcore.items()}
                 series[q].y[vals[q]] = y if len(y) > 1 else next(iter(y.values()))
         if not self.params:
             for s in series.values():
                 s.y = s.y[()]
         return series
+
+    def _result(self, d: dict, core: int, npts: int):
+        """A reading core's results in the RAW `out` layout: its uplink IQ, or its first `out` words
+        (the completion marker, when the build has one, follows them)."""
+        if self.uplink is not None:
+            return d["__uplink"]
+        return d["out"][:self.nout[core]] if self.fin else d["out"]
 
     def compile(self, drv) -> tuple:
         """Compile every core's program and `rq.setup` them → (progs, res-signs, timeout). `run`
@@ -108,6 +131,12 @@ class Experiment:
         m = self._m = base.socmap(drv)
         cfg = self.cfg
         herald = bool(next(iter(self.measures.values())).herald)
+        backends = {meas.backend(m) for meas in self.measures.values()}
+        if len(backends) > 1:
+            raise ValueError(f"the keys' Measures put their results in {sorted(backends)}: one per Experiment")
+        backend = backends.pop()
+        fin = 1 if m.params.with_antq_uplink else 0      # P6 v2 §4.2: every core of an antq build
+        self.fin, self.nout, self.uplink = fin, {}, None
         progs, timeout, signs, plans = {}, 0, {}, {}
         for q in self.keys:
             meas = self.measures[q]
@@ -121,6 +150,10 @@ class Experiment:
             minfo = {r: meas.tables(cfg, r, m, tables) for r in reads}
             comp = compile_sequence(cfg, qref, self.sequences[q], m, axes, self.params,
                                     minfo[reads[0]])
+            if backend == "uplink":
+                _refuse_for_uplink(m, q, herald, comp)
+            if self.rf_silent:
+                _refuse_amplitude_sweeps(q, comp, minfo)
             for k, v in tables._pulses.items():          # the readout slots join the sequence's tables
                 comp.tables._pulses.setdefault(k, {}).update(v)
                 comp.tables._info.setdefault(k, tables._info[k])
@@ -155,20 +188,100 @@ class Experiment:
             for core in cores:
                 r = rcore.get(core)
                 hdr = emit_header(comp, core, minfo[r] if r is not None else None, self.label)
+                nout = meas.out_size_for(m, npts, self.shots) if r is not None else 0
+                tend = _t_end(cfg, m, meas, minfo[r], r, core, axes, self.params, q) \
+                    if fin and r is not None else (LEAD if fin else 0)
                 progs[core] = compile_kernel(
                     k_batched, m, core=core, grp=grp, tables=comp.tables.for_core(core),
                     include=[(f"seq_{_ident(self.label)}core{core}.h", hdr)],
-                    out=Array(meas.out_size(npts, self.shots), host=meas.host) if r is not None
+                    out=Array(max(1, nout + fin), host=(backend == "hostwindow")) if r is not None
                     else Array(1),
                     npts=npts, shots=self.shots, period=period,
-                    mode=meas.kernel_mode if r is not None else NONE,
-                    herald=int(herald and r is not None), hoff=hoff, sh=meas.sh, **fixed)
+                    mode=meas.kernel_mode_for(m) if r is not None else NONE,
+                    herald=int(herald and r is not None), hoff=hoff, sh=meas.sh,
+                    fin=fin, tend=tend, nout=nout, **fixed)
+                if fin:
+                    progs[core].marker = ("out", nout)
+                if self.rf_silent:
+                    _silence(m, core, progs[core], comp.tables.for_core(core))
+                self.nout[core] = nout
             self.compiled[q] = (comp, axes, rcore, npts)
+            if backend == "uplink":
+                up = self.uplink = self.uplink or {}
+                for core in cores:
+                    up[core] = up.get(core, 0) + (npts * self.shots if core in rcore else 0)
             signs[q] = {r: base.res_sign(cfg, r) for r in reads}
             timeout = max(timeout, base.batch_timeout(npts * self.shots * period))
         self.progs = progs
         rq.setup(drv, m, progs)
         return progs, signs, timeout
+
+
+def _refuse_for_uplink(m, q, herald: bool, comp) -> None:
+    """P6 v2 §4.1: word k of a reading core must be shot k, so the uplink takes exactly one decoder
+    result per shot. A herald adds a readout per shot and an ActiveReset its `reset_meas`."""
+    why = "it is heralded" if herald else \
+        ("it contains an ActiveReset (a reset_meas readout)" if any(op[0] == "reset_meas" for op in comp.ops)
+         else None)
+    if why is not None:
+        raise ValueError(f"key {q!r}: the sequence cannot use the uplink backend of {m.params.name}: {why}, "
+                         f"so a shot gives more than one decoder result and the words could not be told "
+                         f"apart. Use Measure(host=False) (core RAM, about 1k shots) or a hostwindow build")
+
+
+def _refuse_amplitude_sweeps(q, comp, minfo) -> None:
+    """RF-silent (P6 v2 §8): an amplitude written at run time would reach a DAC."""
+    swept = [f"{ch.name} slot {slot}" for fld, ch, slot, v in comp.point_ops if fld == "amp"]
+    swept += [f"readout {r}" for r, mi in minfo.items() if mi.meas.amp is not None]
+    if swept:
+        raise ValueError(f"key {q!r}: rf_silent refuses an amplitude sweep ({', '.join(swept)})")
+
+
+def _silence(m, core: int, prog, tables: dict) -> None:
+    """RF-silent: every slot of every DAC-bound table plays at amplitude 0 (the demod has no DAC)."""
+    for sym, table in tables.items():
+        if m.channel(table.channel, core).kind != "demod" and sym in prog.tables:
+            prog.tables[sym] = [(ph, 0, env, dur) for ph, _, env, dur in prog.tables[sym]]
+
+
+def _wrap32(v: int) -> int:
+    return (int(v) + (1 << 31)) % (1 << 32) - (1 << 31)
+
+
+def _sweep_values(x, axes: tuple, params: tuple, q) -> list:
+    """Every value the int expression `x` takes over the Experiment: each value of every Param it
+    names (this key's) and every point of every on-core axis (the kernel's int32 accumulator)."""
+    lin = Lin.of(x)
+    choices = []
+    for sym, _ in lin.terms:
+        if isinstance(sym, Param):
+            choices.append([sym.value(q, i) for i in range(sym.n)])
+        elif isinstance(sym, Axis):
+            choices.append([_wrap32(sym.x0 + j * sym.dx) for j in range(sym.n)])
+        else:
+            raise ValueError(f"cannot bound the readout knob {x!r}: {sym!r} is not an axis or a param")
+    return [_wrap32(lin.const + sum(c * v for (_, c), v in zip(lin.terms, combo)))
+            for combo in itertools.product(*choices)]
+
+
+def _decoded_dur(word: int) -> int:
+    """A seated duration word as the hardware reads it: data[31:16], unsigned."""
+    return (int(word) & 0xFFFF_FFFF) >> 16
+
+
+def _t_end(cfg, m, meas, mi, r, core: int, axes: tuple, params: tuple, q) -> int:
+    """P6 v2 §4.2: LEAD plus the latest pulse end of one shot after t_ro on a reading core, the
+    readout drive (`drive_dur`) or the demod window (`delay + dur`), maximised over the whole sweep:
+    a swept `drive_dur` / `dur` overrides the table default with a seated word, decoded here from
+    bits 31:16; `delay` is already in batches. Every other pulse of a shot ends before t_ro."""
+    ro, _, _, win, ddly = base.readout_tables(cfg, r, m, phase=meas.phase, win=meas.win)
+    drive = ro.pulses["meas"].dur_batches(m, mi.ro.index, core)
+    knobs = mi.meas
+    drives = [drive] if knobs.drive_dur is None else \
+        [_decoded_dur(v) for v in _sweep_values(knobs.drive_dur, axes, params, q)]
+    durs = [win] if knobs.dur is None else [_decoded_dur(v) for v in _sweep_values(knobs.dur, axes, params, q)]
+    delays = [ddly] if knobs.delay is None else _sweep_values(knobs.delay, axes, params, q)
+    return LEAD + max(max(drives), max(0, max(delays)) + max(durs))
 
 
 def _pad_tables(tables, cores) -> None:

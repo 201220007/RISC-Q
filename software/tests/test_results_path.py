@@ -281,14 +281,19 @@ def _cal_exp(m, measure, shots=16):
     return Experiment(_cfg(m), [0], {0: [Gate("x90")]}, {0: ()}, (), measure, shots, label="p3b")
 
 
-def test_cal_raw_defaults_to_the_host_window_and_is_refused_on_antq(responder, antq):
-    """Measure.raw() defaults to host=True, so a raw capture on an antq_uplink build is refused at
-    compile time with the reason, before any board access."""
+def test_cal_raw_defaults_to_off_core_capture_through_the_uplink_on_antq(responder, antq):
+    """Measure.raw() defaults to host=True, off-core capture. Until P6 an antq_uplink build refused it
+    at compile time (plan v2 P3b r2 #11, "until P6"); since qubic3 P6 (plan P6 v2 §4.1) it compiles in
+    mode UPLINK with no host-window array, and every rerun passes the uplink spec, one word per shot."""
+    from riscq.cal.batched import UPLINK
     from riscq.cal.measure import Measure
     r = responder(CONFIGS / "sim-2q-antq.json")
-    with pytest.raises(KernelCompileError, match="results_path='antq_uplink'"):
-        _cal_exp(antq, Measure.raw()).run(r.drv)
-    assert r.setups == []
+    exp = _cal_exp(antq, Measure.raw())
+    r.answer(lambda progs, params: {c: {"out": np.zeros(2 * exp.shots, int)} for c in progs})
+    exp.run(r.drv)
+    (prog,) = r.setups[0].values()
+    assert prog.bindings["mode"] == UPLINK and not prog.host_arrays and prog.marker == ("out", 0)
+    assert r.uplinks and all(u.expected == {0: exp.shots} for u in r.uplinks)
 
 
 def test_cal_iqsum_and_ram_raw_still_compile_on_antq(responder, antq):

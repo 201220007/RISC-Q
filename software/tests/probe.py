@@ -105,8 +105,11 @@ class Probe:
         return self.drv.sim.model_state()
 
     def iq(self, spec, params=None) -> dict:
-        """Play one point from |0⟩ and return each core's `out` array as complex IQ pairs."""
-        return {core: _as_complex(d["out"]) for core, d in self._rerun(spec, params).items()}
+        """Play one point from |0⟩ and return each core's `out` array as complex IQ pairs. On an
+        antq_uplink build `out` ends with the completion marker (qubic3 P6): only the words before it
+        are results."""
+        return {core: _as_complex(_results(self.progs[core], d["out"]))
+                for core, d in self._rerun(spec, params).items()}
 
     def sigma_z(self, spec, params=None, rate_key: str = "rabi_rad_per_amp") -> dict:
         """⟨σz⟩ per core, through the real readout: one |0⟩-reference point (`rate_key` zeroed, so
@@ -124,6 +127,11 @@ def _check_params(params) -> None:
         raise AssertionError(
             f"probe params must be keyed by core, got keys {sorted(map(str, params))}. "
             f"Write {{0: {params}}}, not {params} — a flat dict silently writes no params.")
+
+
+def _results(prog, out) -> np.ndarray:
+    """A program's result words: `out` up to its completion marker, when it has one."""
+    return out if prog.marker is None else out[:prog.marker[1]]
 
 
 def _as_complex(arr) -> np.ndarray:

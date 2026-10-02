@@ -367,7 +367,11 @@ class _FrontEnd:
                                        f"built with results_path={self.m.params.results_path!r}, "
                                        f"which has no HostWindow. Drop host=True (the array then "
                                        f"lives in core RAM), or use a hostwindow build; readout "
-                                       f"results of this build leave through riscq.ddr.DdrReadout")
+                                       f"results of this build leave through riscq.ddr.DdrReadout. "
+                                       f"Calibration RAW and levels IQ capture off-core with "
+                                       f"riscq.cal's Measure(host=True), which takes them from the "
+                                       f"uplink; a kernel's own Array cannot, since the uplink records "
+                                       f"only decoder results")
                     self.host_arrays.add(name)
             else:
                 self._err(arg, f"parameter {name!r} must be annotated int, ParamTable, Array, "

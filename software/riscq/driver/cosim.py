@@ -52,6 +52,22 @@ class _SimExtras:
         so the cores stay held."""
         self._proxy.pl_reset(int(cycles))
 
+    def pl_reset_snapshot(self) -> dict | None:
+        """qubic3 BT, a test observation: the state taken by the last `pl_reset` in the cycle its pulse
+        began, or None before the first. `n` (pulses so far), `cycle`, `batch_time` (the old time base),
+        and on an antq_uplink build what was outstanding on the uplink's DDR ports (`DdrModel.open_state`):
+        `aw_open` and `b_owed` write bursts, `reads_open` read bursts owing `r_beats_owed` R beats, the
+        VALIDs the uplink held up, `axis_valid` / `axis_ready`, the armed S2MM transfer (`dma`) and the
+        model's counters (`stats`)."""
+        return self._proxy.pl_reset_snapshot()
+
+    def ddr_reset(self, cycles: int = 16) -> None:
+        """qubic3 BT, antq_uplink builds: pulse `ddrRst` for `cycles` ui cycles, psr_ddr's peripheral reset
+        (the DDR side of a PL reload; a bench stimulus, no RTL change). It resets the uplink's DDR clock
+        domain, clearing `axi_rst_fault`, which nothing else clears, and the MIG model drops its open
+        AXI transactions, as the fabric reset does on the board."""
+        self._proxy.ddr_reset(int(cycles))
+
     def lockstep(self, on: bool = True) -> int:
         """qubic3 P4 (after-stage r1 #1), deterministic bench scheduling. On: between requests the bench
         waits without advancing the clock (by default it free-runs 200-cycle idle ticks while the
@@ -155,8 +171,8 @@ class _SimExtras:
         self._proxy.ddr_write32(int(off), int(value) & 0xFFFFFFFF)
 
     def ddr_config(self, cfg: dict | None = None) -> dict:
-        """Set the DDR model's knobs (b_delay, aw_stall, ar_stall, b_stall, tready_stall, bresp_next,
-        rresp_next) and return its traffic/stall counters."""
+        """Set the DDR model's knobs (b_delay, aw_stall, ar_stall, b_stall, tready_stall, tready_after,
+        bresp_next, rresp_next) and return its traffic/stall counters."""
         return dict(self._proxy.ddr_config(dict(cfg or {})))
 
     def ddr_mem(self, addr: int, nbytes: int) -> bytes:

@@ -424,7 +424,8 @@ class DdrModel:
     `b_delay` (ui cycles from WLAST to BVALID: delayed writes), `aw_stall` / `ar_stall` / `b_stall`
     (per-cycle probability of holding the channel off), `bresp` / `rresp` (the response of the NEXT
     burst, then back to OKAY). The S2MM side (`dma_*`) stands in for axi_dma: armed with a length it
-    holds TREADY (randomly deasserted with `tready_stall`), collects beats, and completes on TLAST."""
+    holds TREADY (randomly deasserted with `tready_stall`; low for good once a transfer has taken
+    `tready_after` beats, if that is >= 0), collects beats, and completes on TLAST."""
 
     def __init__(self):
         self.mem: dict[int, int] = {}          # byte address -> byte (absent = 0)
@@ -432,18 +433,49 @@ class DdrModel:
         self.b_delay = 0
         self.aw_stall = self.ar_stall = self.b_stall = 0.0
         self.tready_stall = 0.0
+        self.tready_after = -1
         self.bresp_next = 0
         self.rresp_next = 0
         self.stats = {"aw": 0, "ar": 0, "w": 0, "r": 0, "b": 0, "aw_stalled": 0, "ar_stalled": 0,
                       "b_stalled": 0, "axis": 0, "axis_stalled": 0}
         self.dma = None                          # the armed S2MM transfer, or None (TREADY low)
         self._next_dma = 0
+        self.reset_axi()
+
+    def reset_axi(self) -> None:
+        """The slave's open transactions (`_ddr_slave`): AW queue (bursts whose W is not complete), the
+        current W beat, B queue (due cycle, id, resp), AR queue, the R burst in progress, BVALID up.
+        Called again by the fabric reset (`ddr_reset`): on the board psr_ddr resets the MIG's AXI port,
+        and the transactions it still owed no longer exist."""
+        self.awq: deque = deque()
+        self.wbeat = 0
+        self.bq: deque = deque()
+        self.arq: deque = deque()
+        self.rcur = None                         # [addr, beats_left, id, resp]
+        self.b_up = False
 
     def configure(self, cfg: dict) -> dict:
-        for k in ("b_delay", "aw_stall", "ar_stall", "b_stall", "tready_stall", "bresp_next", "rresp_next"):
+        for k in ("b_delay", "aw_stall", "ar_stall", "b_stall", "tready_stall", "tready_after", "bresp_next",
+                  "rresp_next"):
             if k in cfg:
                 setattr(self, k, type(getattr(self, k))(cfg[k]))
         return dict(self.stats)
+
+    def open_state(self, dut) -> dict:
+        """What is outstanding now on `m_axi_ddr` and `m_axis_rd` (a test observation, qubic3 BT): write
+        bursts with AW accepted and W not complete (`aw_open`), with W complete and B not yet taken
+        (`b_owed`); read bursts accepted and not complete (`reads_open`) and the R beats they still owe;
+        the VALIDs the uplink holds up, the AXIS handshake pins, the armed S2MM transfer, the counters."""
+        sig = lambda n: _int_or_zero(getattr(dut, n))      # noqa: E731
+        t = self.dma
+        return {"aw_open": len(self.awq), "b_owed": len(self.bq),
+                "reads_open": len(self.arq) + (self.rcur is not None),
+                "r_beats_owed": (self.rcur[1] if self.rcur else 0) + sum(a[1] for a in self.arq),
+                "aw_valid": sig("m_axi_ddr_aw_valid"), "w_valid": sig("m_axi_ddr_w_valid"),
+                "ar_valid": sig("m_axi_ddr_ar_valid"),
+                "axis_valid": sig("m_axis_rd_valid"), "axis_ready": sig("m_axis_rd_ready"),
+                "dma": None if t is None else {"nbytes": t.nbytes, "got": len(t.data), "tlast": t.tlast},
+                "stats": dict(self.stats)}
 
     def stall(self, p: float) -> bool:
         return p > 0 and self.rng.random() < p
@@ -464,84 +496,78 @@ async def _ddr_slave(dut, dm: DdrModel) -> None:
     """`m_axi_ddr` slave on ddrClk. Same falling-edge discipline as `_host_window_slave`: at the falling
     edge the master's VALID/READY are stable since the last rising edge, so a READY/VALID driven now
     decides the transfer at the coming rising edge. One burst is written or read at a time per channel;
-    AW/AR are queued (up to 4)."""
+    AW/AR are queued (up to 4). The open transactions live on `dm` (`DdrModel.reset_axi`)."""
     clk = dut.ddrClk
     p = "m_axi_ddr"
     sig = lambda n: getattr(dut, f"{p}_{n}")      # noqa: E731
-    awq: deque = deque()
-    arq: deque = deque()
-    bq: deque = deque()                             # (due_cycle, id, resp)
     cyc = 0
-    wbeat = 0
-    rcur = None                                     # [addr, beats_left, id, resp]
-    b_up = False                                    # BVALID presented, not yet taken
     for n in ("aw_ready", "w_ready", "b_valid", "ar_ready", "r_valid"):
         sig(n).value = 0
     while True:
         await FallingEdge(clk)
         cyc += 1
         # ── AW ──
-        aw_ready = len(awq) < 4 and not dm.stall(dm.aw_stall)
+        aw_ready = len(dm.awq) < 4 and not dm.stall(dm.aw_stall)
         if _int_or_zero(sig("aw_valid")):
             if aw_ready:
-                awq.append([_int_or_zero(sig("aw_payload_addr")), _int_or_zero(sig("aw_payload_len")) + 1,
-                            _int_or_zero(sig("aw_payload_id"))])
+                dm.awq.append([_int_or_zero(sig("aw_payload_addr")), _int_or_zero(sig("aw_payload_len")) + 1,
+                               _int_or_zero(sig("aw_payload_id"))])
                 dm.stats["aw"] += 1
             else:
                 dm.stats["aw_stalled"] += 1
         sig("aw_ready").value = int(aw_ready)
         # ── W: accepted only against a known burst (the uplink sends W after its AW) ──
-        w_ready = bool(awq)
+        w_ready = bool(dm.awq)
         if w_ready and _int_or_zero(sig("w_valid")):
-            addr, beats, bid = awq[0]
-            dm.write_beat(addr + DDR_BEAT * wbeat, _int_or_zero(sig("w_payload_data")),
+            addr, beats, bid = dm.awq[0]
+            dm.write_beat(addr + DDR_BEAT * dm.wbeat, _int_or_zero(sig("w_payload_data")),
                           _int_or_zero(sig("w_payload_strb")))
             dm.stats["w"] += 1
-            wbeat += 1
+            dm.wbeat += 1
             last = _int_or_zero(sig("w_payload_last"))
-            if last != (wbeat == beats):
-                raise RuntimeError(f"m_axi_ddr: WLAST={last} on beat {wbeat} of a {beats}-beat burst at {addr:#x}")
+            if last != (dm.wbeat == beats):
+                raise RuntimeError(f"m_axi_ddr: WLAST={last} on beat {dm.wbeat} of a {beats}-beat burst at {addr:#x}")
             if last:
-                awq.popleft()
-                wbeat = 0
+                dm.awq.popleft()
+                dm.wbeat = 0
                 # AXI: BVALID only AFTER the last W handshake. At b_delay 0 the response used to be raised in this
                 # very cycle, so the handshake of WLAST and of B fell on the same edge, and a master holding
                 # BREADY high outside its wait-for-B state (CbufAxiWriter) lost it (qubic3 S0: every run whose
                 # first bank was its final one hung its flush; the G3' runs always set b_delay >= 50).
-                bq.append((cyc + max(1, dm.b_delay), bid, dm.bresp_next))
+                dm.bq.append((cyc + max(1, dm.b_delay), bid, dm.bresp_next))   # (due cycle, id, resp)
                 dm.bresp_next = 0
         sig("w_ready").value = int(w_ready)
         # ── B: presented once due (and not stalled); once BVALID is up it stays up until the handshake
         # (AXI), which happens at the coming edge if BREADY is high now ──
-        if not b_up and bq and bq[0][0] <= cyc:
+        if not dm.b_up and dm.bq and dm.bq[0][0] <= cyc:
             if dm.stall(dm.b_stall):
                 dm.stats["b_stalled"] += 1
             else:
-                b_up = True
-        if b_up:
-            sig("b_payload_id").value = bq[0][1]
-            sig("b_payload_resp").value = bq[0][2]
-        sig("b_valid").value = int(b_up)
-        if b_up and _int_or_zero(sig("b_ready")):
-            bq.popleft()
-            b_up = False
+                dm.b_up = True
+        if dm.b_up:
+            sig("b_payload_id").value = dm.bq[0][1]
+            sig("b_payload_resp").value = dm.bq[0][2]
+        sig("b_valid").value = int(dm.b_up)
+        if dm.b_up and _int_or_zero(sig("b_ready")):
+            dm.bq.popleft()
+            dm.b_up = False
             dm.stats["b"] += 1
         # ── AR ──
-        ar_ready = len(arq) < 4 and not dm.stall(dm.ar_stall)
+        ar_ready = len(dm.arq) < 4 and not dm.stall(dm.ar_stall)
         if _int_or_zero(sig("ar_valid")):
             if ar_ready:
-                arq.append([_int_or_zero(sig("ar_payload_addr")), _int_or_zero(sig("ar_payload_len")) + 1,
-                            _int_or_zero(sig("ar_payload_id")), dm.rresp_next])
+                dm.arq.append([_int_or_zero(sig("ar_payload_addr")), _int_or_zero(sig("ar_payload_len")) + 1,
+                               _int_or_zero(sig("ar_payload_id")), dm.rresp_next])
                 dm.rresp_next = 0
                 dm.stats["ar"] += 1
             else:
                 dm.stats["ar_stalled"] += 1
         sig("ar_ready").value = int(ar_ready)
         # ── R: one burst at a time, in order ──
-        if rcur is None and arq:
-            rcur = arq.popleft()
-        if rcur is not None:
-            addr, left, rid, resp = rcur
+        if dm.rcur is None and dm.arq:
+            dm.rcur = dm.arq.popleft()
+        if dm.rcur is not None:
+            addr, left, rid, resp = dm.rcur
             sig("r_payload_data").value = dm.read_beat(addr)
             sig("r_payload_id").value = rid
             sig("r_payload_resp").value = resp
@@ -549,7 +575,7 @@ async def _ddr_slave(dut, dm: DdrModel) -> None:
             sig("r_valid").value = 1
             if _int_or_zero(sig("r_ready")):
                 dm.stats["r"] += 1
-                rcur = None if left == 1 else [addr + DDR_BEAT, left - 1, rid, resp]
+                dm.rcur = None if left == 1 else [addr + DDR_BEAT, left - 1, rid, resp]
         else:
             sig("r_valid").value = 0
 
@@ -574,7 +600,8 @@ async def _axis_sink(dut, dm: DdrModel) -> None:
     while True:
         await FallingEdge(clk)
         t = dm.dma
-        ready = t is not None and not t.tlast and t.error is None and not dm.stall(dm.tready_stall)
+        ready = (t is not None and not t.tlast and t.error is None and not dm.stall(dm.tready_stall)
+                 and (dm.tready_after < 0 or len(t.data) < DDR_BEAT * dm.tready_after))
         if _int_or_zero(dut.m_axis_rd_valid):
             if ready:
                 beat = _int_or_zero(dut.m_axis_rd_payload_fragment)
@@ -665,6 +692,14 @@ class DriverServer:
     def pl_reset(self, cycles=16):
         """qubic3 S0: pulse `dspRst` and `reset` (the bench's pl_resetn0), see CosimDriver.sim.pl_reset."""
         return self._submit("pl_reset", int(cycles))
+
+    def pl_reset_snapshot(self):
+        """qubic3 BT: what was outstanding when the last pl_reset pulse began; see CosimDriver.sim."""
+        return self._submit("pl_reset_snapshot")
+
+    def ddr_reset(self, cycles=16):
+        """qubic3 BT: pulse `ddrRst` (psr_ddr's fabric reset); see CosimDriver.sim.ddr_reset."""
+        return self._submit("ddr_reset", int(cycles))
 
     def poll_word(self, addr, not_equal, timeout_cycles):
         return self._submit("poll_word", int(addr), int(not_equal), int(timeout_cycles))
@@ -812,6 +847,8 @@ class _BenchState:
         self.dio_loop: dict[str, bool] = {}
         self.ddr_axi: AxiMaster | None = None
         self.lockstep = False   # qubic3 P4: sim time advances only inside requests (no idle free-run)
+        self.pulses = 0         # qubic3 BT: pl_reset pulses so far, and the snapshot taken as the last began
+        self.pulse_snapshot: dict | None = None
 
     def host_write(self, addr: int, data: int, strb: int) -> None:
         """Apply one AXI beat to the modelled buffer. An address outside the buffer is a real bug
@@ -939,9 +976,20 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
             raise ValueError(f"read_host [{off}, {off + nbytes}) outside the "
                              f"{len(st.host_mem)} B host buffer")
         return bytes(st.host_mem[off:off + nbytes])
-    if op in ("ddr_read32", "ddr_write32", "ddr_config", "ddr_mem", "dma_arm", "dma_get"):
+    if op in ("ddr_read32", "ddr_write32", "ddr_config", "ddr_mem", "dma_arm", "dma_get", "ddr_reset"):
         if st.dm is None:
             raise ValueError(f"{op}: this build has results_path={st.m.params.results_path!r}, no uplink")
+        if op == "ddr_reset":
+            # qubic3 BT: psr_ddr's peripheral reset, a bench stimulus on the toplevel's ddrRst (no RTL change),
+            # what a PL reload does to the DDR side: the uplink's whole DDR clock domain (axi_rst_fault with it,
+            # which nothing else clears) and the AXI fabric, so the MIG port's open transactions are dropped.
+            # The MIG stays calibrated; the S2MM stand-in is left to the driver's own DMA reset.
+            dut.ddrRst.value = 1
+            st.dm.reset_axi()
+            await ClockCycles(dut.ddrClk, max(2, int(args[0])))
+            dut.ddrRst.value = 0
+            await ClockCycles(dut.clk, 64)          # the host-domain DDR status and the uplink's synchronisers
+            return None
         if op == "ddr_read32":
             return await st.ddr_axi.read_word(args[0])
         if op == "ddr_write32":
@@ -977,10 +1025,18 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
         return st.mirror.time_of_cycle(_cycle())
     if op == "cycles":
         return _cycle()
+    if op == "pl_reset_snapshot":
+        return st.pulse_snapshot
     if op == "pl_reset":
         # qubic3 S0: the bench's pl_resetn0, a stimulus on the toplevel's reset inputs (no RTL change).
         # Both proc_sys_reset outputs pl_resetn0 drives on the board: dspRst (dsp_rst) and the host
         # domain's reset (ps_rst). Released together, like at sim start, where the origin is pinned.
+        # qubic3 BT: first, what is outstanding as the pulse begins (the batch time is the old base's).
+        st.pulses += 1
+        now = _cycle()
+        st.pulse_snapshot = {"n": st.pulses, "cycle": now,
+                             "batch_time": None if st.mirror.origin_cycle is None else st.mirror.time_of_cycle(now),
+                             **({} if st.dm is None else st.dm.open_state(dut))}
         dut.dspRst.value = 1
         dut.reset.value = 1
         await ClockCycles(dut.clk, max(2, int(args[0])))

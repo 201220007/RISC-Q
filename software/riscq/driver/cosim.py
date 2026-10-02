@@ -37,6 +37,21 @@ class _SimExtras:
         absolute `start_batch` ahead of now (spec 08: refTime free-runs in dspCd, not reset per run)."""
         return int(self._proxy.batch_time())
 
+    def cycles(self) -> int:
+        """Simulated clk cycles since the bench started: monotonic even across a `pl_reset`, which
+        restarts `refTime` and so batch time (the suite's simulated-batch meter uses this)."""
+        return int(self._proxy.cycles())
+
+    def pl_reset(self, cycles: int = 16) -> None:
+        """Pulse what the PS's pl_resetn0 drives (qubic3 S0, plan P4 v2 §4.6): the bench raises
+        `dspRst` and the host-domain `reset` for `cycles` cycles and releases them. A BENCH stimulus:
+        no RTL change; the board pulses pl_resetn0 itself. It clears the timed queues, the channel
+        pipelines and `refTime` (the bench re-pins its batch-time origin at the release), the host
+        domain's registers with a reset value (the time offset, the host-window base), and the uplink's
+        DSP half (its DDR half follows at AXI quiescence). The core hold register has no reset value,
+        so the cores stay held."""
+        self._proxy.pl_reset(int(cycles))
+
     def poll_word(self, addr: int, not_equal: int, timeout_cycles: int) -> int:
         """Run the sim until the 32-bit word at `addr` != not_equal, or `timeout_cycles`
         elapse. Returns the last read value either way (caller decides loudness)."""
@@ -167,6 +182,16 @@ class CosimDdr:
         self._armed = int(nbytes)
         return self._armed
 
+    def dma_idle(self) -> bool:
+        """No S2MM transfer armed and left uncollected (qubic3 S0 quiesce)."""
+        return self._armed is None
+
+    def dma_reset(self) -> None:
+        """Collect and drop an abandoned armed transfer, leaving the S2MM stand-in idle."""
+        if self._armed is not None:
+            self._armed = None
+            self.drv.sim.dma_get(1)
+
     def dma_recv_wait(self, handle, nbytes: int) -> bytes:
         if handle != self._armed or nbytes != self._armed:
             raise RuntimeError(f"dma_recv_wait({nbytes}) does not match the armed transfer ({self._armed})")
@@ -192,10 +217,23 @@ class _RemoteExtras:
     def setup(self, params_json: str, progmap: dict) -> None:
         self._proxy.remote_setup(params_json, progmap)
 
-    def rerun(self, cores, params, arrays, results, timeout):
+    def rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None):
+        """`identities` are the client's setup identities (the server's loaded-set guard checks
+        them, qubic3 S0); `uplink` an `UplinkRun.to_wire()` spec (P6 v2 §4.3)."""
         raw = self._proxy.remote_rerun(list(cores), dict(params), dict(arrays),
-                                       results, int(timeout))
+                                       results, int(timeout), identities, uplink)
         return {int(c): {n: _to_bytes(b) for n, b in d.items()} for c, d in raw.items()}
+
+    def post_stop(self, run_id, kind, S=None) -> str:
+        """Enqueue a stop request server-side (no MMIO, outside the run lock); the outcome known
+        at posting."""
+        return self._proxy.post_stop(list(run_id), str(kind), None if S is None else int(S))
+
+    def current_run(self):
+        return self._proxy.current_run()
+
+    def recover(self) -> list:
+        return list(self._proxy.remote_recover())
 
 
 class CosimDriver:

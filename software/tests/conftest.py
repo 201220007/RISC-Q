@@ -71,8 +71,9 @@ def _cosim_build(request, name: str):
 # simulated batches — NOT seconds — is the suite's cost unit: it is machine-independent, and it
 # is the number a test author can actually reason about (points x shots x grid_period).
 #
-# refTime free-runs and is never reset, so `batch_time()` is a monotonic session-wide counter and
-# the delta across a test is exactly what that test cost.
+# The meter reads the bench's simulated clk cycles (`sim.cycles()`), one per batch (clk and dspClk are
+# both 10 ns on the bench). That is the same delta `batch_time()` gave while refTime never reset, and it
+# stays monotonic across a qubic3 S0 hardware flush, whose pl_resetn0 pulse restarts refTime.
 
 _batch_log: list[tuple[str, int]] = []
 
@@ -90,9 +91,9 @@ def sim_batches(request):
         yield
         return
     drvs = [request.getfixturevalue(n)[0] for n in names]
-    before = [d.sim.batch_time() for d in drvs]
+    before = [d.sim.cycles() for d in drvs]
     yield
-    spent = sum(max(0, d.sim.batch_time() - t0) for d, t0 in zip(drvs, before))
+    spent = sum(max(0, d.sim.cycles() - t0) for d, t0 in zip(drvs, before))
     _batch_log.append((request.node.nodeid, spent))
     cap = request.config.getoption("--batch-cap")
     override = request.node.get_closest_marker("batch_cap")

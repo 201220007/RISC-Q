@@ -30,12 +30,17 @@ from .ddr_regs import (  # noqa: F401  (re-exported for callers/tests)
     STATUS_NAMES, FATAL_BITS, STICKY_MASK, DIAG_NAMES, status_str,
     S_RD_DONE, S_WRITE_DONE, S_FLUSH_BUSY, S_INJ_BUSY, S_OVF_ANY, S_RUN_ACTIVE, S_DSP_ADMIT, S_AXI_RST_FAULT,
     S_ERR_BADSIZE, S_ERR_BASE_BUSY, S_ERR_FLUSH_REFUSED, S_ERR_START_DROPPED, S_ERR_INJ_BUSY,
-    S_ERR_INJ_RANGE,
+    S_ERR_INJ_RANGE, S_EARLY_LATE, S_RD_BUSY,
 )
 
 
 class DdrUplinkError(RuntimeError):
     """Raised whenever a run cannot be certified lossless - the data is never returned."""
+
+
+class LateActivity(DdrUplinkError):
+    """A result arrived outside the run window, at the drain (G1: REJECTED or early_late) or a
+    settle after it (G2): LATE_ACTIVITY, the run FAILED (qubic3 plan P4 v2 §4.6)."""
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,9 @@ class DdrReadout:
         self.soc_map = soc_map
         self.legacy_no_ddr_status = legacy_no_ddr_status
         self._geom = None
+        # qubic3 S0: True from the BASE_RESET write of `prepare` until the run's admission is closed
+        # again (a completed `flush`, or `close_admission` after a failure)
+        self._base_reset_issued = False
 
     # -- geometry, read from the ui_clk side only after readiness is established ----------
     def _ensure_geometry(self, timeout=1.0, deadline=None):
@@ -292,6 +300,7 @@ class DdrReadout:
         if self._rd(WR_BASE) != wr_base:
             raise DdrUplinkError("wr_base rejected by hardware: %s" % status_str(self._status()))
         self._wr(BASE_RESET, 1)
+        self._base_reset_issued = True
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
             s = self._status()
@@ -318,12 +327,57 @@ class DdrReadout:
             if s >> S_ERR_FLUSH_REFUSED & 1:
                 raise DdrUplinkError("flush refused: %s" % status_str(s))
             if not s >> S_FLUSH_BUSY & 1:
+                self._base_reset_issued = False         # admission closed at the flush commit
                 if not s >> S_WRITE_DONE & 1:
                     raise DdrUplinkError("flush ended without write_done (run invalid): %s" % status_str(s))
                 return s
             time.sleep(0.001)
         raise DdrUplinkError("flush did not complete within %ss: %s %s"
                              % (timeout, status_str(self._status()), self._diag()))
+
+    def close_admission(self, timeout=1.0):
+        """qubic3 S0 (plan P4 v2 §4.2): leave the uplink with its admission closed after a failed
+        run, however far `prepare` got. Before its BASE_RESET nothing was opened. After it: wait,
+        bounded, for the start crossing, and FLUSH if the run is active; after `err_start_dropped`
+        (the DSP side may admit while `run_active` stays low, and FLUSH is refused) re-arm with one
+        BASE_RESET, then FLUSH. The flush is never drained. Returns what it did; raises DdrUplinkError
+        if the admission could not be closed."""
+        if not self._base_reset_issued:
+            return "nothing open"
+        self._gate(timeout)
+        deadline = time.monotonic() + timeout
+
+        def wait(cond, what):
+            while not cond():
+                if time.monotonic() >= deadline:
+                    raise DdrUplinkError("closing the admission: %s within %ss: %s %s"
+                                         % (what, timeout, status_str(self._status()), self._diag()))
+                time.sleep(0.001)
+
+        wait(lambda: not (self._diag()["start_busy"] or self._diag()["start_pend"]),
+             "the start crossing did not settle")
+        did = []
+        s = self._status()
+        if s >> S_ERR_START_DROPPED & 1 and not s >> S_RUN_ACTIVE & 1:
+            self._wr(BASE_RESET, 1)
+            wait(lambda: self._status() >> S_RUN_ACTIVE & 1 or self._status() >> S_ERR_BASE_BUSY & 1,
+                 "the re-armed start did not complete")
+            if self._status() >> S_ERR_BASE_BUSY & 1:
+                raise DdrUplinkError("closing the admission: the re-arming BASE_RESET was refused: %s"
+                                     % status_str(self._status()))
+            wait(lambda: not (self._diag()["start_busy"] or self._diag()["start_pend"]),
+                 "the re-armed start crossing did not settle")
+            did.append("re-armed after err_start_dropped")
+            s = self._status()
+        if s >> S_RUN_ACTIVE & 1:
+            self._wr(FLUSH, 1)
+            wait(lambda: not self._status() >> S_FLUSH_BUSY & 1, "the flush did not complete")
+            if self._status() >> S_RUN_ACTIVE & 1:
+                raise DdrUplinkError("closing the admission: the run is still active after FLUSH: %s"
+                                     % status_str(self._status()))
+            did.append("flushed (not drained)")
+        self._base_reset_issued = False
+        return ", ".join(did) or "the run was not active"
 
     # -- drain ---------------------------------------------------------------------------
     def drain(self, wr_base, expected, status=None):
@@ -336,7 +390,9 @@ class DdrReadout:
             raise DdrUplinkError("run_base 0x%x != wr_base 0x%x" % (run_base, wr_base))
         bad = [STATUS_NAMES[b] for b in FATAL_BITS if s >> b & 1]
         if bad:
-            raise DdrUplinkError("run invalid (%s): %s" % (", ".join(bad), status_str(s)))
+            # qubic3 S0: a result outside the run window alone is LATE_ACTIVITY (G1)
+            err = LateActivity if bad == [STATUS_NAMES[S_EARLY_LATE]] else DdrUplinkError
+            raise err("run invalid (%s): %s" % (", ".join(bad), status_str(s)))
         if not s >> S_WRITE_DONE & 1:
             raise DdrUplinkError("write_done not set (run interrupted): %s" % status_str(s))
 
@@ -347,7 +403,7 @@ class DdrReadout:
                                  % (stray, self.num_ch, self.num_ch - 1))
         acc, rej = self._accepted(), self._rejected()
         if any(rej):
-            raise DdrUplinkError("results were rejected per core: %s" % rej)
+            raise LateActivity("results were rejected per core: %s" % rej)
         for core in range(self.num_ch):
             want = expected.get(core, 0)
             if acc[core] != want:
@@ -378,7 +434,8 @@ class DdrReadout:
         s2 = self._status()
         bad2 = [STATUS_NAMES[b] for b in FATAL_BITS if s2 >> b & 1]
         if bad2:
-            raise DdrUplinkError("error raised DURING the drain (%s): %s" % (", ".join(bad2), status_str(s2)))
+            err = LateActivity if bad2 == [STATUS_NAMES[S_EARLY_LATE]] else DdrUplinkError
+            raise err("error raised DURING the drain (%s): %s" % (", ".join(bad2), status_str(s2)))
         # r10-#5: `write_done` must STILL be set. A DDR-domain reset during the drain clears the whole
         # register file, and `ddr_in_reset` is reserved-zero (it cannot self-report), so a vanished
         # `write_done` is the only evidence that the run was interrupted underneath us.
@@ -441,3 +498,36 @@ class DdrReadout:
             time.sleep(0.001)
         raise DdrUplinkError("injection did not complete within %ss: %s"
                              % (timeout, status_str(self._status())))
+
+
+def attach_readout(drv, readout):
+    """Make `readout` the DdrReadout the run layer uses for `drv` (qubic3 S0/P6), e.g. one over a
+    `DdrBoard` holding a fixed, externally owned DMA buffer."""
+    setattr(drv, "_rq_readout", readout)
+    return readout
+
+
+def readout_for(drv, m):
+    """The DdrReadout of `drv` on an antq_uplink build, built once and cached on the driver (plan P6
+    v2 §4.4): over the driver itself when it has the readout's own surface (`dma_recv_prepare`), over
+    `CosimDdr` for a co-sim driver (`drv.sim.ddr_read32`), over `DdrBoard` for a board driver (one that
+    declares `board_soc_window`: its read32 takes offsets in the board's SoC AXI window, as
+    `PynqDriver`'s does). None on a hostwindow build, for a remote client (its server uses its own),
+    and for a driver with no route to the uplink."""
+    if not m.params.with_antq_uplink or getattr(drv, "remote", None) is not None:
+        return None
+    rd = getattr(drv, "_rq_readout", None)
+    if rd is not None:
+        return rd
+    sim = getattr(drv, "sim", None)
+    if hasattr(drv, "dma_recv_prepare"):
+        port = drv
+    elif sim is not None and hasattr(sim, "ddr_read32"):
+        from riscq.driver.cosim import CosimDdr
+        port = CosimDdr(drv)
+    elif getattr(drv, "board_soc_window", False):
+        from riscq.board.ddr_board import DdrBoard
+        port = DdrBoard(soc=drv)
+    else:
+        return None
+    return attach_readout(drv, DdrReadout(port, soc_map=m))

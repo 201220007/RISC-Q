@@ -155,8 +155,13 @@ class TimeMirror:
         self._off_hi = 0
 
     def set_origin(self, cycle: int) -> None:
-        """Pin the batch-time anchor to refTime's origin (dspRst release), set once at sim start."""
+        """Pin the batch-time anchor to refTime's origin (dspRst release): at sim start, and again
+        after a `pl_reset` pulse (qubic3 S0), which restarts refTime."""
         self.origin_cycle = cycle
+
+    def host_reset(self) -> None:
+        """The host-domain reset zeroes the timeOffset registers (init 0)."""
+        self._off_lo = self._off_hi = 0
 
     def on_write(self, addr: int, data: int) -> None:
         if addr == self._reset_addr and data == 0:
@@ -446,7 +451,11 @@ async def _ddr_slave(dut, dm: DdrModel) -> None:
             if last:
                 awq.popleft()
                 wbeat = 0
-                bq.append((cyc + dm.b_delay, bid, dm.bresp_next))
+                # AXI: BVALID only AFTER the last W handshake. At b_delay 0 the response used to be raised in this
+                # very cycle, so the handshake of WLAST and of B fell on the same edge, and a master holding
+                # BREADY high outside its wait-for-B state (CbufAxiWriter) lost it (qubic3 S0: every run whose
+                # first bank was its final one hung its flush; the G3' runs always set b_delay >= 50).
+                bq.append((cyc + max(1, dm.b_delay), bid, dm.bresp_next))
                 dm.bresp_next = 0
         sig("w_ready").value = int(w_ready)
         # ── B: presented once due (and not stalled); once BVALID is up it stays up until the handshake
@@ -580,6 +589,13 @@ class DriverServer:
         schedule an absolute-time capture ahead of `now` (spec 08: refTime free-runs in dspCd)."""
         return self._submit("batch_time")
 
+    def cycles(self):
+        return self._submit("cycles")
+
+    def pl_reset(self, cycles=16):
+        """qubic3 S0: pulse `dspRst` and `reset` (the bench's pl_resetn0), see CosimDriver.sim.pl_reset."""
+        return self._submit("pl_reset", int(cycles))
+
     def poll_word(self, addr, not_equal, timeout_cycles):
         return self._submit("poll_word", int(addr), int(not_equal), int(timeout_cycles))
 
@@ -650,14 +666,31 @@ class DriverServer:
         _run.setup(self, self._m, self._progs)
         return None
 
-    def remote_rerun(self, cores, params, arrays, results, timeout):
+    def remote_rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None):
         from riscq import run as _run
         progs = {int(c): self._progs[int(c)] for c in cores}
+        up = None if uplink is None else _run.UplinkRun.from_wire(dict(uplink))
         out = _run.rerun(self, self._m, progs,
                          params={int(c): v for c, v in dict(params).items()},
                          arrays={int(c): v for c, v in dict(arrays).items()},
-                         results=(None if results is None else list(results)), timeout=int(timeout))
+                         results=(None if results is None else list(results)), timeout=int(timeout),
+                         uplink=up, identities=(None if identities is None else
+                                                {int(c): str(i) for c, i in dict(identities).items()}))
         return {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()} for c, d in out.items()}
+
+    # ── qubic3 S0: the stop seam's remote twin (no MMIO; never waits on the running run) and recovery ──
+    def post_stop(self, run_id, kind, S=None):
+        from riscq import run as _run
+        return _run.request_stop(self, tuple(run_id), kind, S).outcome
+
+    def current_run(self):
+        from riscq import run as _run
+        r = _run.current_run(self)
+        return None if r is None else list(r)
+
+    def remote_recover(self):
+        from riscq import run as _run
+        return _run.recover(self, self._m or SocMap(SocParams.from_json(self._params)))
 
     def shutdown(self):
         return self._submit("shutdown")
@@ -821,6 +854,22 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
         return None
     if op == "batch_time":
         return st.mirror.time_of_cycle(_cycle())
+    if op == "cycles":
+        return _cycle()
+    if op == "pl_reset":
+        # qubic3 S0: the bench's pl_resetn0, a stimulus on the toplevel's reset inputs (no RTL change).
+        # Both proc_sys_reset outputs pl_resetn0 drives on the board: dspRst (dsp_rst) and the host
+        # domain's reset (ps_rst). Released together, like at sim start, where the origin is pinned.
+        dut.dspRst.value = 1
+        dut.reset.value = 1
+        await ClockCycles(dut.clk, max(2, int(args[0])))
+        await Timer(CLK_PERIOD_NS, units="ns")  # release at an edge time from a Timer, as at sim start, so
+        dut.reset.value = 0                     # SIMSTART_TO_TIME0 holds for the new origin
+        dut.dspRst.value = 0
+        st.mirror.set_origin(_cycle())
+        st.mirror.host_reset()
+        await ClockCycles(dut.clk, 64)          # the reset synchronisers and the uplink's DDR-half follow
+        return None
     if op == "poll_word":
         addr, not_equal, timeout_cycles = args
         value = await axi.read_word(addr)

@@ -127,16 +127,44 @@ class BoardServer:
         return None
 
     @_locked
-    def remote_rerun(self, cores, params, arrays, results, timeout):
+    def remote_rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None):
+        """qubic3 S0: `identities` are the client's setup identities, checked by the loaded-set
+        guard of this server's session before the release; `uplink` is an `UplinkRun.to_wire()` spec,
+        run through the server's own DdrReadout (`riscq.ddr.readout_for`, built over `DdrBoard`)."""
         from riscq import run as _run
+        if self._m is None:
+            raise RuntimeError("remote_rerun before remote_setup on this bundle")
         progs = {int(c): self._progs[int(c)] for c in cores}
+        up = None if uplink is None else _run.UplinkRun.from_wire(dict(uplink))
         out = _run.rerun(self._driver(), self._m, progs,
                          params={int(c): v for c, v in dict(params).items()},
                          arrays={int(c): v for c, v in dict(arrays).items()},
                          results=(None if results is None else list(results)),
-                         timeout=int(timeout))
+                         timeout=int(timeout), uplink=up,
+                         identities=(None if identities is None else
+                                     {int(c): str(i) for c, i in dict(identities).items()}))
         return {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()}
                 for c, d in out.items()}
+
+    @_locked
+    def remote_recover(self):
+        from riscq import run as _run
+        from riscq.map import SocMap, SocParams
+        m = self._m or SocMap(SocParams.from_json(self.get_params()))
+        return _run.recover(self._driver(), m)
+
+    # ── qubic3 S0: the stop seam (plan P4 v2 §4.3). NOT locked: remote_rerun holds the lock for the whole
+    # run, and a stop request must reach its poll loop meanwhile. Both only touch the run session's
+    # mailbox (a thread-safe queue), never the MMIO window. ──
+
+    def post_stop(self, run_id, kind, S=None):
+        from riscq import run as _run
+        return _run.request_stop(self._driver(), tuple(run_id), kind, S).outcome
+
+    def current_run(self):
+        from riscq import run as _run
+        r = _run.current_run(self._driver())
+        return None if r is None else list(r)
 
     # ── board ops: thin delegates (spec 10 §3.3) ──
 

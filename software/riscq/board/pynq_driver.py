@@ -41,7 +41,13 @@ _refclks_done = False    # LMK/LMX setup runs once per server process, not per l
 
 class PynqDriver:
     """MMIO Driver + overlay + RFDC ops. Construction IS bring-up, in the reference order:
-    ref clocks -> overlay download -> MMIO -> MTS -> Nyquist zones -> DAC VOP."""
+    ref clocks -> overlay download -> MMIO -> MTS -> Nyquist zones -> DAC VOP.
+
+    qubic3 S0: there is no `pl_reset` here yet. The run layer's hardware flush (plan P4 v2 §4.6,
+    pulse pl_resetn0, then repeat the RF bring-up) is added and validated in the board session; until
+    then a flush on the board raises RecoveryUnavailable and the session needs a PL reload."""
+
+    board_soc_window = True     # read32/write32 take offsets in the SoC AXI window (riscq.ddr.readout_for)
 
     def __init__(self, xsa: str, params_json: str, board: dict | None = None,
                  download: bool = True):

@@ -13,6 +13,11 @@ the board server's `PynqDriver` (a new driver after a bitstream reload is a new 
   - the §4.6 bookkeeping: uplink-free reruns since the last uplink run, and the host state a
     hardware flush must restore (the time offset, the host-window base, the RF bring-up).
 
+qubic3 P4 (plan P4 v2 §4.4, §5) adds the records of a stoppable program's run: the per-core counts
+with their validity (`Counts`), the stop record (`StopRecord`: the outcome of §5.6, the applied
+request with its S and VERIFIED, the common prefix), the TOO_LATE request outcome and the P4
+errors. The run counter also skips 0xFFFF_FFFF, the sentinel a core that never boots keeps.
+
 Nothing in this module touches the hardware. `riscq.run` does every MMIO access, from the one
 thread that owns the run."""
 
@@ -48,6 +53,23 @@ ACCEPTED = "ACCEPTED"
 REFUSED_DUPLICATE = "REFUSED_DUPLICATE"
 LATE = "LATE"
 REFUSED_NOT_STOPPABLE = "REFUSED_NOT_STOPPABLE"
+# P4: refused by the issue step before any write, leaving the run's one request open
+TOO_LATE = "TOO_LATE"                    # an explicit S below the safe minimum v_pre + L + 2 (§5.3)
+REFUSED_NEXT_ONLY = "REFUSED_NEXT_ONLY"  # AT on a run whose kernels do not state C1-C3 (§5.3)
+ISSUE_FAILED = "ISSUE_FAILED"            # the issue step raised: the run FAILED
+
+# P4: the outcome of a stoppable program's run (§5.6). INTERNAL_ERROR fails the run.
+FIRED = "FIRED"                          # AT(S), S < n: every core stopped at S
+NATURAL = "NATURAL"                      # every core ran its n shots
+CONSISTENT_LATE = "CONSISTENT_LATE"      # AT(S) not VERIFIED, every core stopped at one S' > S
+STOPPED_EACH = "STOPPED_EACH"            # NEXT: each core stopped at its next boundary
+INCONSISTENT = "INCONSISTENT"            # AT(S) not VERIFIED and the counts differ
+INTERNAL_ERROR = "INTERNAL_ERROR"
+
+# P4: reserved run-counter values. rq_stop_epoch = 0 is "no request"; 0xFFFF_FFFF is the sentinel the
+# run layer writes over rq_status before every release, which a core that never boots keeps (§4.4)
+SENTINEL = 0xFFFF_FFFF
+_RESERVED_EPOCHS = (0, SENTINEL)
 
 HISTORY = 32                     # run records kept per session
 
@@ -89,10 +111,100 @@ class RecoveryUnavailable(RunLayerError):
     """The driver cannot pulse pl_resetn0, so the hardware flush is impossible here: PL reload."""
 
 
+class NotBooted(Unfinished):
+    """P4 (§4.4): a programmed core raised DONE while its `rq_status` still holds the sentinel the
+    run layer wrote before the release: it never ran this run's start.S. NOT_BOOTED."""
+
+
+class StopPublishError(RunLayerError):
+    """P4 (§5.1): the read-back of a core's `rq_stop_epoch` did not return the epoch just written."""
+
+
+class StopInternalError(RunLayerError):
+    """P4 (§5.6): INTERNAL_ERROR. A count below min(S, n) under AT(S), a VERIFIED request that did not
+    end FIRED (S < n) or NATURAL (S >= n), a core past its n, a stop without a request, reads that
+    are not shots x r on a fixed-read kernel, or more reads than the uplink's nominal: a stated
+    kernel condition (C1-C3) or the run layer is wrong. The run is FAILED."""
+
+
+class StopInconsistent(RunLayerError):
+    """P4 (§5.6): INCONSISTENT. An AT(S) that was not VERIFIED ended with cores at different counts.
+    Not a lifecycle failure: the run is CERTIFIED, each core's data exact. Raised unless the stop spec
+    has `truncate=True`; `record` is the run's StopRecord and `out` its certified data, whose joint
+    part is the common prefix of `record.prefix` shots."""
+
+    def __init__(self, msg: str, record: "StopRecord", out: dict):
+        super().__init__(msg)
+        self.record = record
+        self.out = out
+
+
+@dataclass
+class Counts:
+    """One core's published counts (P4 §4.4): `rq_status` = [shots, reads, fin]. Valid only if the
+    core raised DONE and fin == the run's epoch; otherwise `why` is NOT_BOOTED (the sentinel is still
+    there), UNFINISHED (DONE without fin) or TIMEOUT (no DONE)."""
+
+    shots: int
+    reads: int
+    fin: int
+    valid: bool
+    why: str = ""
+
+    def to_wire(self) -> list:
+        return [int(self.shots), int(self.reads), int(self.fin), bool(self.valid), str(self.why)]
+
+    @classmethod
+    def from_wire(cls, w) -> "Counts":
+        return cls(int(w[0]), int(w[1]), int(w[2]), bool(w[3]), str(w[4]))
+
+
+@dataclass
+class StopRecord:
+    """The P4 record of a run of stoppable programs (§5.6): its outcome, every core's counts and n,
+    the applied request (kind, S, VERIFIED, v_pre, v_post, L, m, the reference core and the issue
+    timestamps), every request's (kind, S, outcome), S' - S for CONSISTENT_LATE, and `prefix`, the
+    shot count of the joint data (min over the cores of `shots`)."""
+
+    run_id: tuple
+    outcome: str
+    counts: dict
+    n: dict
+    request: dict | None = None
+    tickets: list = field(default_factory=list)
+    late_by: int | None = None
+    prefix: int = 0
+
+    @property
+    def shots(self) -> dict:
+        return {c: k.shots for c, k in self.counts.items()}
+
+    @property
+    def reads(self) -> dict:
+        return {c: k.reads for c, k in self.counts.items()}
+
+    def to_wire(self) -> dict:
+        return {"run_id": [int(x) for x in self.run_id], "outcome": self.outcome,
+                "counts": {str(c): k.to_wire() for c, k in self.counts.items()},
+                "n": {str(c): int(v) for c, v in self.n.items()},
+                "request": None if self.request is None else dict(self.request),
+                "tickets": [list(t) for t in self.tickets], "late_by": self.late_by,
+                "prefix": int(self.prefix)}
+
+    @classmethod
+    def from_wire(cls, w: dict) -> "StopRecord":
+        return cls(tuple(int(x) for x in w["run_id"]), str(w["outcome"]),
+                   {int(c): Counts.from_wire(k) for c, k in dict(w["counts"]).items()},
+                   {int(c): int(v) for c, v in dict(w["n"]).items()},
+                   None if w.get("request") is None else dict(w["request"]),
+                   [tuple(t) for t in w.get("tickets", [])], w.get("late_by"), int(w.get("prefix", 0)))
+
+
 @dataclass
 class FailureRecord:
     """What the cleanup saw (§4.2): the failure kind, the stage the run had reached, the error, and
-    STATUS, DIAG, the DONE word and every `rq_status` it could read."""
+    STATUS, DIAG, the DONE word and every `rq_status` it could read (P4: with each core's `Counts`,
+    invalid unless the core raised DONE and published fin == epoch)."""
 
     kind: str
     stage: str
@@ -102,6 +214,7 @@ class FailureRecord:
     diag: int | None = None
     done: int | None = None
     rq_status: dict = field(default_factory=dict)
+    counts: dict = field(default_factory=dict)
     cleanup: list = field(default_factory=list)
     t: float = field(default_factory=time.time)
 
@@ -123,6 +236,8 @@ class RunRecord:
     wrote: bool = False           # the run wrote to the hardware (its params): a failure then needs the flush
     policy_error: bool = False    # the stop policy raised
     preflight: dict | None = None # the many-shot preflight's numbers (P6 v2 §4.5)
+    stop: "StopRecord | None" = None  # P4: the record of a run of stoppable programs
+    done_word: int = 0            # P4: the DONE word the poll saw (the core reset clears it afterwards)
 
     def to(self, state: str) -> None:
         self.stage = state
@@ -139,11 +254,13 @@ class StopRequest:
 
 class Ticket:
     """The handle `request_stop` returns. `outcome` is QUEUED until the run's poll loop (or the
-    mailbox's closure at DONE) decides it; `wait()` blocks until then."""
+    mailbox's closure at DONE) decides it; `wait()` blocks until then. `info` holds what the issue
+    step recorded (P4: S, VERIFIED, v_pre, v_post, L, m, timestamps)."""
 
     def __init__(self, request: StopRequest):
         self.request = request
         self.outcome = QUEUED
+        self.info: dict = {}
         self._ev = threading.Event()
 
     def _decide(self, outcome: str) -> None:
@@ -178,8 +295,12 @@ class StopMailbox:
         t._decide(LATE)
         return t
 
-    def drain(self) -> Ticket | None:
-        """Decide every queued request; returns the newly accepted one, if any."""
+    def drain(self, issue=None) -> Ticket | None:
+        """Decide every queued request, in order; returns the newly accepted one, if any. `issue(t)`,
+        when given, runs for a valid request before it is decided (P4: it publishes the request) and
+        returns its outcome: ACCEPTED (None counts as ACCEPTED), or a refusal that wrote nothing
+        (TOO_LATE, REFUSED_NEXT_ONLY), which leaves the run's one request open for a later one. If
+        `issue` raises, the request is ISSUE_FAILED and the exception propagates (the run fails)."""
         new = None
         while True:
             try:
@@ -191,8 +312,17 @@ class StopMailbox:
             elif self.accepted is not None:
                 t._decide(REFUSED_DUPLICATE)
             else:
-                self.accepted = new = t
-                t._decide(ACCEPTED)
+                outcome = ACCEPTED
+                if issue is not None:
+                    try:
+                        outcome = issue(t) or ACCEPTED
+                    except BaseException:
+                        t._decide(ISSUE_FAILED)
+                        self.decided.append(t)
+                        raise
+                if outcome == ACCEPTED:
+                    self.accepted = new = t
+                t._decide(outcome)
             self.decided.append(t)
 
     def close(self) -> None:
@@ -213,20 +343,25 @@ class StopMailbox:
 
 @dataclass
 class StopSpec:
-    """The P4 hook of a stoppable run (§4.3). `issue(ctx, ticket)` performs an accepted request (P4
-    writes the stop words); `policy(ctx)` runs once per poll iteration and may return a request
-    `(kind, S)`. Either raising fails the run. `poll_interval` (seconds, 0 = busy poll) paces the
-    loop on hardware, `poll_cycles` in co-sim."""
+    """The P4 hook of a stoppable run (§4.3). `issue(ctx, ticket)` performs a valid request (P4
+    writes the stop words) and returns its outcome (see `StopMailbox.drain`); `policy(ctx)` runs
+    once per poll iteration and may return a request `(kind, S)`. Either raising fails the run.
+    `poll_interval` (seconds, 0 = busy poll) paces the loop on hardware, `poll_cycles` in co-sim.
+    P4: `truncate` accepts an INCONSISTENT outcome (the joint data is the common prefix) instead
+    of raising `StopInconsistent`; `wire` is the serpent-safe form `riscq.stop.spec` builds, which a
+    remote driver sends to its server (None: this spec runs only next to the hardware)."""
 
     issue: object
     policy: object = None
     poll_interval: float = 0.0
     poll_cycles: int = 2_000
+    truncate: bool = False
+    wire: dict | None = None
 
 
 @dataclass
 class RunContext:
-    """What a stop hook sees of the running run."""
+    """What a stop hook sees of the running run (P4: and the run's `UplinkRun`, or None)."""
 
     drv: object
     m: object
@@ -234,6 +369,7 @@ class RunContext:
     run_id: tuple
     session: "RunSession"
     done: int = 0                 # the last DONE word the poll loop read
+    uplink: object = None
 
 
 @dataclass
@@ -245,7 +381,7 @@ class PendingFlush:
 def _seed() -> int:
     while True:
         s = int.from_bytes(os.urandom(4), "little")
-        if s:
+        if s not in _RESERVED_EPOCHS:
             return s
 
 
@@ -255,8 +391,9 @@ class RunSession:
         self.loaded: dict | None = None      # {core: setup identity}; None: nothing loaded
         self.generation = 0                  # +1 per complete setup (§5.1)
         self._seed = _seed() if seed is None else int(seed) & 0xFFFF_FFFF
-        if not self._seed:
-            raise ValueError("the run counter's seed must be nonzero")
+        if self._seed in _RESERVED_EPOCHS:
+            raise ValueError("the run counter's seed must be neither 0 (no request) nor 0xFFFF_FFFF "
+                             "(the never-booted sentinel)")
         self._next = self._seed
         self._exhausted = False
         self.pending_flush: PendingFlush | None = None
@@ -269,13 +406,16 @@ class RunSession:
         self.current: RunRecord | None = None
         self.flushes: list = []              # (reason, t) of every hardware flush
         self.notes: deque = deque(maxlen=HISTORY)   # EXPECTED_DISCARD / STRAY / cleanup lines
+        self.last_stop: StopRecord | None = None    # P4: the stop record of the last stoppable run
 
     # ── epochs and run ids (§5.1) ──
     def next_epoch(self) -> int:
         if self._exhausted:
             raise EpochExhausted("epoch space exhausted, open a session")
         e = self._next
-        n = (e + 1) & 0xFFFF_FFFF or 1       # never 0
+        n = (e + 1) & 0xFFFF_FFFF
+        while n in _RESERVED_EPOCHS:         # never 0, never the sentinel (P4 §4.4)
+            n = (n + 1) & 0xFFFF_FFFF
         if n == self._seed:
             self._exhausted = True
         self._next = n
@@ -324,10 +464,13 @@ class RunSession:
 
     # ── the stop mailbox (§4.3): no run lock here, a poster must never wait on a running run ──
     def post_stop(self, run_id, kind: str, S: int | None = None) -> Ticket:
+        """P4: AT takes a shot index 0 <= S < 2^31 (the kernel compares int32), or None for the
+        earliest S the issue step can verify, v_pre + L + 2 + m (§5.3); NEXT takes none."""
         if kind not in (NEXT, AT):
             raise ValueError(f"stop kind must be {NEXT!r} or {AT!r}, got {kind!r}")
-        if kind == AT and (S is None or int(S) < 0):
-            raise ValueError("an AT request needs a shot index S >= 0")
+        if kind == AT and S is not None and not 0 <= int(S) <= 0x7FFF_FFFF:
+            raise ValueError(f"an AT request takes a shot index 0 <= S < 2^31, or None for the earliest "
+                             f"verifiable one; got {S}")
         if kind == NEXT and S is not None:
             raise ValueError("a NEXT request takes no shot index")
         req = StopRequest(tuple(int(x) for x in run_id), kind, None if S is None else int(S))

@@ -314,6 +314,35 @@ def k_missing_name(rq_epoch: int, rq_stop_epoch: int, rq_status: Array, n: int):
     rq_status[0] = n
 
 
+@kernel
+def k_fin_in_loop(rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int, rq_status: Array, n: int):
+    e = rq_epoch
+    s = 0
+    while s < n:
+        if rq_stop_epoch == e and s >= rq_stop_at:
+            break
+        s = s + 1
+        rq_status[0] = s
+        rq_status[1] = 0
+        rq_status[2] = e
+    rq_status[2] = e
+
+
+@kernel
+def k_fin_by_index(rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int, rq_status: Array, n: int):
+    e = rq_epoch
+    s = 0
+    k = 2
+    while s < n:
+        if rq_stop_epoch == e and s >= rq_stop_at:
+            break
+        s = s + 1
+        rq_status[0] = s
+        rq_status[1] = 0
+        rq_status[k] = e
+    rq_status[2] = e
+
+
 def test_the_convention_is_checked():
     m = _sim2q()
     conv = StopConvention("n")
@@ -325,6 +354,9 @@ def test_the_convention_is_checked():
         compile_kernel(k_no_loop_check, m, stop=conv)
     with pytest.raises(KernelCompileError, match=r"no store to rq_status\[2\]"):
         compile_kernel(k_no_fin, m, stop=conv)
+    for k in (k_fin_in_loop, k_fin_by_index):                  # fin published before the loop ended
+        with pytest.raises(KernelCompileError, match=r"rq_status\[2\] \(fin\)"):
+            compile_kernel(k, m, stop=conv)
     with pytest.raises(KernelCompileError, match="cannot be bound"):
         _compile(k_ok, rq_epoch=5)
     with pytest.raises(KernelCompileError, match="plain Array"):

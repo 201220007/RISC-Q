@@ -8,7 +8,15 @@ mailbox and the uplink admission, records the failure and re-raises; a FAILED ru
 quiescence and the `pl_resetn0` hardware flush with `recover()`, the loaded-set guard, the
 generation + epoch run ids with the stop mailbox (the seam P4's STOP plugs into), and the optional
 `uplink=UplinkRun` of `rerun` (P6 v2 §4.3). On a hostwindow build a valid setup or rerun issues
-exactly the driver operations it issued before S0 (`tests/test_hostwindow_pins.py`)."""
+exactly the driver operations it issued before S0 (`tests/test_hostwindow_pins.py`).
+
+qubic3 P4 (plan P4 v2 §4.4, §5) runs stoppable programs (`riscq.lang.StopConvention`, `riscq.stop`):
+before every release `rerun` writes each opting core's epoch, clears its stop words and puts the
+sentinel over its `rq_status`; after DONE it requires fin == epoch (valid counts), returns each
+core's `rq_status` = [shots, reads, fin], classifies the run (§5.6) into the run's `StopRecord`, and
+drains exactly `reads` uplink words per core. `rerun(stop=riscq.stop.spec(...))` lets the run take
+one NEXT or AT(S) request, which P4's issue step publishes from the poll loop. Programs without the
+convention take exactly their S0 path."""
 
 from __future__ import annotations
 
@@ -24,9 +32,10 @@ from riscq.build import Image, Program
 from riscq import ddr_regs as rd_regs
 from riscq.map import SocMap, pack16
 from riscq.session import (  # noqa: F401  (re-exported: the run layer's public names)
-    CERTIFIED, DONE_SEEN, FAILED, FLUSHED, FLUSH_FAILED, FLUSH_STRAY, FLUSH_UNPROVEN, IDLE, PREPARED,
-    PREPARING, RELEASED, RESET, FailureRecord, LoadedSetError, PreflightRefused, RecoveryRequired,
-    RecoveryUnavailable, RunContext, RunLayerError, SessionPoisoned, StopMailbox, StopSpec, Unfinished,
+    CERTIFIED, DONE_SEEN, FAILED, FLUSHED, FLUSH_FAILED, FLUSH_STRAY, FLUSH_UNPROVEN, IDLE, INCONSISTENT,
+    PREPARED, PREPARING, RELEASED, RESET, SENTINEL, FailureRecord, LoadedSetError, NotBooted,
+    PreflightRefused, RecoveryRequired, RecoveryUnavailable, RunContext, RunLayerError, SessionPoisoned,
+    StopInconsistent, StopInternalError, StopMailbox, StopPublishError, StopRecord, StopSpec, Unfinished,
     session,
 )
 
@@ -449,17 +458,35 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
     On an antq_uplink build a run where a programmed core has no marker is not queue-proven, and
     every later release waits for the hardware flush too (§4.6), uplink-free ones included; an
     uplink-free rerun with a flush pending is refused (RecoveryRequired) while the uplink has a run
-    open, which is then its caller's own protocol."""
+    open, which is then its caller's own protocol.
+
+    P4 (plan P4 v2 §4.4, §5): for every program with a stop convention (`prog.stop`) the run layer
+    writes rq_epoch = the epoch, rq_stop_epoch = rq_stop_at = 0 and the sentinel over rq_status
+    before the release (callers may not pass those params); after DONE its marker rq_status[2] must
+    read the epoch (UNFINISHED, or NOT_BOOTED while the sentinel is still there), `out[c]["rq_status"]`
+    is [shots, reads, fin], and the run's `StopRecord` (`riscq.stop.last(drv)`) carries the outcome of
+    §5.6. INTERNAL_ERROR fails the run; INCONSISTENT completes it, certified, and then raises
+    `StopInconsistent` unless the spec says `truncate`. The uplink drains exactly `reads` words of
+    such a core (`uplink.expected`, or `uplink.nominal`, is then the upper bound `prepare` checks).
+    A `stop` spec needs the convention on every programmed core; remotely, only one with a wire form
+    (`riscq.stop.spec`) crosses to the server."""
     _check_results_path(m, progs)
+    _check_stop_args(progs, params or {}, stop)
     remote = getattr(drv, "remote", None)
     if remote is not None:
-        if stop is not None:
-            raise ValueError("a stop hook runs next to the hardware: pass it to the server-side runner")
+        if stop is not None and stop.wire is None:
+            raise ValueError("this stop hook runs only next to the hardware: pass a riscq.stop.spec(...), "
+                             "whose wire form the server-side runner rebuilds")
         idents = {int(c): program_identity(p) for c, p in progs.items()}
         kw = {"identities": idents}
         if uplink is not None:
             kw["uplink"] = uplink.to_wire()
-        raw = remote.rerun(list(progs), params or {}, arrays or {}, results, timeout, **kw)
+        if stop is not None:
+            kw["stop"] = stop.wire
+        raw = dict(remote.rerun(list(progs), params or {}, arrays or {}, results, timeout, **kw))
+        rec = raw.pop("__stop", None)
+        if rec is not None:
+            session(drv).last_stop = StopRecord.from_wire(rec)
         return {int(core): {name: np.frombuffer(buf, dtype="<i4").copy() for name, buf in d.items()}
                 for core, d in raw.items()}
     params = params or {}
@@ -483,7 +510,10 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
         run = s.begin(progs, uplink is not None)
         if stop is not None:
             run.mailbox = StopMailbox(run.run_id)
+        opting = {c: p for c, p in progs.items() if p.stop is not None}
+        n_shots = {}
         rd = None
+        inconsistent = None
         try:
             if uplink is not None:
                 rd = uplink.readout if uplink.readout is not None else _readout(drv, m)
@@ -513,7 +543,11 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                 write_params(drv, m, core, prog, params.get(core, {}))
                 for name, values in arrays.get(core, {}).items():
                     write_array(drv, m, core, prog, name, values)
-                if prog.marker is not None:
+                if prog.stop is not None:                          # P4: epoch, stop words, sentinels
+                    _arm_stop(drv, m, core, prog, run.run_id[1])
+                    from riscq.stop import shots_of
+                    n_shots[core] = shots_of(drv, m, core, prog, params.get(core, {}))
+                elif prog.marker is not None:
                     drv.write32(_marker_addr(m, core, prog), MARKER_ARMED)
             if uplink is not None:
                 run.to(PREPARING)
@@ -524,9 +558,9 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
             reset(drv, m, on=False)
             run.to(RELEASED)
             if stop is None:
-                poll_done(drv, m, progs, timeout=timeout)
+                run.done_word = poll_done(drv, m, progs, timeout=timeout)
             else:
-                _poll_stoppable(drv, m, progs, timeout, run, stop, s)
+                run.done_word = _poll_stoppable(drv, m, progs, timeout, run, stop, s, uplink)
             run.to(DONE_SEEN)
             if run.mailbox is not None:
                 run.mailbox.close()
@@ -539,18 +573,29 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                                  else read_array(drv, m, core, prog, name))
                           for name in (list(prog.arrays) if results is None else results)}
                    for core, prog in progs.items()}
-            run.proven = _check_markers(drv, m, progs, out)
+            for core, prog in opting.items():                      # P4: every opting core's counts
+                if "rq_status" not in out[core]:
+                    out[core]["rq_status"] = read_array(drv, m, core, prog, "rq_status")
+            run.proven = _check_markers(drv, m, progs, out, run.run_id[1])
+            expected = None if uplink is None else dict(uplink.expected)
+            if opting:
+                from riscq.stop import finish
+                s.last_stop = finish(run, opting, out, n_shots, uplink)
+                if expected is not None:
+                    expected.update({c: k.reads for c, k in run.stop.counts.items()})
+                if run.stop.outcome == INCONSISTENT and (stop is None or not stop.truncate):
+                    inconsistent = run.stop
             if uplink is not None:
                 run.stage = "FLUSH"
                 st = rd.flush(timeout=uplink.flush_timeout)
                 run.to(FLUSHED)
                 run.stage = "DRAIN"
-                got = rd.drain(uplink.base, uplink.expected, status=st)          # G1
+                got = rd.drain(uplink.base, expected, status=st)                 # G1
                 run.stage = "SETTLE"
                 _settle(drv, uplink)
                 _check_g2(rd)                                                    # G2
                 from riscq.ddr import reconstruct
-                for core, n in uplink.expected.items():
+                for core, n in expected.items():
                     if n:
                         re, im = got[int(core)]
                         iq = np.empty(2 * len(re), dtype=np.int32)
@@ -563,10 +608,17 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                 s.request_flush(FLUSH_UNPROVEN, f"run {run.run_id}: not every programmed core has a "
                                                 f"completion marker")
             s.end(run, CERTIFIED)
-            return out
         except BaseException as exc:
             _fail(drv, m, s, run, exc, rd, progs)
             raise
+        if inconsistent is not None:                               # certified, then raised (§5.6)
+            raise StopInconsistent(
+                f"INCONSISTENT: AT({inconsistent.request['S']}) was not VERIFIED (v_pre "
+                f"{inconsistent.request.get('v_pre')}, v_post {inconsistent.request.get('v_post')}) and the "
+                f"cores stopped at {inconsistent.shots}; the run is certified and each core's data exact, "
+                f"the joint data is the common prefix of {inconsistent.prefix} shots (pass "
+                f"riscq.stop.spec(truncate=True) to take it without this error)", inconsistent, out)
+        return out
 
 
 def run(drv, m: SocMap, progs: dict[int, Program],
@@ -588,38 +640,83 @@ def _marker_addr(m: SocMap, core: int, prog: Program) -> int:
     return m.to_host_addr(core, prog.var_addr(name) + 4 * index)
 
 
-def _check_markers(drv, m: SocMap, progs: dict[int, Program], out: dict | None = None) -> bool:
-    """After DONE, with the reset held: every marker must read MARKER_DONE (P6 v2 §4.2), taken from
-    the results already read when they hold the marker's array, else read. Returns whether the run
-    is queue-proven, i.e. every programmed core carries a marker."""
+def _check_markers(drv, m: SocMap, progs: dict[int, Program], out: dict | None = None,
+                   epoch: int | None = None) -> bool:
+    """After DONE, with the reset held: every marker must read MARKER_DONE (P6 v2 §4.2), or the run's
+    `epoch` for a stoppable program (P4 §4.4: fin == epoch), taken from the results already read when
+    they hold the marker's array, else read. A stoppable core whose rq_status still holds the
+    sentinel in all three words is NOT_BOOTED. Returns whether the run is queue-proven, i.e. every
+    programmed core carries a marker."""
     bad = {}
     for core, prog in progs.items():
         if prog.marker is not None:
             name, index = prog.marker
+            want = MARKER_DONE if prog.stop is None else int(epoch) & 0xFFFF_FFFF
             got = (out or {}).get(core, {}).get(name)
             v = int(got[index]) & 0xFFFF_FFFF if got is not None and name not in prog.host_arrays \
                 else drv.read32(_marker_addr(m, core, prog))
-            if v != MARKER_DONE:
+            if v != want:
                 bad[core] = v
     if bad:
-        raise Unfinished(f"cores {sorted(bad)} raised DONE without their completion marker "
-                         f"({', '.join(f'core {c}: {v:#010x}' for c, v in sorted(bad.items()))}; "
-                         f"{MARKER_ARMED:#x} = never booted): UNFINISHED")
+        never = [c for c in bad if progs[c].stop is not None and (out or {}).get(c, {}).get("rq_status") is not None
+                 and all(int(x) & 0xFFFF_FFFF == SENTINEL for x in out[c]["rq_status"][:3])]
+        err, what = (NotBooted, "NOT_BOOTED") if never else (Unfinished, "UNFINISHED")
+        raise err(f"cores {sorted(bad)} raised DONE without their completion marker "
+                  f"({', '.join(f'core {c}: {v:#010x}' for c, v in sorted(bad.items()))}; "
+                  f"{MARKER_ARMED:#x} = never booted): {what}")
     return bool(progs) and all(prog.marker is not None for prog in progs.values())
 
 
-def _poll_stoppable(drv, m: SocMap, progs: dict, timeout: int, run, stop: StopSpec, s) -> int:
+def _check_stop_args(progs: dict, params: dict, stop) -> None:
+    """P4, before any MMIO: the stop convention's names are the run layer's, and P4's issue step
+    (`riscq.stop.Issuer`) needs the convention on every programmed core (each must check the stop
+    words, non-readers too). A hand-made S0 hook (`StopSpec(issue=...)`) is not held to it."""
+    from riscq.lang.kernel import STOP_INTS
+    for core, p in params.items():
+        bad = sorted(set(p) & set(STOP_INTS))
+        if bad:
+            raise ValueError(f"core {core}: {bad} are written by the run layer (the epoch and the stop "
+                             f"words of the stop convention), not passed as params")
+    if stop is not None and getattr(stop.issue, "needs_convention", False):
+        plain = sorted(c for c, prog in progs.items() if prog.stop is None)
+        if plain:
+            raise ValueError(f"a stoppable run needs the stop convention on every programmed core, "
+                             f"non-readers included (a core that never checks would run its n shots); "
+                             f"cores {plain} have none (compile_kernel(..., stop=StopConvention(...)))")
+
+
+def _arm_stop(drv, m: SocMap, core: int, prog: Program, epoch: int) -> None:
+    """P4 §4.4, §5.1, with the reset held: rq_epoch = the epoch, both stop words 0 (no request, so the
+    RAM state at the release does not depend on history), and the sentinel over rq_status, which a
+    core keeps unless it boots (start.S zeroes .bss). The cores are held, so block writes are safe
+    here: one for the three words when the linker placed them together, one for the sentinels (the
+    stop traffic during a run is single-word, `riscq.stop.publish`)."""
+    names = ("rq_epoch", "rq_stop_epoch", "rq_stop_at")
+    addrs = [prog.var_addr(n) for n in names]
+    words = (int(epoch) & 0xFFFF_FFFF, 0, 0)
+    if addrs == [addrs[0], addrs[0] + 4, addrs[0] + 8]:
+        drv.write_block(m.to_host_addr(core, addrs[0]), b"".join(w.to_bytes(4, "little") for w in words))
+    else:
+        for a, w in zip(addrs, words):
+            drv.write32(m.to_host_addr(core, a), w)
+    drv.write_block(m.to_host_addr(core, prog.var_addr("rq_status")), SENTINEL.to_bytes(4, "little") * 3)
+
+
+def _poll_stoppable(drv, m: SocMap, progs: dict, timeout: int, run, stop: StopSpec, s,
+                    uplink: UplinkRun | None = None) -> int:
     """The poll loop of a stoppable run (plan P4 v2 §4.3): each iteration reads DONE; once DONE is
     seen it closes the mailbox (every request still queued is LATE) and returns, before any policy
     or request is looked at, so a completed run never accepts a stop. Otherwise it runs the policy
-    (which may post a request), decides the mailbox and hands an accepted request to the stop hook.
-    Paced by `poll_interval` (hardware, against the wall-clock deadline `poll_seconds` gives) or
-    `poll_cycles` (co-sim); `timeout` is in cycles, as in `poll_done`."""
+    (which may post a request, `(kind, S)` or `(kind, S, info)`), then decides the mailbox, the stop
+    hook issuing the run's first valid request before it is decided (P4: it writes the stop words,
+    or refuses with TOO_LATE before any write). Paced by `poll_interval` (hardware, against the
+    wall-clock deadline `poll_seconds` gives) or `poll_cycles` (co-sim); `timeout` is in cycles, as
+    in `poll_done`."""
     cores = list(progs)
     mask = sum(1 << c for c in cores)
     addr = m.host_ctrl + m.HOST_DONE
     sim = getattr(drv, "sim", None)
-    ctx = RunContext(drv, m, dict(progs), run.run_id, s)
+    ctx = RunContext(drv, m, dict(progs), run.run_id, s, uplink=uplink)
     deadline = None if sim is not None else _time.monotonic() + poll_seconds(m, timeout)
     spent = 0
     word = drv.read32(addr)
@@ -635,10 +732,10 @@ def _poll_stoppable(drv, m: SocMap, progs: dict, timeout: int, run, stop: StopSp
                 run.policy_error = True
                 raise
             if req is not None:
-                s.post_stop(run.run_id, *req)
-        accepted = run.mailbox.drain()
-        if accepted is not None:
-            stop.issue(ctx, accepted)
+                t = s.post_stop(run.run_id, req[0], req[1] if len(req) > 1 else None)
+                if len(req) > 2:
+                    t.info.update(req[2])
+        run.mailbox.drain(issue=lambda t: stop.issue(ctx, t))
         if (spent >= timeout) if sim is not None else (_time.monotonic() >= deadline):
             raise TimeoutError(_not_done(cores, word, timeout, m, sim))
         if sim is not None:
@@ -655,8 +752,14 @@ def _kind(run, exc) -> str:
     from riscq.ddr import LateActivity
     if isinstance(exc, LateActivity):
         return "LATE_ACTIVITY"
+    if isinstance(exc, NotBooted):
+        return "NOT_BOOTED"
     if isinstance(exc, Unfinished):
         return "UNFINISHED"
+    if isinstance(exc, StopInternalError):
+        return "INTERNAL_ERROR"
+    if isinstance(exc, StopPublishError):
+        return "STOP_PUBLISH"
     if isinstance(exc, PreflightRefused):
         return "PREFLIGHT"
     if isinstance(exc, SessionPoisoned):
@@ -706,6 +809,11 @@ def _fail(drv, m: SocMap, s, run, exc, rd, progs) -> None:
                                        for x in read_array(drv, m, core, prog, "rq_status")]
             except Exception as e:                      # noqa: BLE001
                 rec.cleanup.append(f"core {core} rq_status unreadable: {e!r}")
+                continue
+            if prog.stop is not None and run.wrote:     # P4: the counts, valid only with DONE and fin == e
+                from riscq.stop import counts_of
+                done = bool(((rec.done or 0) | run.done_word) >> core & 1)   # the reset clears DONE
+                rec.counts[core] = counts_of(rec.rq_status[core], run.run_id[1], done)
     run.failure = rec
     run.to(FAILED)
     s.end(run, FAILED)

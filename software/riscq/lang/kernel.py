@@ -405,15 +405,23 @@ class _FrontEnd:
         if not any(reads(s, ("rq_epoch",)) for s in body):
             self._err(self.fdef, "a stoppable kernel reads rq_epoch (once, before its shot loop) and "
                                  "publishes it as fin, rq_status[2]")
-        stored = {n.slice.value for s in body for n in ast.walk(s)
-                  if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)
-                  and isinstance(n.value, ast.Name) and n.value.id == STOP_STATUS
-                  and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, int)}
+        def status_stores(node):
+            return [n for n in ast.walk(node) if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)
+                    and isinstance(n.value, ast.Name) and n.value.id == STOP_STATUS]
+
+        stored = {n.slice.value for s in body for n in status_stores(s)
+                  if isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, int)}
         missing = [i for i in (0, 1, 2) if i not in stored]
         if missing:
             self._err(self.fdef, f"a stoppable kernel publishes rq_status[0] (posted shots), [1] (reads) "
                                  f"and [2] (fin, the epoch, after its last pulse); no store to "
                                  f"rq_status{missing}")
+        for i, s in enumerate(body):                  # fin: only after the shot loop, at top level
+            for n in status_stores(s):
+                if not (isinstance(n.slice, ast.Constant) and n.slice.value in (0, 1)) and i <= boundary:
+                    self._err(n, "rq_status[2] (fin) says the counts are final and every posted pulse has "
+                                 "ended: store it in a top-level statement after the shot loop, past the "
+                                 "completion epilogue, never in or before the loop")
         for i, s in enumerate(body):
             for node in ast.walk(s):
                 if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):

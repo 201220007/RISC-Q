@@ -143,8 +143,13 @@ def test_client_identities_are_checked_against_the_loaded_set():
 # ── run ids (§5.1) ──
 
 def test_epochs_are_nonzero_unique_and_survive_setup():
+    """Never 0 (no request) and, since P4, never 0xFFFF_FFFF, the sentinel a never-booted core keeps
+    in rq_status (plan P4 v2 §4.4): fin == epoch must not hold for a core that never ran."""
     s = S.RunSession(seed=0xFFFF_FFFE)
-    assert [s.next_epoch() for _ in range(3)] == [0xFFFF_FFFE, 0xFFFF_FFFF, 1]
+    assert [s.next_epoch() for _ in range(3)] == [0xFFFF_FFFE, 1, 2]
+    for bad in (0, 0xFFFF_FFFF):
+        with pytest.raises(ValueError, match="seed"):
+            S.RunSession(seed=bad)
     f, m = soc(HW)
     rq.setup(f, m, {0: prog()})
     seen = set()
@@ -230,8 +235,9 @@ def test_a_request_to_a_run_without_a_stop_hook_is_not_stoppable():
     f.on_release = release
     rq.rerun(f, m, {0: prog()})
     assert got == [S.REFUSED_NOT_STOPPABLE]
-    with pytest.raises(ValueError):
-        S.session(f).post_stop((1, 1), S.AT)                                 # AT needs S
+    for bad in (-1, 2 ** 31):                         # S is the kernel's int32; None (P4) = the earliest
+        with pytest.raises(ValueError):
+            S.session(f).post_stop((1, 1), S.AT, bad)
     with pytest.raises(ValueError):
         S.session(f).post_stop((1, 1), "HALT")
 

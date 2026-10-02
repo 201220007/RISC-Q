@@ -230,12 +230,20 @@ class _RemoteExtras:
     def setup(self, params_json: str, progmap: dict) -> None:
         self._proxy.remote_setup(params_json, progmap)
 
-    def rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None):
+    def rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None, stop=None):
         """`identities` are the client's setup identities (the server's loaded-set guard checks
-        them, qubic3 S0); `uplink` an `UplinkRun.to_wire()` spec (P6 v2 §4.3)."""
+        them, qubic3 S0); `uplink` an `UplinkRun.to_wire()` spec (P6 v2 §4.3); `stop` the wire form
+        of a `riscq.stop.spec(...)` (qubic3 P4), whose run's StopRecord comes back under "__stop"."""
+        kw = {} if stop is None else {"stop": stop}
         raw = self._proxy.remote_rerun(list(cores), dict(params), dict(arrays),
-                                       results, int(timeout), identities, uplink)
-        return {int(c): {n: _to_bytes(b) for n, b in d.items()} for c, d in raw.items()}
+                                       results, int(timeout), identities, uplink, **kw)
+        out = {}
+        for c, d in raw.items():
+            if c == "__stop":
+                out[c] = d
+            else:
+                out[int(c)] = {n: _to_bytes(b) for n, b in d.items()}
+        return out
 
     def post_stop(self, run_id, kind, S=None) -> str:
         """Enqueue a stop request server-side (no MMIO, outside the run lock); the outcome known

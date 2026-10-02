@@ -142,11 +142,14 @@ class BoardServer:
 
     @_wire_errors
     @_locked
-    def remote_rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None):
+    def remote_rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None, stop=None):
         """qubic3 S0: `identities` are the client's setup identities, checked by the loaded-set
         guard of this server's session before the release; `uplink` is an `UplinkRun.to_wire()` spec,
-        run through the server's own DdrReadout (`riscq.ddr.readout_for`, built over `DdrBoard`)."""
+        run through the server's own DdrReadout (`riscq.ddr.readout_for`, built over `DdrBoard`).
+        qubic3 P4: `stop` is the wire form of a `riscq.stop.spec(...)`; the poll loop runs it here,
+        next to the MMIO window, and the run's StopRecord goes back under "__stop"."""
         from riscq import run as _run
+        from riscq import stop as _stop
         if self._m is None:
             raise RuntimeError("remote_rerun before remote_setup on this bundle")
         progs = {int(c): self._progs[int(c)] for c in cores}
@@ -159,9 +162,14 @@ class BoardServer:
                          results=(None if results is None else list(results)),
                          timeout=int(timeout), uplink=up,
                          identities=(None if identities is None else
-                                     {int(c): str(i) for c, i in dict(identities).items()}))
-        return {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()}
-                for c, d in out.items()}
+                                     {int(c): str(i) for c, i in dict(identities).items()}),
+                         stop=None if stop is None else _stop.from_wire(dict(stop)))
+        reply = {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()}
+                 for c, d in out.items()}
+        rec = _run.session(self._driver()).runs[-1].stop
+        if rec is not None:
+            reply["__stop"] = rec.to_wire()
+        return reply
 
     @_wire_errors
     @_locked

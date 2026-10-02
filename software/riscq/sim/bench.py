@@ -729,8 +729,9 @@ class DriverServer:
         return None
 
     @_wire_errors
-    def remote_rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None):
+    def remote_rerun(self, cores, params, arrays, results, timeout, identities=None, uplink=None, stop=None):
         from riscq import run as _run
+        from riscq import stop as _stop
         progs = {int(c): self._progs[int(c)] for c in cores}
         up = None if uplink is None else _run.UplinkRun.from_wire(dict(uplink))
         if up is not None:
@@ -740,8 +741,13 @@ class DriverServer:
                          arrays={int(c): v for c, v in dict(arrays).items()},
                          results=(None if results is None else list(results)), timeout=int(timeout),
                          uplink=up, identities=(None if identities is None else
-                                                {int(c): str(i) for c, i in dict(identities).items()}))
-        return {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()} for c, d in out.items()}
+                                                {int(c): str(i) for c, i in dict(identities).items()}),
+                         stop=None if stop is None else _stop.from_wire(dict(stop)))
+        reply = {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()} for c, d in out.items()}
+        rec = _run.session(self).runs[-1].stop      # qubic3 P4: the run's StopRecord goes back too
+        if rec is not None:
+            reply["__stop"] = rec.to_wire()
+        return reply
 
     # ── qubic3 S0: the stop seam's remote twin (no MMIO; never waits on the running run) and recovery ──
     def post_stop(self, run_id, kind, S=None):

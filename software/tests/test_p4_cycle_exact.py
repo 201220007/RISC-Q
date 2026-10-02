@@ -46,6 +46,14 @@ pytestmark = pytest.mark.cosim
 
 G_DUR, DUR, F, P, NMAX = 16, 40, 1024, 256, 14      # gate 16 batches, demod 40, period 256; n <= NMAX
 
+# The branch predictor's worst case on k_probe's posting path (REPORT §3.4): a mispredicted branch
+# costs 5 cycles (the redirect acts at executeAt + 1 = stage 5, the refetch starts the next cycle),
+# and gate p4e saw 9 per mispredict here (a wrong-path timer read can reach the bus first); from the
+# demod read's return to the gate fire's post k_probe runs 3 conditional branches, 4 once a request
+# is visible (the loop test, the epoch compare, s >= rq_stop_at, the pad test). One AT request takes
+# at most 5 cycles from the reference core (M1: 5 accesses, 1 stall cycle each).
+BRANCH_COST, PROBE_BRANCHES, AT_STALL = 9, 4, 5
+
 
 @kernel
 def k_probe(gate: ParamTable, demod: ParamTable, grp: Group, rq_epoch: int, rq_stop_epoch: int,
@@ -211,9 +219,11 @@ def test_lockstep_repeats_a_run_cycle_for_cycle(probe):
     """The same stoppable run, released at the same batch-time phase with P4's issuer at the same
     scheduled cycle, repeats cycle for cycle under lockstep once the CPU's branch predictor has seen
     it: after one warm-up run, three runs give equal StopRecords (v_pre, v_post, S, counts) and equal
-    kernel timelines relative to the release. (The GShare counters survive the core reset, so the
+    kernel timelines relative to the release. This is warmed repeatability, not reset-to-reset
+    determinism: the GShare counters and history survive the core reset (the BTB does not), so the
     first run of a new branch pattern, here the check that starts to see the request, can take a few
-    cycles more; the M-tests measure within a run or against warmed references.)
+    cycles more, and one warm-up need not normalise every history. The M-tests measure within a run
+    or against warmed references; the predictor's worst case is bounded separately (REPORT §3.4).
 
     FLOOR: four runs of ~5 k batches (12 shots at 256, the record read, the phase alignment)."""
     drv, m, progs = probe
@@ -507,8 +517,10 @@ def test_m3_the_at_pattern_across_a_critical_window_is_bit_exact(probe):
 def test_m2_the_slack_of_the_gate_fire(probe):
     """M2: `pad` cycles of delay before the posts (a stall injected in the shot path). The smallest
     pad that changes the gate DAC capture gives the fire class's slack, pad - 1; the corrupted run
-    plays a pulse late with the previous pulse's amplitude, as R5 says. k_probe's gate fire has well
-    over the four stall cycles one host access costs (M1).
+    plays a pulse late with the previous pulse's amplitude, as R5 says. One host access costs at most
+    one stall cycle (M1); the slack must cover the predictor's worst case on the posting path
+    (PROBE_BRANCHES mispredicts at BRANCH_COST each) plus the AT_STALL cycles one AT request can take
+    from the reference core, so C3 holds for k_probe in every predictor state.
 
     FLOOR: a reference run and ~10 bisection runs, each with a 3.5 k-batch DAC capture."""
     drv, m, progs = probe
@@ -527,8 +539,9 @@ def test_m2_the_slack_of_the_gate_fire(probe):
             lo = mid
         else:
             hi = mid
-    print(f"\n[P4 M2] k_probe's gate fire: corrupted from pad {hi}: slack {hi - 1} cycles")
-    assert hi - 1 >= 16, hi
+    need = PROBE_BRANCHES * BRANCH_COST + AT_STALL
+    print(f"\n[P4 M2] k_probe's gate fire: corrupted from pad {hi}: slack {hi - 1} cycles (needs {need})")
+    assert hi - 1 >= need, (hi, need)
 
 
 # ── M2 and M3 on k_batched, the calibration kernel (not stoppable in P4: plan Q3). Last: it reloads core 0 ──
@@ -578,22 +591,21 @@ def _harmless_pattern(m, progs, R, x):
     return ops + [(None, "read32", magic)]
 
 
-@pytest.mark.batch_cap(530_000)
+@pytest.mark.batch_cap(1_450_000)
 def test_m2_m3_k_batched_drives_under_host_traffic(cosim):
     """M2 and M3 on k_batched (plan P4 v2 §6), the calibration kernel P4 keeps non-stoppable (Q3):
     how much host traffic its drive fire takes, heralded (the drive is posted when the herald read
     returns, which by herald_offset's design is at its nominal LEAD deadline, so its post lands just
-    after that deadline) and not. M2: one host access, at most one stall cycle (M1), started every 3
-    cycles from 60 before the second drive's deadline (start - LEAD) to 100 after it; M1 found that an
-    access stalls the core only from runs of three consecutive offsets, so this hits each run. A
-    stall that corrupts the drive at some offset means the fire class has no slack there. M3: the
-    44-access AT pattern swept the same way across the heralded drive's window. A capture is corrupt
-    when it differs from the run without traffic (which a rerun reproduces bit for bit). The offsets
-    are recorded for the report; what P4 relies on is asserted: the non-heralded drive takes a stall
-    anywhere in its window.
+    after that deadline) and not. M2: one host access, at most one stall cycle (M1), started at every
+    cycle from 60 before the second drive's deadline (start - LEAD) to 99 after it, past the drive's
+    start. M3: the 44-access AT pattern swept the same way across the heralded drive's window. A
+    capture is corrupt when it differs from the run without traffic (which a rerun reproduces bit for
+    bit). Every sweep must be clean: a corrupt capture at any offset, plain or heralded, fails the
+    test. This shows at least one cycle of slack at every offset in the predictor state the runs
+    reach; it bounds nothing more (REPORT §3.4: one mispredicted herald branch costs more).
 
-    FLOOR: two image loads and about 170 runs of ~2.5 k batches (two short-relax shots each, with
-    their DAC capture through the second drive)."""
+    FLOOR: two image loads and about 490 runs of ~2.7 k batches (two short-relax shots each, with
+    their DAC capture through the second drive): three sweeps of 160 cycles."""
     drv, m = cosim
     drv.sim.set_model({"kind": "zero"})
     found = {}
@@ -608,7 +620,7 @@ def test_m2_m3_k_batched_drives_under_host_traffic(cosim):
         found[("window", herald)] = (f"period {progs[0].bindings['period']}, drives at R + "
                                      f"{[w.cycle(t0 + r) - w.R for r in starts]}, deadline R + {dl}")
         magic = st.word_addr(m, 0, progs[0], "__rq_magic")
-        xs = range(dl - 60, dl + 102, 3)
+        xs = range(dl - 60, dl + 100)
         found[("M2", herald)] = [x - dl for x in xs
                                  if not np.array_equal(run(lambda R, rid, x=x: [(R + x, "read32", magic)])[2], ref)]
         if herald:
@@ -618,5 +630,4 @@ def test_m2_m3_k_batched_drives_under_host_traffic(cosim):
     print("\n[P4 M2/M3 k_batched] offsets (cycles from the drive's posting deadline) where traffic corrupts the "
           "second drive: " + "; ".join(f"{k[0]} {'heralded' if k[1] else 'plain'}: {v or 'none'}"
                                        for k, v in found.items()))
-    assert not found[("M2", False)], found
-    assert all(isinstance(found[k], list) for k in found if k[0] != "window")
+    assert not found[("M2", False)] and not found[("M2", True)] and not found[("M3", True)], found

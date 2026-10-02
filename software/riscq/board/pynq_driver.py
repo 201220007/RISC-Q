@@ -162,18 +162,24 @@ class PynqDriver:
         still in flight before it frees the drain buffer (a fixed buffer stays its owner's). If the
         channel cannot be stopped (r3, r4), the buffer stays in `riscq.board.ddr_board`'s in-flight
         registry, and the driver marks itself unusable and raises: its MMIO, the uplink's windows and
-        `attach_readout` refuse from then on, all but the S2MM reset a later close() retries."""
-        rd = getattr(self, "_rq_readout", None)
-        port = getattr(rd, "drv", None)
-        if port is not None and port is not self and hasattr(port, "close"):
-            try:
-                port.close()
-            except Exception as e:
-                self._unusable = (f"close() could not stop the uplink's S2MM channel ({type(e).__name__}: "
-                                  f"{e}); its drain buffer stays registered as in flight, and the PL needs a "
-                                  f"reload or a power cycle")
-                raise RuntimeError(self._unusable) from e
-        self._rq_readout = None
+        `attach_readout` refuse from then on, all but the S2MM reset a later close() retries. The
+        teardown, the unusable mark and dropping the cache happen under the board lock (r5), which
+        `attach_readout` takes too, so a concurrent attach sees either the driver before close() or
+        its outcome."""
+        from riscq.board.ddr_board import board_lock
+        from riscq.ddr import DdrMap
+        with board_lock(DdrMap().dma_base):
+            rd = getattr(self, "_rq_readout", None)
+            port = getattr(rd, "drv", None)
+            if port is not None and port is not self and hasattr(port, "close"):
+                try:
+                    (port._close if hasattr(port, "_close") else port.close)()
+                except Exception as e:
+                    self._unusable = (f"close() could not stop the uplink's S2MM channel ({type(e).__name__}: "
+                                      f"{e}); its drain buffer stays registered as in flight, and the PL needs "
+                                      f"a reload or a power cycle")
+                    raise RuntimeError(self._unusable) from e
+            self._rq_readout = None
         buf, self._host_buf = getattr(self, "_host_buf", None), None
         if buf is not None:
             buf.freebuffer()

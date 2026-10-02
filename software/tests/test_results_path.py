@@ -374,6 +374,50 @@ def test_attach_readout_is_refused_while_a_transfer_is_in_flight_or_the_driver_i
     assert drv._rq_readout is rd
 
 
+@pytest.mark.parametrize("stuck", [False, True], ids=["stop-confirmed", "stop-failed"])
+def test_a_concurrent_attach_waits_for_close_and_sees_its_outcome(fake_board, tmp_path, stuck):
+    """qubic3 r5: close() holds the board lock through its teardown, its unusable mark and the cache
+    drop, and attach_readout checks under it: an attach started mid-close waits, then lands after a
+    confirmed stop, or is refused after a failed one, which keeps the old readout."""
+    import threading
+    from riscq.board.ddr_board import DdrBoard
+    from riscq.ddr import DdrReadout, attach_readout
+    from riscq.map import SocMap
+    drv, rd = _antq_board_driver(fake_board, tmp_path)
+    dma = _arm(rd.drv, _CmaBuf("drain"), stuck=stuck)
+    entered, go, errors = threading.Event(), threading.Event(), {}
+    write = dma.write
+
+    def held_reset(off, val):
+        if off == 0x30 and val & dma.RESET:
+            entered.set()                               # close() is resetting, under the board lock
+            go.wait(5)
+        write(off, val)
+    dma.write = held_reset
+    new = DdrReadout(DdrBoard(soc=drv), soc_map=SocMap(drv.params))
+
+    def run(name, fn):
+        try:
+            fn()
+        except RuntimeError as e:
+            errors[name] = str(e)
+    closer = threading.Thread(target=run, args=("close", drv.close))
+    closer.start()
+    assert entered.wait(5)
+    attacher = threading.Thread(target=run, args=("attach", lambda: attach_readout(drv, new)))
+    attacher.start()
+    attacher.join(0.2)
+    assert attacher.is_alive(), "attach_readout ran while close() held the board lock"
+    go.set()
+    closer.join(5)
+    attacher.join(5)
+    if stuck:
+        assert "unusable" in errors["attach"] and "stays registered" in errors["close"]
+        assert drv._rq_readout is rd
+    else:
+        assert errors == {} and drv._rq_readout is new and _FREED[-1:] == ["drain"]
+
+
 def test_pynq_driver_close_stops_a_transfer_in_flight_then_frees(fake_board, tmp_path):
     """The success path: the S2MM reset is confirmed, then the buffer leaves the registry and is
     freed, the readout dropped, and close() returns normally."""

@@ -355,8 +355,12 @@ class DdrBoard:
         fails raises with every registered buffer still registered. The buffer is freed (unless it is
         fixed) only once nothing of the channel is registered."""
         with self._lock:
-            if self._active is not None or _INFLIGHT.get(self.map.dma_base):
-                self._reset()
-            if self._buf is not None and not self._fixed:   # a fixed buffer belongs to its owner
-                self._buf.freebuffer()
-                self._buf = None
+            self._close()
+
+    def _close(self):
+        """close() for a caller holding the board lock (`PynqDriver.close`)."""
+        if self._active is not None or _INFLIGHT.get(self.map.dma_base):
+            self._reset()
+        if self._buf is not None and not self._fixed:       # a fixed buffer belongs to its owner
+            self._buf.freebuffer()
+            self._buf = None

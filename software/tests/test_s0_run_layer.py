@@ -10,6 +10,7 @@ run_base mismatch, a zero timeout after BASE_RESET, a failing cleanup); G3 (EXPE
 STRAY, saturated counts); which transitions take the hardware flush; the flush sequence; POISONED and
 recover()."""
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +56,12 @@ def kernel(results=None, markers=True, done=True):
         if done:
             fake.done = sum(1 << c for c in fake.loaded)
     return run
+
+
+@pytest.fixture(autouse=True)
+def _short_hardware_polls(monkeypatch):
+    """FakeSoc takes the hardware poll, so a hung kernel times out after POLL_MIN_S of wall clock."""
+    monkeypatch.setattr(rq, "POLL_MIN_S", 0.01)
 
 
 def soc(text=ANTQ):
@@ -182,14 +189,33 @@ def test_mailbox_accepts_one_request_then_refuses_and_closes():
                         rq.request_stop(fake, (rid[0], rid[1] ^ 1), S.NEXT),
                         rq.request_stop(fake, (rid[0] - 1, rid[1]), S.NEXT)])
         fake.on_release = None
-        fake.done = 1
     f.on_release = release
+    hook.spec.policy = lambda ctx: setattr(f, "done", 1)       # the kernel ends during the 1st poll
     rq.rerun(f, m, {0: p}, stop=hook.spec)
     assert [t.outcome for t in tickets] == [S.ACCEPTED, S.REFUSED_DUPLICATE, S.LATE, S.LATE]
     assert hook.issued == [(S.session(f).runs[-1].run_id, S.AT, 5)]
     rid = S.session(f).runs[-1].run_id
     assert rq.request_stop(f, rid, S.NEXT).outcome == S.LATE                 # after DONE: closed
     assert rq.current_run(f) is None
+
+
+def test_a_run_seen_done_closes_its_mailbox_before_the_policy_and_the_requests():
+    """A request still queued when the poll loop first reads DONE is LATE: the loop closes the
+    mailbox and returns before it runs the policy or decides a request, so neither the policy nor
+    the hook runs and a completed run never holds an ACCEPTED ticket."""
+    f, m = soc(HW)
+    rq.setup(f, m, {0: prog()})
+    tickets, calls = [], []
+
+    def release(fake):
+        tickets.append(rq.request_stop(fake, rq.current_run(fake), S.NEXT))
+        fake.done = 1                                  # DONE before the first poll
+    f.on_release = release
+    hook = Hook(policy=lambda ctx: calls.append(ctx.done))
+    rq.rerun(f, m, {0: prog()}, stop=hook.spec)
+    assert [t.outcome for t in tickets] == [S.LATE] and hook.issued == [] and calls == []
+    run = S.session(f).runs[-1]
+    assert run.outcome == S.CERTIFIED and run.mailbox.accepted is None
 
 
 def test_a_request_to_a_run_without_a_stop_hook_is_not_stoppable():
@@ -227,7 +253,7 @@ def test_policy_request_and_policy_failure():
 
     def bad(ctx):
         raise ValueError("policy bug")
-    f.on_release = kernel()
+    f.on_release = kernel(done=False)
     with pytest.raises(ValueError, match="policy bug"):
         rq.rerun(f, m, {0: prog()}, stop=S.StopSpec(issue=lambda c, t: None, policy=bad))
     rec = S.session(f).last_failure
@@ -242,11 +268,35 @@ def test_a_failing_stop_hook_fails_the_run():
 
     def release(fake):
         S.session(fake).post_stop(rq.current_run(fake), S.NEXT)
-        fake.done = 1
     f.on_release = release
     with pytest.raises(RuntimeError, match="stop words"):
         rq.rerun(f, m, {0: prog()}, stop=hook.spec)
     assert S.session(f).runs[-1].outcome == S.FAILED
+
+
+# ── the hardware poll's wall-clock bound (after-stage r1 #4; the unit mismatch is upstream's) ──
+
+def test_hardware_polls_turn_cycle_timeouts_into_a_bounded_wall_clock_deadline(monkeypatch):
+    from riscq.cal.base import batch_timeout
+    from riscq.map import SocMap, SocParams
+    monkeypatch.setattr(rq, "POLL_MIN_S", 1.0)
+    board = SocMap(SocParams.from_json((CONFIGS / "zcu216-14q-antq.json").read_text()))
+    assert board.params.dsp_freq_hz == 500e6
+    # the cal layer's smallest timeout, 2·10^7 cycles, was 2·10^7 sleeps of 1 ms (5.5 h) upstream
+    assert batch_timeout(0) == 20_000_000 and rq.poll_seconds(board, batch_timeout(0)) == 1.0
+    n = 10**6 * 2000                                   # 10^6 shots at a 2000-batch period: 4 s of hardware
+    assert rq.poll_seconds(board, batch_timeout(n)) == pytest.approx(16.04)
+    assert rq.poll_seconds(board, 10**15) == rq.POLL_MAX_S == 600.0
+    # a hung kernel behind a hardware driver times out at the capped deadline, with and without a stop hook
+    monkeypatch.setattr(rq, "POLL_MAX_S", 0.2)
+    f, m = soc(HW)
+    rq.setup(f, m, {0: prog()})
+    f.on_release = kernel(done=False)
+    for stop in (None, Hook().spec):
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError, match="a 0.2 s wall-clock bound"):
+            rq.rerun(f, m, {0: prog()}, timeout=batch_timeout(10**9), stop=stop)
+        assert 0.2 <= time.monotonic() - t0 < 5.0
 
 
 # ── the failure lifecycle without the uplink (§4.2): FAILED, no data, the flush, an exact next run ──

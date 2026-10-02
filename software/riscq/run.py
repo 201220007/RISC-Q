@@ -181,8 +181,9 @@ def poll_done(drv, m: SocMap, cores, timeout: int = 2_000_000) -> int:
     clearing write and a stale DONE from the previous run cannot race this poll.
 
     `cores` is an iterable of core indices; parked cores never raise their bit, so pass only the
-    cores that were given a program. `timeout` is in sim/host-clock cycles when the driver has sim
-    extras, else read iterations. Loud TimeoutError naming the cores still missing."""
+    cores that were given a program. `timeout` is in dsp cycles (batches): the co-sim poll counts
+    them, and on hardware it is a wall-clock deadline, `poll_seconds(m, timeout)`. Loud TimeoutError
+    naming the cores still missing."""
     cores = list(cores)
     mask = 0
     for core in cores:
@@ -191,19 +192,36 @@ def poll_done(drv, m: SocMap, cores, timeout: int = 2_000_000) -> int:
     sim = getattr(drv, "sim", None)
     chunk = 20_000
     spent = 0
+    deadline = None if sim is not None else _time.monotonic() + poll_seconds(m, timeout)
     word = drv.read32(addr)
     while word & mask != mask:
-        if spent >= timeout:
-            missing = sorted(c for c in cores if not (word >> c) & 1)
-            raise TimeoutError(f"cores {missing} not DONE after {timeout} cycles "
-                               f"(DONE word = {word:#010x})")
+        if (spent >= timeout) if sim is not None else (_time.monotonic() >= deadline):
+            raise TimeoutError(_not_done(cores, word, timeout, m, sim))
         if sim is not None:
             word = sim.poll_word(addr, not_equal=word, timeout_cycles=min(chunk, timeout - spent))
+            spent += chunk
         else:
             _time.sleep(0.001)
             word = drv.read32(addr)
-        spent += chunk if sim is not None else 1
     return word
+
+
+# qubic3 S0 r1: the hardware poll's wall-clock bounds. Upstream counted the timeout as 1 ms sleeps, so
+# the cal layer's cycle-derived timeouts (`riscq.cal.base.batch_timeout`, at least 2·10^7) meant 5.5 h.
+POLL_MIN_S = 1.0             # host-side latency and scheduling: the shortest hardware poll
+POLL_MAX_S = 600.0           # the longest (10^6 shots x 14 cores at a 2000-batch period: 4 s at 500 MHz)
+
+
+def poll_seconds(m: SocMap, timeout: int) -> float:
+    """The wall-clock bound of a hardware DONE poll whose `timeout` is in dsp cycles (batches): that
+    many cycles at the build's `dsp_freq_hz`, at least POLL_MIN_S and at most POLL_MAX_S."""
+    return min(POLL_MAX_S, max(POLL_MIN_S, int(timeout) / float(m.params.dsp_freq_hz)))
+
+
+def _not_done(cores, word: int, timeout: int, m: SocMap, sim) -> str:
+    missing = sorted(c for c in cores if not (word >> c) & 1)
+    bound = "" if sim is not None else f", a {poll_seconds(m, timeout):.3g} s wall-clock bound"
+    return f"cores {missing} not DONE after {timeout} cycles{bound} (DONE word = {word:#010x})"
 
 
 def check_magic(drv, m: SocMap, core: int, program: Program) -> None:
@@ -577,20 +595,25 @@ def _check_markers(drv, m: SocMap, progs: dict[int, Program], out: dict | None =
 
 
 def _poll_stoppable(drv, m: SocMap, progs: dict, timeout: int, run, stop: StopSpec, s) -> int:
-    """The poll loop of a stoppable run (plan P4 v2 §4.3): each iteration reads DONE, runs the
-    policy (which may post a request), then decides the mailbox and hands an accepted request to the
-    stop hook. Paced by `poll_interval` (hardware; `timeout` is in milliseconds there, as in
-    `poll_done`) or `poll_cycles` (co-sim)."""
+    """The poll loop of a stoppable run (plan P4 v2 §4.3): each iteration reads DONE; once DONE is
+    seen it closes the mailbox (every request still queued is LATE) and returns, before any policy
+    or request is looked at, so a completed run never accepts a stop. Otherwise it runs the policy
+    (which may post a request), decides the mailbox and hands an accepted request to the stop hook.
+    Paced by `poll_interval` (hardware, against the wall-clock deadline `poll_seconds` gives) or
+    `poll_cycles` (co-sim); `timeout` is in cycles, as in `poll_done`."""
     cores = list(progs)
     mask = sum(1 << c for c in cores)
     addr = m.host_ctrl + m.HOST_DONE
     sim = getattr(drv, "sim", None)
     ctx = RunContext(drv, m, dict(progs), run.run_id, s)
-    deadline = _time.monotonic() + timeout * 1e-3
+    deadline = None if sim is not None else _time.monotonic() + poll_seconds(m, timeout)
     spent = 0
     word = drv.read32(addr)
     while True:
         ctx.done = word
+        if word & mask == mask:
+            run.mailbox.close()
+            return word
         if stop.policy is not None:
             try:
                 req = stop.policy(ctx)
@@ -602,12 +625,8 @@ def _poll_stoppable(drv, m: SocMap, progs: dict, timeout: int, run, stop: StopSp
         accepted = run.mailbox.drain()
         if accepted is not None:
             stop.issue(ctx, accepted)
-        if word & mask == mask:
-            return word
         if (spent >= timeout) if sim is not None else (_time.monotonic() >= deadline):
-            missing = sorted(c for c in cores if not (word >> c) & 1)
-            raise TimeoutError(f"cores {missing} not DONE after {timeout} "
-                               f"{'cycles' if sim is not None else 'ms'} (DONE word = {word:#010x})")
+            raise TimeoutError(_not_done(cores, word, timeout, m, sim))
         if sim is not None:
             step = min(int(stop.poll_cycles), timeout - spent)
             word = sim.poll_word(addr, not_equal=word, timeout_cycles=step)

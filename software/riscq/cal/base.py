@@ -233,8 +233,10 @@ def grid_period(relax: int, seq_batches: int, dur: int, delay: int = 0, herald: 
 
 
 def batch_timeout(nbatches: int) -> int:
-    """poll_done timeout (host/sim cycles) for a batch of `nbatches` grid batches: 4 cycles/batch +
-    boot slack (mirrors tests/test_batch)."""
+    """poll_done timeout, in dsp cycles, for a batch of `nbatches` grid batches: 4 cycles/batch +
+    boot slack (mirrors tests/test_batch). The co-sim poll counts the cycles; on hardware
+    `riscq.run.poll_seconds` turns them into a bounded wall-clock deadline at the build's
+    `dsp_freq_hz` (qubic3 S0 r1: upstream slept 1 ms per count, 5.5 h for the boot slack alone)."""
     return int(nbatches) * 4 + 20_000_000
 
 

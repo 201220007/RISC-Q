@@ -241,36 +241,51 @@ async def _capture_run(dut, m: SocMap, mirror: TimeMirror, cap: DacCapture) -> N
 class DacWatch:
     """qubic3 P6: a test observation of whole DAC outputs over a run of unknown length. Per DAC: the
     batches watched, the peak |sample|, the first and last batch stamp with a nonzero sample, and
-    the stamp where the last nonzero stretch began (the start of the last pulse)."""
+    the stamp where the last nonzero stretch began (the start of the last pulse). qubic3 P4 adds the
+    timed-DIO outputs `dios` (board port names, active while the level is nonzero, DIO_PIPE modelled
+    out) and, per output, every nonzero stretch [first, last] (up to STRETCHES), so one watch can
+    follow several runs and the gaps between them."""
 
-    def __init__(self, dac_ids):
+    STRETCHES = 4096
+
+    def __init__(self, dac_ids, dios=()):
         self.dac_ids = list(dac_ids)
-        self.stats = {d: {"batches": 0, "peak": 0, "first": None, "last": None, "last_rise": None}
-                      for d in self.dac_ids}
+        self.dios = list(dios)
+        self.stats = {d: {"batches": 0, "peak": 0, "first": None, "last": None, "last_rise": None,
+                          "stretches": []}
+                      for d in self.dac_ids + [f"dio:{n}" for n in self.dios]}
         self.stop = False
         self.done = False
 
 
 async def _watch_run(dut, st: "_BenchState", w: DacWatch) -> None:
-    prev = {d: False for d in w.dac_ids}
+    keys = w.dac_ids + [f"dio:{n}" for n in w.dios]
+    prev = {d: False for d in keys}
     try:
         while not w.stop:
             await FallingEdge(dut.dspClk)
             if st.mirror.origin_cycle is None:
                 continue
             t = st.mirror.time_of_cycle(_cycle())
-            for d in w.dac_ids:
-                lanes = _read_dac(dut, d)
-                peak = int(np.abs(lanes).max())
+            for d in keys:
+                if isinstance(d, str):
+                    peak = _int_or_zero(getattr(dut, f"io_dio_{d[4:]}_out"))
+                    stamp = t - DIO_PIPE
+                else:
+                    peak = int(np.abs(_read_dac(dut, d)).max())
+                    stamp = t - st.m.dac_pipe(d)
                 rec = w.stats[d]
                 rec["batches"] += 1
                 if peak:
-                    stamp = t - st.m.dac_pipe(d)
                     rec["peak"] = max(rec["peak"], peak)
                     rec["first"] = stamp if rec["first"] is None else rec["first"]
                     rec["last"] = stamp
                     if not prev[d]:
                         rec["last_rise"] = stamp
+                        if len(rec["stretches"]) < w.STRETCHES:
+                            rec["stretches"].append([stamp, stamp])
+                    elif rec["stretches"] and rec["stretches"][-1][1] == stamp - 1:
+                        rec["stretches"][-1][1] = stamp
                 prev[d] = bool(peak)
     finally:
         w.done = True
@@ -654,6 +669,16 @@ class DriverServer:
     def poll_word(self, addr, not_equal, timeout_cycles):
         return self._submit("poll_word", int(addr), int(not_equal), int(timeout_cycles))
 
+    # ── qubic3 P4 (after-stage r1 #1): deterministic bench scheduling ──
+    def lockstep(self, on):
+        """Lockstep (on) or free-running (off, the default) between requests; returns the cycle.
+        See CosimDriver.sim.lockstep."""
+        return self._submit("lockstep", bool(on))
+
+    def sched(self, ops):
+        """Host accesses at exact cycles, in one request; see CosimDriver.sim.sched."""
+        return self._submit("sched", [list(o) for o in ops])
+
     def dac_capture_arm(self, dac_id, n_batches, start_batch=None):
         return self._submit("dac_arm", int(dac_id), int(n_batches),
                             None if start_batch is None else int(start_batch))
@@ -661,8 +686,8 @@ class DriverServer:
     def dac_capture_get(self, handle):
         return self._submit("dac_get", int(handle))
 
-    def dac_watch_start(self, dac_ids):
-        return self._submit("watch_start", [int(d) for d in dac_ids])
+    def dac_watch_start(self, dac_ids, dios=None):
+        return self._submit("watch_start", [int(d) for d in dac_ids], [str(n) for n in (dios or ())])
 
     def dac_watch_stop(self, handle):
         return self._submit("watch_stop", int(handle))
@@ -786,6 +811,7 @@ class _BenchState:
         self.dm = DdrModel() if m.params.with_antq_uplink else None
         self.dio_loop: dict[str, bool] = {}
         self.ddr_axi: AxiMaster | None = None
+        self.lockstep = False   # qubic3 P4: sim time advances only inside requests (no idle free-run)
 
     def host_write(self, addr: int, data: int, strb: int) -> None:
         """Apply one AXI beat to the modelled buffer. An address outside the buffer is a real bug
@@ -843,7 +869,11 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
         for d in args[0]:
             if not hasattr(dut, f"io_dac_{d}_payload"):
                 raise ValueError(f"no such DAC port: io_dac_{d}_payload")
-        w = DacWatch(args[0])
+        dios = list(args[1]) if len(args) > 1 else []
+        for n in dios:
+            if not hasattr(dut, f"io_dio_{n}_out"):
+                raise ValueError(f"no such DIO port: io_dio_{n}_out")
+        w = DacWatch(args[0], dios)
         handle = st.new_capture(w)
         cocotb.start_soon(_watch_run(dut, st, w))
         return handle
@@ -961,6 +991,36 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
         st.mirror.host_reset()
         await ClockCycles(dut.clk, 64)          # the reset synchronisers and the uplink's DDR-half follow
         return None
+    if op == "lockstep":
+        st.lockstep = bool(args[0])
+        return _cycle()
+    if op == "sched":
+        # qubic3 P4 (after-stage r1 #1): each item [at, kind, *args] starts at clk cycle `at` (None: right
+        # after the previous one); a cycle already passed is an error, so a schedule is either kept or loud.
+        # Kinds: write32 (addr, value), read32 (addr), advance (cycles). Returns per item
+        # [start cycle, end cycle, value or None, batch time at the start].
+        out = []
+        for item in args[0]:
+            at, kind, rest = item[0], item[1], item[2:]
+            now = _cycle()
+            if at is not None:
+                if at < now:
+                    raise RuntimeError(f"sched: cycle {at} has passed (now {now}); no access was issued late")
+                if at > now:
+                    await ClockCycles(dut.clk, at - now)
+            t0 = _cycle()
+            value = None
+            if kind == "write32":
+                await axi.write_word(rest[0], rest[1])
+                st.mirror.on_write(rest[0], rest[1])
+            elif kind == "read32":
+                value = await axi.read_word(rest[0])
+            elif kind == "advance":
+                await ClockCycles(dut.clk, rest[0])
+            else:
+                raise ValueError(f"sched: unknown kind {kind!r}")
+            out.append([t0, _cycle(), value, st.mirror.time_of_cycle(t0) if st.mirror.origin_cycle is not None else None])
+        return out
     if op == "poll_word":
         addr, not_equal, timeout_cycles = args
         value = await axi.read_word(addr)
@@ -1043,8 +1103,12 @@ async def cosim_server(dut):
         try:
             req = reqs.get_nowait()
         except queue.Empty:
-            await ClockCycles(dut.clk, IDLE_TICK)   # bounded free-run between requests
-            continue
+            if not st.lockstep:
+                await ClockCycles(dut.clk, IDLE_TICK)   # bounded free-run between requests
+                continue
+            # qubic3 P4 lockstep: block without advancing the clock, so the client's think time moves no
+            # sim time and every host access lands on a cycle fixed by the requests alone
+            req = reqs.get()
         if req.op == "shutdown":
             req.result = True
             req.done.set()

@@ -52,6 +52,22 @@ class _SimExtras:
         so the cores stay held."""
         self._proxy.pl_reset(int(cycles))
 
+    def lockstep(self, on: bool = True) -> int:
+        """qubic3 P4 (after-stage r1 #1), deterministic bench scheduling. On: between requests the bench
+        waits without advancing the clock (by default it free-runs 200-cycle idle ticks while the
+        client thinks), so sim time moves only inside requests (each AXI access, poll_word, advance,
+        a capture) and a sequence of host operations lands on the same cycles every time, whatever
+        the wall-clock timing. Off restores the free-running default. Returns the current cycle."""
+        return int(self._proxy.lockstep(bool(on)))
+
+    def sched(self, ops) -> list:
+        """Host accesses at exact cycles, in one request: `ops` = [(at, kind, *args)], kind
+        `write32` (addr, value), `read32` (addr) or `advance` (cycles); `at` the clk cycle at which
+        the access starts (`cycles()` numbering), or None for right after the previous item. A cycle
+        already passed raises (nothing is issued late). Returns per item (start cycle, end cycle,
+        value read or None, batch time at the start)."""
+        return [tuple(r) for r in self._proxy.sched([list(o) for o in ops])]
+
     def poll_word(self, addr: int, not_equal: int, timeout_cycles: int) -> int:
         """Run the sim until the 32-bit word at `addr` != not_equal, or `timeout_cycles`
         elapse. Returns the last read value either way (caller decides loudness)."""
@@ -73,14 +89,17 @@ class _SimExtras:
         samples = np.frombuffer(_to_bytes(data), dtype="<i2").reshape(int(n), 16).copy()
         return int(t0), samples
 
-    def dac_watch_start(self, dac_ids) -> int:
+    def dac_watch_start(self, dac_ids, dios=()) -> int:
         """Start watching whole DAC outputs (qubic3 P6, a test observation): every batch from now
-        until `dac_watch_stop`, which returns {dac: {batches, peak, first, last, last_rise}} with the
-        batch stamps of the first and last nonzero sample and of the start of the last pulse."""
-        return int(self._proxy.dac_watch_start([int(d) for d in dac_ids]))
+        until `dac_watch_stop`, which returns {dac: {batches, peak, first, last, last_rise,
+        stretches}} with the batch stamps of the first and last nonzero sample, of the start of the
+        last pulse, and (qubic3 P4) every nonzero stretch [first, last]. `dios` adds timed-DIO board
+        ports (`<core>_<channel>`), keyed "dio:<port>", active while their level is nonzero."""
+        return int(self._proxy.dac_watch_start([int(d) for d in dac_ids], [str(n) for n in dios]))
 
     def dac_watch_stop(self, handle: int) -> dict:
-        return {int(d): dict(rec) for d, rec in dict(self._proxy.dac_watch_stop(int(handle))).items()}
+        return {(d if str(d).startswith("dio:") else int(d)): dict(rec)
+                for d, rec in dict(self._proxy.dac_watch_stop(int(handle))).items()}
 
     def dio_capture_arm(self, name: str, n_batches: int, start_batch: int | None = None) -> int:
         """ARM a timed-DIO capture of the board port `io_dio_<name>_out` (`<core>_<channel>`), like

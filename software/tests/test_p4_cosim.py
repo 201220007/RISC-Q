@@ -22,8 +22,9 @@ heralded. The drain certifies exactly the counted reads of each core after AT(S)
 run, the DDR words equal the CPU's results, REJECTED stays 0 through G2, the `landed` policy stops on
 the uplink's own CUR_ADDR, a hung stoppable run fails and the next uplink run is exact.
 
-C5, completion (`cosim_antq`): a stopped readout that drives the `ro` DAC; every DAC sample precedes
-fin, and the next run's first drive is its own.
+C5, completion (`cosim_antq`): a stopped readout that drives the gate DAC, the readout DAC and the
+DIO bank, watched continuously across it and the next run; C6: a stopped uplink run and the next one
+under DDR stalls.
 
 The remote seam (`cosim`, last): a RemoteDriver sends the stop spec's wire form to the bench's
 server-side runner, the board server's twin, and the run's StopRecord comes back with the results.
@@ -510,19 +511,49 @@ def test_a_hung_stoppable_uplink_run_fails_and_the_next_is_exact(up2):
     assert rec.outcome == S.FIRED and s.runs[-1].flushed == S.FLUSH_FAILED
 
 
-# ── C5, completion after a stop (§5.4): every DAC sample precedes fin, nothing stale plays next ──
+# ── C6 under DDR stalls (plan P4 v2 §8): a stop in run 1 only, run 2 exact ──
 
-RO_DUR = 48                         # the readout drive outlasts the 40-batch demod: t_end is its end
+@pytest.mark.batch_cap(120_000)
+def test_c6_two_uplink_runs_under_ddr_stalls_a_stop_in_the_first(up2):
+    """C6: the DDR model delays every write response 900 ui cycles and holds AW, AR and B off 80 %
+    of the cycles and the drain's TREADY 70 % (G3' run 2's stall set). Run 1 is stopped by AT(S),
+    run 2 runs its n shots; both certify exactly, each core's drain on its counted reads, and the
+    stalls really happened.
+
+    FLOOR: two uplink reruns slowed by the stalls (~30 k batches each) plus their shots."""
+    drv, m, progs = up2
+    _tone(drv, m, adcs=(m.adc_of(0), m.adc_of(1)))
+    before = drv.sim.ddr_config(dict(b_delay=900, aw_stall=0.8, ar_stall=0.8, b_stall=0.8, tready_stall=0.7))
+    try:
+        _, rec = _up(up2, 40, _spec(st.AtProgress(3)), base=0x20000)
+        assert rec.outcome == S.FIRED and rec.request["verified"]
+        _, rec2 = _up(up2, 12, base=0x40000)
+        assert rec2.outcome == S.NATURAL and rec2.reads == {0: 12, 1: 18}
+        stats = drv.sim.ddr_config()
+    finally:
+        drv.sim.ddr_config(dict(b_delay=0, aw_stall=0.0, ar_stall=0.0, b_stall=0.0, tready_stall=0.0))
+    stalled = {k: stats[k] - before[k] for k in ("aw_stalled", "b_stalled", "axis_stalled")}
+    assert all(v > 0 for v in stalled.values()), stalled
+    print(f"\n[P4 C6] FIRED at {rec.request['S']}, then NATURAL, under stalls {stalled}")
+
+
+# ── C5, completion after a stop (§5.4), observed continuously across reuse ──
+
+RO_DUR, GD = 48, 16                 # the readout drive (48 batches) starts after the 16-batch gate pulse
 
 
 @kernel
-def k_ro(ro: ParamTable, demod: ParamTable, grp: Group, rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int,
-         rq_status: Array, out: Array, code: int, n: int, period: int):
-    """A stoppable readout: each shot plays the readout drive and its demod at t. After the
+def k_ro(gate: ParamTable, ro: ParamTable, demod: ParamTable, ttl: ParamTable, grp: Group, rq_epoch: int,
+         rq_stop_epoch: int, rq_stop_at: int, rq_status: Array, out: Array, code: int, n: int, period: int):
+    """A stoppable readout that drives every output it has: each shot plays a gate pulse and a DIO
+    pulse (on, then off 6 batches later) at t, the readout drive and its demod at t + GD. After the
     epilogue (the last drive has ended, plus LEAD) it records out[0] = now() just before fin,
     out[1] = t of the last shot posted and out[2] = t of the first."""
+    init_pulse_params(gate.pulses)  # noqa: F821
     init_pulse_params(ro.pulses)  # noqa: F821
     init_pulse_params(demod.pulses)  # noqa: F821
+    init_pulse_params(ttl.pulses)  # noqa: F821
+    set_freq(gate, gate.freq)  # noqa: F821
     set_freq(ro, ro.freq)  # noqa: F821   (set_freq regenerates the phasors; without it the drive plays 0)
     set_freq(demod, code)  # noqa: F821
     t = barrier(grp) + period  # noqa: F821
@@ -534,14 +565,17 @@ def k_ro(ro: ParamTable, demod: ParamTable, grp: Group, rq_epoch: int, rq_stop_e
     while s < n:
         if rq_stop_epoch == e and s >= rq_stop_at:
             break
-        play(ro, ro["m"], t)  # noqa: F821
-        play(demod, demod["sq"], t)  # noqa: F821
+        play(gate, gate["g"], t)  # noqa: F821
+        play(ttl, ttl["on"], t)  # noqa: F821
+        fire(ttl, ttl["off"])  # noqa: F821
+        play(ro, ro["m"], t + GD)  # noqa: F821
+        play(demod, demod["sq"], t + GD)  # noqa: F821
         t_last = t
-        t_end = t + RO_DUR
+        t_end = t + GD + RO_DUR
         s = s + 1
         rq_status[0] = s
         rq_status[1] = s
-        wait_until(t + READOUT_LEAD)  # noqa: F821
+        wait_until(t + GD + READOUT_LEAD)  # noqa: F821
         read_res()  # noqa: F821
         t = t + period
     if s > 0:
@@ -552,42 +586,61 @@ def k_ro(ro: ParamTable, demod: ParamTable, grp: Group, rq_epoch: int, rq_stop_e
     rq_status[2] = e
 
 
-@pytest.mark.batch_cap(55_000)
-def test_completion_after_a_stop_every_dac_sample_precedes_fin(cosim_antq):
-    """C5 (plan P4 v2 §5.4) on sim-dio-antq: an AT(S) stop of a readout that drives the `ro` DAC
-    every shot. The DAC watch sees the first drive at the first shot's t, the last one start at the
-    last posted shot's t and end RO_DUR later, S shots in all, and its last nonzero sample before
-    the kernel's now() at fin: the stop posted nothing past its boundary and the epilogue waited out
-    everything posted. The run after it (no request) starts its drive at its own first t, so nothing
-    stale played in between; both runs certify through the uplink.
+@pytest.mark.batch_cap(60_000)
+def test_completion_after_a_stop_observed_continuously_across_reuse(cosim_antq):
+    """C5 (plan P4 v2 §5.4) on sim-dio-antq core 0: an AT(S) stop of a readout that drives the gate
+    DAC, the readout DAC and the timed-DIO bank every shot, then the next run without a request.
+    One watch follows all three outputs from before the first release to after the second run. In
+    each run every output pulses exactly once per shot it ran, at the shot's own time (the readout
+    GD later), and its last sample comes before the kernel's now() at fin; between the first run's
+    fin and the second run's first shot no output moves. The decoder is covered by the uplink:
+    both runs certify with exactly their counted results, REJECTED stays 0 through G2, and the
+    second run's quiesce finds no stray result.
 
     FLOOR: the 1-core image load (~10 k batches) and two uplink reruns at ~16 k batches each plus
     ~22 and 3 shots at 384 batches."""
+    from riscq.lang import DioTable
     drv, m = cosim_antq
     _tone(drv, m, adcs=(m.adc_of(0),))
-    ro = ParamTable(m.channel_named("ro", 0), 0.0, {"m": Pulse(envelopes.square(RO_DUR), amp=0.5)})
-    demod = ParamTable(m.channel_named("demod", 0), 0.0, {"sq": Pulse(envelopes.square(DUR), amp=1.0)})
-    progs = {0: compile_kernel(k_ro, m, core=0, tables=dict(ro=ro, demod=demod), grp=Group([0], id=0),
-                               out=Array(3), code=pack16(4 * F), period=PERIOD,
+    drv.sim.dio_loopback("q0_ttl", False)
+    tables = dict(
+        gate=ParamTable(m.channel_named("gate", 0), 50e6, {"g": Pulse(envelopes.square(4 * GD), freq_hz=50e6, amp=0.5)}),
+        ro=ParamTable(m.channel_named("ro", 0), 0.0, {"m": Pulse(envelopes.square(RO_DUR), amp=0.5)}),
+        demod=ParamTable(m.channel_named("demod", 0), 0.0, {"sq": Pulse(envelopes.square(DUR), amp=1.0)}),
+        ttl=DioTable(m.channel_named("ttl", 0), {"on": (0x0001, 0x0001, 6), "off": (0x0001, 0x0000, 6)}))
+    progs = {0: compile_kernel(k_ro, m, core=0, tables=tables, grp=Group([0], id=0), out=Array(3),
+                               code=pack16(4 * F), period=PERIOD,
                                stop=StopConvention("n", at=True, lead=1, reads_per_shot=1))}
     rq.setup(drv, m, progs)
-    dac = m.ro_dac(0)
-    for n, spec in ((40, _spec(st.AtProgress(2))), (3, None)):
-        h = drv.sim.dac_watch_start([dac])
-        try:
+    outputs = {"gate": m.channel_named("gate", 0).dac, "ro": m.ro_dac(0), "ttl": "dio:q0_ttl"}
+    starts = {"gate": 0, "ro": GD, "ttl": 0}
+    h = drv.sim.dac_watch_start([outputs["gate"], outputs["ro"]], dios=["q0_ttl"])
+    runs = []
+    try:
+        for n, spec in ((40, _spec(st.AtProgress(2))), (3, None)):
             out = rq.rerun(drv, m, progs, params={0: {"n": n}}, results=["rq_status", "out"], stop=spec,
                            uplink=rq.UplinkRun(expected={0: n}, base=0x8000))
-        finally:
-            seen = drv.sim.dac_watch_stop(h)[dac]
-        rec = st.last(drv)
-        shots = rec.shots[0]
-        t_fin, t_last, t_first = (int(x) for x in out[0]["out"])
-        assert rec.outcome == (S.FIRED if spec is not None else S.NATURAL)
-        assert shots == (rec.request["S"] if spec is not None else n) and len(out[0]["__uplink"]) == 2 * shots
-        assert seen["first"] == t_first and seen["last_rise"] == t_last == t_first + (shots - 1) * PERIOD, seen
-        assert seen["last"] + 1 == t_last + RO_DUR and seen["last"] < t_fin, (seen, t_fin)
-        print(f"\n[P4 C5] {rec.outcome}: {shots} shots, drive {seen['first']}..{seen['last']}, fin at {t_fin} "
-              f"({t_fin - seen['last'] - 1} batches after the last drive sample)")
+            rec = st.last(drv)
+            assert rec.outcome == (S.FIRED if spec is not None else S.NATURAL)
+            assert len(out[0]["__uplink"]) == 2 * rec.shots[0]
+            runs.append((rec.shots[0], *(int(x) for x in out[0]["out"])))
+            assert rq._readout(drv, m).rejected() == [0, 0]
+    finally:
+        seen = drv.sim.dac_watch_stop(h)
+    (s1, fin1, last1, first1), (s2, fin2, last2, first2) = runs
+    assert last1 == first1 + (s1 - 1) * PERIOD and last2 == first2 + (s2 - 1) * PERIOD
+    for name, key in outputs.items():
+        st_ = [tuple(x) for x in seen[key]["stretches"]]
+        run1 = [x for x in st_ if x[0] < fin1]
+        run2 = [x for x in st_ if x[0] > fin1]
+        assert [x[0] for x in run1] == [first1 + k * PERIOD + starts[name] for k in range(s1)], (name, run1)
+        assert [x[0] for x in run2] == [first2 + k * PERIOD + starts[name] for k in range(s2)], (name, run2)
+        assert run1[-1][1] < fin1 and run2[-1][1] < fin2, (name, run1[-1], fin1, run2[-1], fin2)
+        assert not [x for x in st_ if fin1 <= x[0] < first2 or fin1 <= x[1] < first2], name
+    assert not any(n.startswith("STRAY") for n in S.session(drv).notes)
+    print(f"\n[P4 C5] FIRED at {s1} shots, then {s2}; gate/ro/ttl pulse once per shot; fin1 "
+          f"{fin1 - max(seen[k]['stretches'][s1 - 1][1] for k in outputs.values())} batches after the last "
+          f"sample of run 1; no output moved in the {first2 - fin1} batches before run 2")
 
 
 # ── the remote seam (§4.3): the server-side runner publishes, the record comes back ──

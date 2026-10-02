@@ -154,14 +154,14 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
 
 @pytest.fixture(autouse=True)
-def _dma_quarantine():
-    """qubic3 r3: the DMA buffer quarantine (`riscq.board.ddr_board`) is process-wide; each test
+def _dma_inflight():
+    """qubic3 r4: the DMA in-flight registry (`riscq.board.ddr_board`) is process-wide; each test
     leaves it as it found it, so a test's deliberately stuck channel cannot refuse a later attach."""
     from riscq.board import ddr_board
-    saved = {k: list(v) for k, v in ddr_board._QUARANTINE.items()}
+    saved = {k: list(v) for k, v in ddr_board._INFLIGHT.items()}
     yield
-    ddr_board._QUARANTINE.clear()
-    ddr_board._QUARANTINE.update(saved)
+    ddr_board._INFLIGHT.clear()
+    ddr_board._INFLIGHT.update(saved)
 
 
 @pytest.fixture(scope="session")

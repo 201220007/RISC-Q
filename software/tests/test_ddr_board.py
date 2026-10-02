@@ -242,7 +242,7 @@ def test_close_stops_the_channel_before_freeing_the_buffer(fake_pynq):
     b.close()
     reset_at = [i for i, e in enumerate(dma.log) if e[0] == "w" and e[1] == 0x30 and e[2] & 0x4]
     assert reset_at, "close() must reset the channel when a transfer is in flight"
-    assert buf.freed == 1 and _quarantined() == []
+    assert buf.freed == 1 and _inflight() == []
 
 
 def test_close_keeps_the_buffer_if_the_channel_cannot_be_stopped(fake_pynq):
@@ -255,15 +255,15 @@ def test_close_keeps_the_buffer_if_the_channel_cannot_be_stopped(fake_pynq):
     with pytest.raises(RuntimeError, match="did not clear"):
         b.close()
     assert buf.freed == 0, "the buffer must NOT be freed when the DMA could not be stopped"
-    assert [x[1] for x in _quarantined()] == [buf]      # qubic3 r3: held whatever happens to `b`
+    assert [x[1] for x in _inflight()] == [buf]      # qubic3 r4: held whatever happens to `b`
     dma.model_dma = True                        # the reset now clears: the confirmed stop
     b.close()
-    assert buf.freed == 1 and _quarantined() == []
+    assert buf.freed == 1 and _inflight() == []
 
 
-def _quarantined():
-    from riscq.board.ddr_board import quarantined
-    return quarantined()
+def _inflight():
+    from riscq.board.ddr_board import inflight
+    return inflight()
 
 
 class _StuckAfterLength(FakeMMIO):
@@ -277,10 +277,10 @@ class _StuckAfterLength(FakeMMIO):
             self.regs[0x34] |= 0x10                         # DMAIntErr right after the start
 
 
-def test_an_exception_after_length_with_a_failed_reset_quarantines_and_raises(fake_pynq):
-    """qubic3 r3 #3: the transfer is recorded before the first arming write, so a failure after
-    LENGTH whose reset also fails leaves the board possibly armed: the buffer is quarantined, a
-    new arm is refused, and close() raises without freeing. A confirmed reset releases it."""
+def test_an_exception_after_length_with_a_failed_reset_keeps_the_buffer_registered(fake_pynq):
+    """qubic3 r3 #3, r4: the buffer is registered before the first arming write, so a failure after
+    LENGTH whose reset also fails leaves it registered: a new arm is refused, and close() raises
+    without freeing. A confirmed reset releases it."""
     from riscq.board.ddr_board import DdrBoard
     m = DdrMap()
     stuck = _StuckAfterLength(m.dma_base, m.dma_size)
@@ -289,15 +289,95 @@ def test_an_exception_after_length_with_a_failed_reset_quarantines_and_raises(fa
     with pytest.raises(RuntimeError, match="error immediately after LENGTH"):
         b.dma_recv_prepare(32)
     buf = b._buf
-    assert b._active == (buf, 32) and [x[1] for x in _quarantined()] == [buf]
+    assert b._active == (buf, 32) and [x[1] for x in _inflight()] == [buf]
     with pytest.raises(RuntimeError, match="already in flight"):
         b.dma_recv_prepare(32)
     with pytest.raises(OSError, match="bus error"):
         b.close()
-    assert buf.freed == 0 and [x[1] for x in _quarantined()] == [buf]
+    assert buf.freed == 0 and [x[1] for x in _inflight()] == [buf]
     stuck.regs.pop(0x58)                                    # the reset works again
     b.close()
-    assert buf.freed == 1 and _quarantined() == [] and b._active is None
+    assert buf.freed == 1 and _inflight() == [] and b._active is None
+
+
+def test_a_keyboard_interrupt_after_length_leaves_the_buffer_registered(fake_pynq):
+    """qubic3 r4: no exception path has to register anything, KeyboardInterrupt included (the
+    arm's `except Exception` does not see it, so no reset is even tried)."""
+    from riscq.board.ddr_board import DdrBoard
+    m = DdrMap()
+
+    class Interrupted(FakeMMIO):
+        def write(self, off, val):
+            super().write(off, val)
+            if off == 0x58:
+                raise KeyboardInterrupt
+    b = DdrBoard()
+    b._mmio[(m.dma_base, m.dma_size)] = Interrupted(m.dma_base, m.dma_size)
+    with pytest.raises(KeyboardInterrupt):
+        b.dma_recv_prepare(32)
+    buf = b._buf
+    assert [x[1] for x in _inflight()] == [buf] and buf.freed == 0
+    b.close()                                               # the reset is confirmed: released, freed
+    assert buf.freed == 1 and _inflight() == []
+
+
+def test_a_module_reload_keeps_the_registry(fake_pynq):
+    """qubic3 r4: reloading riscq.board.ddr_board keeps the registry and the locks themselves."""
+    import importlib
+    from riscq.board import ddr_board
+    b = ddr_board.DdrBoard()
+    buf = b.dma_recv_prepare(32)
+    registry, locks = ddr_board._INFLIGHT, ddr_board._LOCKS
+    importlib.reload(ddr_board)
+    assert ddr_board._INFLIGHT is registry and ddr_board._LOCKS is locks
+    assert [x[1] for x in ddr_board.inflight()] == [buf]
+    b.close()
+    assert buf.freed == 1 and ddr_board.inflight() == []
+
+
+def test_close_and_arm_are_serialised_by_the_board_lock(fake_pynq):
+    """qubic3 r4: a close() started while another thread is arming waits for the arm (it holds the
+    board lock), then resets the channel before it frees the buffer."""
+    import threading
+    from riscq.board.ddr_board import DdrBoard
+    m = DdrMap()
+    entered, go, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class SlowArm(FakeMMIO):
+        def write(self, off, val):
+            if off == 0x58 and not go.is_set():             # hold the arm at LENGTH
+                entered.set()
+                go.wait(5)
+            super().write(off, val)
+    dma = SlowArm(m.dma_base, m.dma_size)
+    b = DdrBoard()
+    b._mmio[(m.dma_base, m.dma_size)] = dma
+    armed = []
+    t_arm = threading.Thread(target=lambda: armed.append(b.dma_recv_prepare(32)))
+    t_arm.start()
+    assert entered.wait(5)
+    t_close = threading.Thread(target=lambda: (b.close(), closed.set()))
+    t_close.start()
+    assert not closed.wait(0.2), "close() ran while the arm held the board lock"
+    go.set()
+    t_arm.join(5)
+    t_close.join(5)
+    assert armed and closed.is_set()
+    writes = [(e[1], e[2]) for e in dma.log if e[0] == "w"]
+    assert writes.index((0x30, FakeMMIO.RESET)) > writes.index((0x58, 32))   # stopped after the arm
+    assert armed[0].freed == 1 and _inflight() == []
+
+
+def test_a_completed_transfer_releases_its_buffer(fake_pynq):
+    """The success path: the completed transfer leaves the registry, and close() frees."""
+    b = _board()
+    buf = b.dma_recv_prepare(32)
+    assert [x[1] for x in _inflight()] == [buf]
+    fake_pynq[DdrMap().dma_base].regs[b.S2MM_DMASR] = b.DMASR_IDLE      # idle, not halted: done
+    b.dma_recv_wait(buf, 32)
+    assert _inflight() == [] and buf.freed == 0
+    b.close()
+    assert buf.freed == 1
 
 
 def test_a_failed_arm_resets_the_channel(fake_pynq):

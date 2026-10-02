@@ -160,8 +160,8 @@ class PynqDriver:
         sees the pool free (specs/software/22 §3). On an antq_uplink build that includes the run
         layer's cached uplink readout (qubic3 S0 r1): its `DdrBoard.close()` stops an S2MM transfer
         still in flight before it frees the drain buffer (a fixed buffer stays its owner's). If the
-        channel cannot be stopped (r3), the buffer stays in `riscq.board.ddr_board`'s quarantine,
-        and the driver marks itself unusable and raises: its MMIO, the uplink's windows and
+        channel cannot be stopped (r3, r4), the buffer stays in `riscq.board.ddr_board`'s in-flight
+        registry, and the driver marks itself unusable and raises: its MMIO, the uplink's windows and
         `attach_readout` refuse from then on, all but the S2MM reset a later close() retries."""
         rd = getattr(self, "_rq_readout", None)
         port = getattr(rd, "drv", None)
@@ -170,8 +170,8 @@ class PynqDriver:
                 port.close()
             except Exception as e:
                 self._unusable = (f"close() could not stop the uplink's S2MM channel ({type(e).__name__}: "
-                                  f"{e}); its drain buffer is quarantined, and the PL needs a reload or a "
-                                  f"power cycle")
+                                  f"{e}); its drain buffer stays registered as in flight, and the PL needs a "
+                                  f"reload or a power cycle")
                 raise RuntimeError(self._unusable) from e
         self._rq_readout = None
         buf, self._host_buf = getattr(self, "_host_buf", None), None

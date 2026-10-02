@@ -535,18 +535,20 @@ class DdrReadout:
 
 def attach_readout(drv, readout):
     """Make `readout` the DdrReadout the run layer uses for `drv` (qubic3 S0/P6), e.g. one over a
-    `DdrBoard` holding a fixed, externally owned DMA buffer. Refused while `drv` is unusable or any
-    DMA buffer is quarantined (qubic3 r3, `riscq.board.ddr_board`): a new readout must not take over
-    a channel that may still be writing."""
+    `DdrBoard` holding a fixed, externally owned DMA buffer. Refused while `drv` is unusable or any DMA
+    buffer is registered as in flight or not yet confirmed stopped (qubic3 r4, `riscq.board.ddr_board`),
+    under the board's lock: a new readout must not take over a channel that may still be writing."""
     why = getattr(drv, "_unusable", None)
     if why:
         raise RuntimeError(f"attach_readout refused: the driver is unusable ({why})")
-    from riscq.board.ddr_board import quarantined
-    held = quarantined()
-    if held:
-        raise RuntimeError(f"attach_readout refused: {len(held)} DMA buffer(s) quarantined, the S2MM "
-                           f"channel at {held[0][0]:#x} not yet stopped ({held[0][2]})")
-    setattr(drv, "_rq_readout", readout)
+    from riscq.board.ddr_board import board_lock, inflight
+    base = getattr(getattr(getattr(readout, "drv", None), "map", None), "dma_base", None)
+    with board_lock(DdrMap().dma_base if base is None else base):
+        held = inflight()
+        if held:
+            raise RuntimeError(f"attach_readout refused: {len(held)} DMA buffer(s) in flight or not yet "
+                               f"confirmed stopped on the S2MM channel at {held[0][0]:#x}")
+        setattr(drv, "_rq_readout", readout)
     return readout
 
 

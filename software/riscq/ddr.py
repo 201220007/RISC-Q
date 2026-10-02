@@ -71,6 +71,22 @@ def parse_words(words):
     return tag, real, imag
 
 
+# qubic3 S0 r1: the estimate the run layer returns for a 28-bit field. `parse_words` gives the field
+# itself, the integral with its low 4 bits cleared (a floor: +7.5 LSB of error on average when the low
+# bits are uniform, which averaging over shots does not remove); the half step centres the estimate
+# in the field's 16-LSB interval, leaving an error in [-8, 7] with a mean of -0.5.
+HALF_STEP = 8
+
+
+def reconstruct(fields):
+    """The midpoint estimate of 32-bit integrals from their decoded 28-bit fields (`parse_words`):
+    field + HALF_STEP, as int32 (a field is at most 2^31 - 16, so this cannot overflow)."""
+    a = np.asarray(fields, dtype=np.int32)
+    if np.any(a & 15):
+        raise ValueError("reconstruct takes decoded 28-bit fields (low 4 bits clear)")
+    return (a + np.int32(HALF_STEP)).astype(np.int32)
+
+
 class DdrReadout:
     """`drv` must provide `read32`/`write32` (the `riscq.board.PynqDriver` surface) and, for
     `drain()`, `dma_recv_prepare(nbytes)` / `dma_recv_wait(buf, nbytes)`. Drain completion MUST be the

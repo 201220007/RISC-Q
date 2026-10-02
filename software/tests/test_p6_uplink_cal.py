@@ -24,7 +24,7 @@ from riscq.cal.cals.readout import PREP, _prepped
 from riscq.cal.experiment import Experiment, _t_end
 from riscq.cal.measure import Measure
 from riscq.cal.sequence import ActiveReset, Gate, Meas
-from riscq.ddr import DdrUplinkError, LateActivity, RING_LIMIT, parse_words, preflight
+from riscq.ddr import DdrUplinkError, LateActivity, RING_LIMIT, parse_words, preflight, reconstruct
 from riscq.map import LEAD, SocMap, SocParams, pack16
 from tests.cal_fixtures import _cfg, _cfg2, _s
 from tests.fake_soc import FakeSoc
@@ -175,14 +175,41 @@ def test_a_none_core_waits_lead_and_carries_the_marker():
 EXTREMES = [-2 ** 31, -2 ** 31 + 16, -16, 0, 15, 2 ** 31 - 16, 2 ** 31 - 1, -1]
 
 
+def _floor16(v):
+    return (np.asarray(v, dtype=np.int64).astype(np.int32) >> 4 << 4).astype(np.int32)
+
+
 def test_uplink_words_decode_at_the_extremes():
     iq = np.array([[re, im] for re in EXTREMES for im in EXTREMES[::-1]], dtype=np.int64).reshape(-1)
     got = uplink_iq(1, iq)
-    want = (iq.astype(np.int32) >> 4 << 4).astype(np.int32)
+    want = _floor16(iq) + 8                         # the field, plus the run layer's half step
     assert np.array_equal(got, want)
-    assert list(got[:2]) == [-2 ** 31, -1 << 4] and 15 not in got
+    assert list(got[:2]) == [-2 ** 31 + 8, -16 + 8] and got.max() == 2 ** 31 - 8
     tag, re, im = parse_words(np.array([(1 << 56) | (0x8000000 << 28) | 0x7FFFFFF], dtype="<u8"))
     assert (int(tag[0]), int(re[0]), int(im[0])) == (1, -2 ** 31, 2 ** 31 - 16)    # sign in each field
+    assert list(reconstruct(np.array([-2 ** 31, 2 ** 31 - 16]))) == [-2 ** 31 + 8, 2 ** 31 - 8]
+    with pytest.raises(ValueError, match="low 4 bits"):
+        reconstruct(np.array([15]))
+
+
+def test_the_half_step_removes_the_flooring_bias():
+    """After-stage r1 #10: under uniform low bits the floor (parse_words' field) errs by +7.5 LSB on
+    average, which averaging over shots keeps; the estimate errs by -0.5 (the integer half step), in
+    [-8, 7]. Every low-bit value under fields of both signs and at both ends of the range."""
+    fields = np.array([-2 ** 31, -2 ** 31 + 16, -4096, -32, -16, 0, 16, 4096, 2 ** 31 - 32, 2 ** 31 - 16],
+                      dtype=np.int64)
+    v = (fields[:, None] + np.arange(16)).reshape(-1)       # uniform low bits under each field
+    iq = np.stack([v, v[::-1]], axis=1).reshape(-1)        # the imaginary field from the other end
+    got = uplink_iq(0, iq).astype(np.int64)
+    err, err_floor = iq - got, iq - _floor16(iq)
+    assert err_floor.mean() == 7.5 and (err_floor.min(), err_floor.max()) == (0, 15)
+    assert err.mean() == -0.5 and (err.min(), err.max()) == (-8, 7)
+    for c in (0, 1):                                       # per component, per sign
+        for sign in (-1, 1):
+            sel = np.sign(iq[c::2] + 0.5) == sign
+            assert err[c::2][sel].mean() == -0.5
+    assert list(uplink_iq(0, [-1, -16])) == [-8, -8] and list(uplink_iq(0, [2 ** 31 - 1, -2 ** 31])) \
+        == [2 ** 31 - 8, -2 ** 31 + 8]
 
 
 def test_raw_experiment_decodes_in_order_and_shape_through_the_uplink(responder):
@@ -201,8 +228,8 @@ def test_raw_experiment_decodes_in_order_and_shape_through_the_uplink(responder)
     y = s[0].y
     assert y.shape == (npts * shots, 2)
     k = np.arange(npts * shots)
-    assert np.array_equal(y[:, 0], 16 * ((k // shots) * 1000 + k % shots))
-    assert np.array_equal(y[:, 1], -16 * ((k // shots) * 1000 + k % shots))
+    assert np.array_equal(y[:, 0], 16 * ((k // shots) * 1000 + k % shots) + 8)      # the half step
+    assert np.array_equal(y[:, 1], -16 * ((k // shots) * 1000 + k % shots) + 8)
     assert r.uplinks[0].expected == {0: npts * shots}
 
 
@@ -438,7 +465,7 @@ def test_an_experiment_raises_with_no_data_and_the_next_certifies(fault, err, mo
     f = _antq_soc()
     cfg = _cfg(M_ANTQ)
     ok = _raw_exp(cfg).run(f)
-    assert np.array_equal(ok[0].y[:, 0], 16 * np.arange(1, 5))
+    assert np.array_equal(ok[0].y[:, 0], 16 * np.arange(1, 5) + 8)              # field + the half step
     if fault == "g2":
         real = rq._settle
         monkeypatch.setattr(rq, "_settle", lambda drv, u: (f.up.post(1, 0, 0), real(drv, u)))
@@ -451,7 +478,7 @@ def test_an_experiment_raises_with_no_data_and_the_next_certifies(fault, err, mo
     s = S.session(f)
     assert s.runs[-1].outcome == S.FAILED and s.pending_flush.reason == S.FLUSH_FAILED
     again = _raw_exp(cfg).run(f)                          # its setup takes the flush
-    assert np.array_equal(again[0].y[:, 1], -16 * np.arange(1, 5)) and f.pl_resets == 1
+    assert np.array_equal(again[0].y[:, 1], -16 * np.arange(1, 5) + 8) and f.pl_resets == 1
 
 
 # ── U5b: the owned, fixed DMA buffer (P6 v2 §4.5) ──

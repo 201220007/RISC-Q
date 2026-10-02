@@ -66,15 +66,15 @@ def raw_iq(z) -> np.ndarray:
 
 def uplink_iq(core: int, iq) -> np.ndarray:
     """RAW `out` values as they come back through the antq uplink (qubic3 P6): packed into the
-    uplink's words `[tag8, real[31:4], imag[31:4]]`, then decoded by `riscq.ddr.parse_words` and
-    interleaved [re0, im0, re1, im1, ...]."""
-    from riscq.ddr import parse_words
+    uplink's words `[tag8, real[31:4], imag[31:4]]`, decoded by `riscq.ddr.parse_words`, given the
+    run layer's half step (`riscq.ddr.reconstruct`) and interleaved [re0, im0, re1, im1, ...]."""
+    from riscq.ddr import parse_words, reconstruct
     v = np.asarray(iq, dtype=np.int64).reshape(-1, 2) & 0xFFFF_FFFF
     words = (np.uint64(core) << np.uint64(56)) | ((v[:, 0] >> 4).astype(np.uint64) << np.uint64(28)) \
         | (v[:, 1] >> 4).astype(np.uint64)
     _, re, im = parse_words(words)
     out = np.empty(2 * len(re), dtype=np.int32)
-    out[0::2], out[1::2] = re, im
+    out[0::2], out[1::2] = reconstruct(re), reconstruct(im)
     return out
 
 

@@ -437,7 +437,8 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
     session and propagates: a FAILED run returns no data, and the next release (or setup) is preceded
     by the hardware flush. A program with a completion `marker` must show it after DONE (UNFINISHED
     otherwise). `uplink=UplinkRun(...)` adds quiesce, prepare, flush, drain (G1) and the G2 settle, and
-    returns each reading core's IQ as `out[c]["__uplink"]` = int32 [re0, im0, re1, im1, ...].
+    returns each reading core's IQ as `out[c]["__uplink"]` = int32 [re0, im0, re1, im1, ...], the
+    midpoint estimates of the drained 28-bit fields (`riscq.ddr.reconstruct`, field + 8 LSB).
     `stop=StopSpec(...)` opens the stop mailbox (the P4 seam). `identities` are the setup identities a
     remote client expects; they are checked against the loaded set too."""
     _check_results_path(m, progs)
@@ -536,11 +537,12 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                 run.stage = "SETTLE"
                 _settle(drv, uplink)
                 _check_g2(rd)                                                    # G2
+                from riscq.ddr import reconstruct
                 for core, n in uplink.expected.items():
                     if n:
                         re, im = got[int(core)]
                         iq = np.empty(2 * len(re), dtype=np.int32)
-                        iq[0::2], iq[1::2] = re, im
+                        iq[0::2], iq[1::2] = reconstruct(re), reconstruct(im)    # the fields + 8
                         out.setdefault(int(core), {})["__uplink"] = iq
             run.to(CERTIFIED)
             if uplink is None and m.params.with_antq_uplink:

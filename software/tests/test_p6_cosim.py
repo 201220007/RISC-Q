@@ -4,7 +4,8 @@ They run on the sim-dio-antq build (`cosim_antq`, in both results-path modes), c
 through a DAC-to-ADC loopback of its own readout drive, so the IQ is a real decoder integral:
 
   C2  dual capture in one run: a RAW (core RAM) Experiment's programs rerun through the uplink seam
-      give, word for word and in order, the RAM IQ truncated to the uplink's 28-bit fields (C6: the
+      give, word for word and in order, the RAM IQ truncated to the uplink's 28-bit fields plus the
+      run layer's 8-LSB half step (C6: the
       same with the drain cut into 64-byte chunks, four of them);
   C4  one RAW Experiment through the uplink, local and through `drv.enable_remote()`: equal results;
       a drain failure in the bench makes the remote client raise with no data;
@@ -41,7 +42,9 @@ UPLINK_FLOOR = ("about 16 k batches per uplink rerun in co-sim (the bench free-r
 
 
 def _trunc28(v):
-    return (np.asarray(v, dtype=np.int64).astype(np.int32) >> 4 << 4).astype(np.int32)
+    """The run layer's `__uplink` estimate of a 32-bit integral: its 28-bit field (bits 31:4) plus
+    the half step, 8 LSB (`riscq.ddr.reconstruct`)."""
+    return ((np.asarray(v, dtype=np.int64).astype(np.int32) >> 4 << 4) + 8).astype(np.int32)
 
 
 def _loopback(drv, m):

@@ -66,7 +66,9 @@ def _model(drv, m):
 
 
 def _trunc28(v):
-    return (np.asarray(v, dtype=np.int64).astype(np.int32) >> 4 << 4).astype(np.int32)
+    """The run layer's `__uplink` estimate of a 32-bit integral: its 28-bit field (bits 31:4) plus
+    the half step, 8 LSB (`riscq.ddr.reconstruct`)."""
+    return ((np.asarray(v, dtype=np.int64).astype(np.int32) >> 4 << 4) + 8).astype(np.int32)
 
 
 @pytest.fixture(scope="module")
@@ -87,7 +89,8 @@ def _params(**kw):
 
 
 def _exact(drv, m, progs, base=0x4000, **kw):
-    """One uplink run that must certify exactly: N words, equal to the CPU's values truncated."""
+    """One uplink run that must certify exactly: N words, equal to the CPU's values truncated to
+    their 28-bit fields, plus the half step."""
     out = rq.rerun(drv, m, progs, params=_params(), results=["out"],
                    uplink=rq.UplinkRun(expected={1: N}, base=base), **kw)
     cpu = np.asarray(out[1]["out"][:2 * N], dtype=np.int64)

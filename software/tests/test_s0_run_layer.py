@@ -77,7 +77,8 @@ WORDS = {0: [(0x1230, -0x4560), (-16, 2 ** 31 - 16)], 1: [(160, 320)]}
 
 
 def _iq(words):
-    return [x for re, im in words for x in ((re >> 4) << 4, (im >> 4) << 4)]
+    """The run layer's `__uplink`: each 28-bit field plus the half step."""
+    return [x for re, im in words for x in (((re >> 4) << 4) + 8, ((im >> 4) << 4) + 8)]
 
 
 # ── the loaded-set guard (§4.5) ──

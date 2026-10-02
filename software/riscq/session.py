@@ -77,7 +77,8 @@ class Unfinished(RunLayerError):
 
 
 class PreflightRefused(RunLayerError):
-    """The many-shot preflight (P6 v2 §4.5) refused the rerun before any hardware access."""
+    """The many-shot preflight (P6 v2 §4.5) refused the rerun: after quiescence, and before the
+    run's own first write (no params, marker, BASE_RESET or release)."""
 
 
 class EpochExhausted(RunLayerError):

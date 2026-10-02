@@ -239,7 +239,7 @@ def test_close_stops_the_channel_before_freeing_the_buffer(fake_pynq):
     b = _board()
     buf = b.dma_recv_prepare(32)
     dma = fake_pynq[DdrMap().dma_base]
-    b.close()
+    assert b.close() is True
     reset_at = [i for i, e in enumerate(dma.log) if e[0] == "w" and e[1] == 0x30 and e[2] & 0x4]
     assert reset_at, "close() must reset the channel when a transfer is in flight"
     assert buf.freed == 1
@@ -252,7 +252,7 @@ def test_close_keeps_the_buffer_if_the_channel_cannot_be_stopped(fake_pynq):
     buf = b.dma_recv_prepare(32)
     dma = fake_pynq[DdrMap().dma_base]
     dma.model_dma = False                       # the reset bit will never self-clear
-    b.close()
+    assert b.close() is False                   # the caller learns it must keep the board referenced
     assert buf.freed == 0, "the buffer must NOT be freed when the DMA could not be stopped"
 
 

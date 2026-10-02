@@ -612,5 +612,5 @@ def preflight(expected, base, bank_bytes, chunk, remote_reply=False, budget=None
         bad.append("the drain needs about %d B of PS memory (%d chunk(s) of %d B), over the %d B budget"
                    % (peak, k, chunk, budget))
     if bad:
-        raise PreflightRefused("preflight refused the rerun before any hardware access: " + "; ".join(bad))
+        raise PreflightRefused("preflight refused the rerun before its first write: " + "; ".join(bad))
     return out

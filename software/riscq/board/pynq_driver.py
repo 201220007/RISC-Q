@@ -116,6 +116,7 @@ class PynqDriver:
         self.params = SocParams.from_json(self.params_text)
         self._host_buf = None
         self.host_base = None
+        self._unusable = None      # set by a close() that could not stop the uplink's S2MM channel
         if self.params.with_host_window:
             nbytes = SocMap(self.params).hostwin_bytes_total
             _check_cma(nbytes)
@@ -128,6 +129,8 @@ class PynqDriver:
     # ── the Driver protocol over pynq.MMIO (a numpy uint32 view of the /dev/mem mmap) ──
 
     def _check(self, addr: int, nbytes: int = 4) -> None:
+        if getattr(self, "_unusable", None):
+            raise RuntimeError(f"this driver is unusable: {self._unusable}")
         if addr % 4:
             raise ValueError(f"unaligned address {addr:#x}")
         if addr < 0 or addr + nbytes > AXI_SIZE:
@@ -156,17 +159,25 @@ class PynqDriver:
         """Release the CMA buffers. Called before a reload so the next driver's `pynq.allocate`
         sees the pool free (specs/software/22 §3). On an antq_uplink build that includes the run
         layer's cached uplink readout (qubic3 S0 r1): its `DdrBoard.close()` stops an S2MM transfer
-        still in flight before it frees the drain buffer (a fixed buffer stays its owner's), and
-        the cache is dropped."""
-        rd, self._rq_readout = getattr(self, "_rq_readout", None), None
-        try:
-            port = getattr(rd, "drv", None)
-            if port is not None and port is not self and hasattr(port, "close"):
-                port.close()
-        finally:
-            buf, self._host_buf = getattr(self, "_host_buf", None), None
-            if buf is not None:
-                buf.freebuffer()
+        still in flight before it frees the drain buffer (a fixed buffer stays its owner's). The
+        cache is dropped only once that stop is confirmed (r2): if the channel cannot be stopped,
+        the driver keeps the readout, so the buffer stays allocated, marks itself unusable (every
+        MMIO access raises) and raises. A later close() tries the stop again."""
+        rd = getattr(self, "_rq_readout", None)
+        port = getattr(rd, "drv", None)
+        if port is not None and port is not self and hasattr(port, "close"):
+            try:
+                stopped, why = port.close() is not False, "DdrBoard.close() could not reset it"
+            except Exception as e:                      # noqa: BLE001 - kept, then raised below
+                stopped, why = False, f"{type(e).__name__}: {e}"
+            if not stopped:
+                self._unusable = (f"close() could not stop the uplink's S2MM channel ({why}); its drain "
+                                  f"buffer is kept, and the PL needs a reload or a power cycle")
+                raise RuntimeError(self._unusable)
+        self._rq_readout = None
+        buf, self._host_buf = getattr(self, "_host_buf", None), None
+        if buf is not None:
+            buf.freebuffer()
 
     def read_host(self, offset: int, nbytes: int) -> bytes:
         """Read the CMA result buffer at buffer-relative `offset` (specs/software/22 §2.6). Only

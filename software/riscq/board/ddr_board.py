@@ -300,15 +300,20 @@ class DdrBoard:
     def close(self):
         """r28-#8: never free a CMA buffer the PL may still be writing into. Stop the channel first, and
         if the reset fails, keep the buffer -- leaking it is strictly better than handing its pages back
-        to the kernel while a DMA is writing them."""
+        to the kernel while a DMA is writing them.
+
+        Returns True once no transfer is in flight (the buffer freed, unless it is fixed), False when the
+        channel could not be stopped and the buffer is still held. A caller seeing False must keep this
+        object referenced: dropping it would let pynq's buffer destructor free the pages (qubic3 r2)."""
         if self._active is not None:
             try:
                 self.dma_reset()
             except Exception:                                    # noqa: BLE001
                 log.exception("could not reset the S2MM channel at close(); NOT freeing the CMA buffer "
                               "-- a live DMA writing freed pages would corrupt unrelated memory")
-                return
+                return False
         self._active = None
         if self._buf is not None and not self._fixed:      # a fixed buffer belongs to its owner
             self._buf.freebuffer()
             self._buf = None
+        return True

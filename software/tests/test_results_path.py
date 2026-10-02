@@ -248,6 +248,61 @@ def test_pynq_driver_close_tears_down_the_cached_uplink_readout(fake_board, tmp_
     drv.close()                                     # nothing cached: a no-op
 
 
+def _antq_board_driver(fake_board, tmp_path):
+    from riscq.ddr import readout_for
+    from riscq.map import SocMap
+    pd, _ = fake_board
+    board = {**pd.BOARD_DEFAULTS, "mts": None, "dac_nyquist": {"default": 2}}
+    drv = pd.PynqDriver("x.xsa", str(_board_cfg(tmp_path, "sim-2q-antq.json")), board=board)
+    return drv, readout_for(drv, SocMap(drv.params))
+
+
+class _DrainBuf:
+    nbytes, freed = 1 << 16, 0
+
+    def freebuffer(self):
+        self.freed += 1
+
+
+def test_pynq_driver_close_keeps_the_readout_until_the_dma_stop_is_confirmed(fake_board, tmp_path):
+    """qubic3 S0 after-stage r2 #1: with a transfer in flight and an S2MM reset that fails, close()
+    keeps the DdrBoard referenced (dropping it would let pynq's buffer destructor free pages the DMA
+    may still write), does not free the buffer, marks the driver unusable and raises; a later
+    close() whose reset succeeds frees the buffer and drops the readout."""
+    import gc
+    import weakref
+    drv, rd = _antq_board_driver(fake_board, tmp_path)
+    port, drain = rd.drv, _DrainBuf()
+    port._buf, port._active = drain, (drain, 4096)           # a drain in flight
+
+    def stuck():
+        raise RuntimeError("the S2MM soft reset did not clear within 1 s (DMACR=0x00000004)")
+    port.dma_reset = stuck
+    alive = weakref.ref(port)
+    with pytest.raises(RuntimeError, match="could not stop the uplink's S2MM channel"):
+        drv.close()
+    del port, rd
+    gc.collect()
+    assert alive() is not None and drv._rq_readout.drv is alive()   # still owned by the driver
+    assert drain.freed == 0 and alive()._buf is drain and alive()._active is not None
+    with pytest.raises(RuntimeError, match="unusable"):
+        drv.read32(0)                                         # every MMIO access refuses
+    alive().dma_reset = lambda: setattr(alive(), "_active", None)   # the stop now succeeds
+    drv.close()
+    assert drain.freed == 1 and drv._rq_readout is None
+
+
+def test_pynq_driver_close_stops_a_transfer_in_flight_then_frees(fake_board, tmp_path):
+    """The success path of r2 #1: the S2MM reset is confirmed, then the buffer is freed and the
+    readout dropped, and close() returns normally."""
+    drv, rd = _antq_board_driver(fake_board, tmp_path)
+    port, drain, resets = rd.drv, _DrainBuf(), []
+    port._buf, port._active = drain, (drain, 4096)
+    port.dma_reset = lambda: (resets.append(1), setattr(port, "_active", None))
+    drv.close()
+    assert resets == [1] and drain.freed == 1 and drv._rq_readout is None and drv._unusable is None
+
+
 def test_pynq_driver_hostwindow_allocates_after_the_shim(fake_board, tmp_path):
     pd, events = fake_board
     board = {**pd.BOARD_DEFAULTS, "mts": None, "dac_nyquist": {"default": 2}}

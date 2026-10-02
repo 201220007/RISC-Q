@@ -1,0 +1,1087 @@
+{
+ "tests/test_cal_drag.py::test_leakage_captures_in_the_classifiers_zero_demod_frame#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "28f12a75135f9e2fe302b500c99b333c6e391bab97964d05529eb633621558d7"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_captures_in_the_classifiers_zero_demod_frame#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "ec08fadda3d463904852dd628f2f63ddc7e0d98dc4c7c61e1c6b568a9125cb05"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "82661dcd56e7856f3ec4f9164d8641daacd2c71b8d43706978b52d9918004b22"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "b434758c345b7f8f81adea2ef6278e3952ce75c892357d76600f0142e53a5f6b"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#2": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "287d53797aac4ffb6103cdff2ab77404e1fd7a2cf72cfd6fae169cd3812d5cdb"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#3": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e843301b72ea7134d8108a7e23097095e661759aa0c8e9d8f5f49480b9947081"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#4": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "8872b23dee5814638c7b2f9ca2b912a35e1b09b66a557e60252b0f8a8438fb26"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#5": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "82661dcd56e7856f3ec4f9164d8641daacd2c71b8d43706978b52d9918004b22"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#6": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "b434758c345b7f8f81adea2ef6278e3952ce75c892357d76600f0142e53a5f6b"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#7": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "287d53797aac4ffb6103cdff2ab77404e1fd7a2cf72cfd6fae169cd3812d5cdb"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#8": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e843301b72ea7134d8108a7e23097095e661759aa0c8e9d8f5f49480b9947081"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_drag.py::test_leakage_picks_the_minimum_of_a_planted_p2#9": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "8872b23dee5814638c7b2f9ca2b912a35e1b09b66a557e60252b0f8a8438fb26"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_amplitude_fine_pass_refines_the_coarse#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e306213bf07f88a4d2e83b5bd98397681d85be5324abc564227d47f129989b64"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_amplitude_fine_pass_refines_the_coarse#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "05552178623fda6b94e40f1c3be283ab26b172c03951313280fffe6bdd355a71"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_amplitude_proposal_is_not_applied_until_apply#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d6e5a470fabbcfe4a982f5bda211bc6258da04795263c8b0cb052be858c2de77"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_amplitude_recovers_the_planted_rabi_rate#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d6e5a470fabbcfe4a982f5bda211bc6258da04795263c8b0cb052be858c2de77"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_amplitude_rejects_a_fit_whose_pi_over_2_lies_outside_the_sweep#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d6e5a470fabbcfe4a982f5bda211bc6258da04795263c8b0cb052be858c2de77"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_amplitude_rejects_a_fit_whose_pi_over_2_lies_outside_the_sweep#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d6e5a470fabbcfe4a982f5bda211bc6258da04795263c8b0cb052be858c2de77"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_fidelity_picks_readout_amp#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "879aca9add8bc2a4fc62eb95d72231880c28a1c6a30248fdb03ee782c79ba6a1"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_fidelity_sweeps_the_full_span_at_tiny_amp#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "994eff104c65461331804a8fd0bded949d077ce778d56ca0aeb141a49976a910"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_frequency_proposal_moves_the_carrier_toward_f_ge[-60]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "426605ee05a58627972884c788f864729dc6ebd91edf983b8a84f591a20c538f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_frequency_proposal_moves_the_carrier_toward_f_ge[60]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "fabc3cb07ea584d6995151cebdb19c1ac5fc796b08da1ef8d196a08e470eb2d8"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_frequency_verdict_is_per_qubit#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "f10674c808053bb408d6393de073c2e3ac24cba6b8ffeb00b0e8b1bfe3765e2b",
+   "1": "771e728b1489a37393e77cf073f2e34bdb644651980b443d11725e422c9649d5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_frequency_verdict_is_per_qubit#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "f10674c808053bb408d6393de073c2e3ac24cba6b8ffeb00b0e8b1bfe3765e2b",
+   "1": "771e728b1489a37393e77cf073f2e34bdb644651980b443d11725e422c9649d5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_heralded_phase_matches_unheralded#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "72511168086ffe86a7aa382af00e15b4f0c5c44ab6a7ed446dbf1ab155c4fb31"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_heralded_phase_matches_unheralded#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "b06842210387f6ab86ae73bfd6aa467d736dbed403eda5b1aa23060a5498f323"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_heralded_phase_matches_unheralded#2": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "0f7a8593ec64eced618a6be7c8d5850ab63695a54d94425d247d05f813509be0"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_heralded_phase_matches_unheralded#3": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "55ec3273c5037870845388f1f23119b11942ff3cf69d66e5a0ac4053247f2f2d"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_heralded_readout_fidelity_matches_unheralded#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "8e7988df1d7814117301198753421e58c212e6179c660cb04e8a75f648ea25a7"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_heralded_readout_fidelity_matches_unheralded#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "3406cbd183e9a3b2ad163fc8c113cf8429ff30755ee62557096d4230423d6076"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_heralding_matches_unheralded_on_clean_qubit#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "0d18758b0b197af5bd57d715c8313c78bb65ea90193b8a90758b328c9128f330"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_heralding_matches_unheralded_on_clean_qubit#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d79ff403939d3f9e729ae99b112a6e5f70329c18b36a2ddffa4adcaf29cfe2a6"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_phase_verdict_is_per_qubit#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "6a32bf78a52899ad7d116ec74ba7b1a503bea7f4cca6d0a5a67b3d6a4d33c366",
+   "1": "6a32bf78a52899ad7d116ec74ba7b1a503bea7f4cca6d0a5a67b3d6a4d33c366"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_phase_verdict_is_per_qubit#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "f537e4c22632b6e80f12b8216401290d8f6c73f6943ce519b8666f98b5ea6b31",
+   "1": "f537e4c22632b6e80f12b8216401290d8f6c73f6943ce519b8666f98b5ea6b31"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_punchout_maps_frequency_against_drive_power#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "a39eed67620565a84aa80ee0b0b8d4424ac9c6459700d6851b86c43b1887c22f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_calibration_captures_in_the_zero_demod_frame#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "4d6dd68ffd019221c30487ea1090a07c923719151fcb9b2d8fe26b370eec8f5e"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_calibration_captures_in_the_zero_demod_frame#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "4d6dd68ffd019221c30487ea1090a07c923719151fcb9b2d8fe26b370eec8f5e"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_calibration_captures_in_the_zero_demod_frame#2": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "4d6dd68ffd019221c30487ea1090a07c923719151fcb9b2d8fe26b370eec8f5e"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_calibration_captures_in_the_zero_demod_frame#3": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "eabdb635e5aee347ec405dc03966e42c1c259c32855b67e5a814b9c5d7944316"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_calibration_phase_proposal_is_a_fixed_point#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "edccf32e3a0b9748c295f6663ae0057ef761d3a2f5bcf31b6fec73e71eb844a5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_calibration_phase_proposal_is_a_fixed_point#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "edccf32e3a0b9748c295f6663ae0057ef761d3a2f5bcf31b6fec73e71eb844a5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_calibration_returns_per_prep_shots_and_a_classifier#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "2e78332055845b029e962cb9f8848e76d878a65354a10d5270f0c17f53227082"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_fidelity_matches_the_host_classifier#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "8b91d0c69e0e4652e8bb1f9f55ff92e0ec7bfc2e912cb14ccd5f94840877b822"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_readout_fidelity_matches_the_host_classifier#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "ceefde1ee5c8258fdd533805e131c6a96a81173c68eea8c488b8381974cd2f51"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_resonator_scan_folds_past_the_half_rate#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "9c8ec442eef292430e065302c027cf3fb69f0faf1c76a946565d8cc1b1c6214f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_resonator_scans_the_cavity_coherently#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "2c17d57fded4f5390a96a4b8ba62c8be078127b0327863567eff9a0c87e3c440"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_separation_picks_max_separation_not_the_magnitude_peak#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "96331fed75c932260a0e61f43efc03e2e8b47890142683024f3905edc5468212"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_separation_proposes_physical_hz_not_the_alias#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "96331fed75c932260a0e61f43efc03e2e8b47890142683024f3905edc5468212"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_t1_recovers_the_planted_decay#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "dfbce7e01bc75b494d4575b60a98f70bbcf6f08aee404bf58e1c5d63df0bf3e7"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_t2_recovers_the_planted_decay#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "2497c8c6bcc638948c3ef75d24c1891edfbb7bb8ea7e874046127b69b0bb91b5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_window_delay_is_swept_as_a_per_core_param#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e82cff83fb2b35c7354a15b9a5b1e14bd52b63f14e5898d29153c1e9e473671f",
+   "1": "aca01493a83a42b17cfbf40599c9f5fdc0f1efb6bc603ccff8f1a78ee8334c51"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_window_picks_the_longer_integration#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "09817b6eddba834fad2603806cfe408bd14bf3dca415c8a00a9f1ffa4e24543d"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_host.py::test_window_sweeps_each_qubit_around_its_own_timing#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "ab90b8ea6eb1430d5258d6ebc83ca8e848f0d94ba6fb218d389f513d7d282c7d",
+   "1": "b0aac535e29f3374ef351be96c47e35a9a21769ca9327d68adafc83e32288ec8"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_rpe.py::test_local_phases_write_is_zz_free[raw0--1.2]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "efe4cd1c6556c5c9b194be72f0d8e30680e9aca09c8e4052b97fd09b9b523602",
+   "1": "1756843afef0bc9d810ddd8dae69485c1e6b2165aec6681e9729c69f162c8189"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_rpe.py::test_local_phases_write_is_zz_free[raw0--1.2]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d89df9f5748e8d2dc04dd542bd883cb062bc142484cf088dc4aaa588816416d3",
+   "1": "78ce7da7a36a560b2d8d3134dfb483716d66038b77dc7d450e762e9ce0633807"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_rpe.py::test_local_phases_write_is_zz_free[raw0--1.5707963267948966]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "efe4cd1c6556c5c9b194be72f0d8e30680e9aca09c8e4052b97fd09b9b523602",
+   "1": "1756843afef0bc9d810ddd8dae69485c1e6b2165aec6681e9729c69f162c8189"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_rpe.py::test_local_phases_write_is_zz_free[raw0--1.5707963267948966]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d89df9f5748e8d2dc04dd542bd883cb062bc142484cf088dc4aaa588816416d3",
+   "1": "78ce7da7a36a560b2d8d3134dfb483716d66038b77dc7d450e762e9ce0633807"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_rpe.py::test_local_phases_write_is_zz_free[raw1--1.2]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "efe4cd1c6556c5c9b194be72f0d8e30680e9aca09c8e4052b97fd09b9b523602",
+   "1": "1756843afef0bc9d810ddd8dae69485c1e6b2165aec6681e9729c69f162c8189"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_rpe.py::test_local_phases_write_is_zz_free[raw1--1.2]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d89df9f5748e8d2dc04dd542bd883cb062bc142484cf088dc4aaa588816416d3",
+   "1": "78ce7da7a36a560b2d8d3134dfb483716d66038b77dc7d450e762e9ce0633807"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_rpe.py::test_local_phases_write_is_zz_free[raw1--1.5707963267948966]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "efe4cd1c6556c5c9b194be72f0d8e30680e9aca09c8e4052b97fd09b9b523602",
+   "1": "1756843afef0bc9d810ddd8dae69485c1e6b2165aec6681e9729c69f162c8189"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cal_rpe.py::test_local_phases_write_is_zz_free[raw1--1.5707963267948966]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d89df9f5748e8d2dc04dd542bd883cb062bc142484cf088dc4aaa588816416d3",
+   "1": "78ce7da7a36a560b2d8d3134dfb483716d66038b77dc7d450e762e9ce0633807"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_multimode.py::test_chevron_picks_the_resonant_row#0": {
+  "build": "sim-mm",
+  "cores": {
+   "0": "6bfb3c3a148ad1368d3df7a2e3003f08f7c165388d408237f89ffe7eb47290da"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_multimode.py::test_error_amplification_sharpens_on_the_true_knob[amp]#0": {
+  "build": "sim-mm",
+  "cores": {
+   "0": "c6ff14d59db692007267b840db4a922256a5a76a253118e9486a4070a15a73ee"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_multimode.py::test_error_amplification_sharpens_on_the_true_knob[freq]#0": {
+  "build": "sim-mm",
+  "cores": {
+   "0": "cbe588a34537e4979716b8d9ef9d910a29180a2bc324696de29b100cf762eb97"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_multimode.py::test_length_rabi_recovers_the_swap_time#0": {
+  "build": "sim-mm",
+  "cores": {
+   "0": "51af21bb4917deb5a6575a0a7abc2489e8a6683e1ad40986e8300631cafa06c0"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_multimode.py::test_process_multimode_plan_runs_gated#0": {
+  "build": "sim-mm",
+  "cores": {
+   "0": "eabf7909065516bd99b8d10016cfa07e89563067755ed1d37175cb0f3cbb595c"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_multimode.py::test_process_multimode_plan_runs_gated#1": {
+  "build": "sim-mm",
+  "cores": {
+   "0": "79d74018bdac0cde4d15fc90f54df5f0d8c710bbba23518d083da037f41a27e4"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_multimode.py::test_process_multimode_plan_runs_gated#2": {
+  "build": "sim-mm",
+  "cores": {
+   "0": "c0077ae8688a90e097c688d85095f00f0f9ff6bbb7f77f6e9838ebd95abb075d"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_fidelity_picks_the_planted_drive_amp#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "698a60a0a1df0bcba65665cac0ec6885f91e133b4ad3e1dbd5195084676381b3"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_punchout_rows_track_the_drive_amp#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "2b60d8e808dd711ba1cf9d9bbf1dd4e02c50baae11a1abe716c0b9a2aaf2d60a"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_readout_calibration_finds_the_chain_angle#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "edccf32e3a0b9748c295f6663ae0057ef761d3a2f5bcf31b6fec73e71eb844a5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_readout_fidelity_3level_confusion#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "2e78332055845b029e962cb9f8848e76d878a65354a10d5270f0c17f53227082"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_readout_fidelity_3level_confusion#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e2e02886e522bfa228f9b73ba397901975a43257afd17599589e283a62dc5f7f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_readout_fidelity_is_the_planted_gaussian_error#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "19736285a2e101127b547a8741d3320915d749bfa08b633829487640c3e98c2f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_resonator_magnitude_peaks_on_the_planted_pole#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "0701e7e95ff378398868baf45be40fe391ab03275275a802fb0a35c832872bac"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_separation_argmax_is_the_dispersive_centre#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "1991d62de64dba4d81130d54a3c3fb922fd6e69d08dcd1b3fa94a1f99b7ae0dd"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_window_picks_the_planted_optimum[demod/delay]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "fd3d375b633283aab456cf325a4a423b5f49458606a049face2092d8e7c93e8a",
+   "1": "72fa16f215bc03833a8cfeca6e225a6e48dcf1dd1f367c30c0ada1e9009bd293"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_window_picks_the_planted_optimum[demod/dur]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "ab90b8ea6eb1430d5258d6ebc83ca8e848f0d94ba6fb218d389f513d7d282c7d",
+   "1": "cb90109acaef901ac5b5d3d2d5715095253623b2577dcb7843dc783526c729ce"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_readout.py::test_window_picks_the_planted_optimum[dur]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "13ed2e580b3308318c41e447b78fcac62789533c9145182fd2648003d5684d6a",
+   "1": "174dda4a3b52b8897a7a8ad1403dfef4e8a8517e84658dc11cfda1d2a759a224"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_amplitude_derive_hpi#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "0d0d80790ea94260708130c0e30b14587d191896b068d7184f7a921d1d51ecfa"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_ef_amplitude_recovers_the_planted_ef_rabi[X-2-span2]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "5390a1cee5c02aeb87a4c3a9ff376717ea1b6fc69dc59ced96f54d3c97c74e36"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_ef_amplitude_recovers_the_planted_ef_rabi[X90-1-span0]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "cf2fb1eecb6345a0f3d450ec38bb7063a26cb4bb21405cccc538f655369b03da"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_ef_amplitude_recovers_the_planted_ef_rabi[X90-4-span1]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "feb93db0649a999dc3be66acca0f9f3016bff27ac206df98c1ff889479e513de"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_ef_frequency_recovers_the_planted_ef_detuning#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d34c4def77267ef8c07d4a4b3f0ceabbaf2ba6446ce9a79e81de2c291e20c714"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_ef_phase_recovers_the_planted_ef_axis[X90]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "df96aca2a8ac76b8c217b2d2cc081a360d229d8ea6cea88e3f62b7a7789d142b"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_ef_phase_recovers_the_planted_ef_axis[X90]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "c394d360f1a20df9564074fd4aeddd52000389b7a62dae7e7b60b0e7bb55d474"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_ef_phase_recovers_the_planted_ef_axis[X]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "caf773f0fc493197ca219779574f655c3e5858e22b86df8ca511c7f560ba99f3"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_spectroscopy_recovers_a_planted_line#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d5d1456ab3ca78a85a06197f9e01cc8188a1b3a4a0608a51ad867214fd0c2ca4"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_spectroscopy_recovers_a_planted_line#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "67d76d56f1be46b782a26a391c91abce01022b2a9d72c1b3bb4e36a2fdd2fb8a"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_single.py::test_t2_echoes_and_apply_freq#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "8502f7751dced26f8df5884b94399fb0f6381e209cbba98bf57af7e7f2c8ca2b"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_amp_freq_sweep_seeds_the_argmax#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "bf78c58e64d7c9259a24189bfba73231d744d333f140bdbf2f8fcec04af46268",
+   "1": "716ded26f810c55b8d2e82f73b23414e04bb998ae03cbd1521aa4db203a5773b"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_amp_freq_sweep_seeds_the_argmax#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "bf78c58e64d7c9259a24189bfba73231d744d333f140bdbf2f8fcec04af46268",
+   "1": "716ded26f810c55b8d2e82f73b23414e04bb998ae03cbd1521aa4db203a5773b"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_frequency_and_amplitude_ladder#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "3a35265e5cae379c910c444647721377d5dd727576d8c0f57241125d2c460486",
+   "1": "1db765161fe0c0b3bb63db9f1adcfacd81c85ddf295e803688b71e1cc0f9d7ce"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_frequency_and_amplitude_ladder#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "f6759bb8bd51a219289a8e56a8467b0dc597edef31988e0736a22ba299c14c6f",
+   "1": "6035c28328d7adfa6ab4f58482d54956a9d2e5320766fc43966aa269329a0223"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_frequency_and_amplitude_ladder#2": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "b72d6301924e0919159986369cab9e06158f657a8a80d6e5aab7cde33a412125",
+   "1": "1df79cd5957a2f82b0a9ffccc9d31e1c8c4d87e1cb934f478d3a87600cd5523c"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_frequency_and_amplitude_ladder#3": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "ee1539633913bbe126d203c18ca0035ad01ec29e881d2a1f7c69a93899029ea3",
+   "1": "6bb4cc1ee421cd82e8aa6d905233769415239e25c121c8a0fd671a988ef8537d"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_rpe_recovers_planted_generator_errors[-1]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "11161525b1f2c6eeed982318fd53bad94b6ede8453c6f02ed775b2089e2f18b4",
+   "1": "6015c57523cc0c00d1474b815ada02ff6708663bc10cfff06252216464561260"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_rpe_recovers_planted_generator_errors[-1]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "a5bc2c8a4dae313d70a2d4561b41341e07b1e3f82b2d699e9178aa5e965058ff",
+   "1": "5569c814c66abf8d6da0fd554826556b9e35a19862f8300a1369a89311ca622f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_rpe_recovers_planted_generator_errors[1]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "11161525b1f2c6eeed982318fd53bad94b6ede8453c6f02ed775b2089e2f18b4",
+   "1": "e4aabf764866703a53ce87b8201334f763ba88e7ec40c057d7f1b91565492b3f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_rpe_recovers_planted_generator_errors[1]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "f3cd4d86e93b2eed984ee8d253bba2e7e425968e38ce14bbbb9a845c61704970",
+   "1": "5569c814c66abf8d6da0fd554826556b9e35a19862f8300a1369a89311ca622f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_sandwich_plays_the_shelf_ef_x_on_both_sides#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "1da3abfb140fdadbaa0247a7bab19731ac683e37a4bb987fdee122c07c45fa69",
+   "1": "1a1dc214a86ace5be8361859f30482a6d98998b5ef460e16b0e5707948565605"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_sweep_dip_and_return#0": {
+  "build": "sim-2q1c",
+  "cores": {
+   "0": "4812f69246384800d3d8a5a6dad783cdad350ad39c1f9b4d387fbde539dbd65a",
+   "1": "4812f69246384800d3d8a5a6dad783cdad350ad39c1f9b4d387fbde539dbd65a",
+   "2": "93484fb3a0d1b02f871b1a62b7c684bd0e855711a428349d5b996a6552e6b970"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_sweep_dip_and_return#1": {
+  "build": "sim-2q1c",
+  "cores": {
+   "0": "4812f69246384800d3d8a5a6dad783cdad350ad39c1f9b4d387fbde539dbd65a",
+   "1": "4812f69246384800d3d8a5a6dad783cdad350ad39c1f9b4d387fbde539dbd65a",
+   "2": "438e24e664b210a18f53fa27767601c9eb43d90bf746ac39a44adef7b1d97af3"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_cz_sweep_dip_and_return#2": {
+  "build": "sim-2q1c",
+  "cores": {
+   "0": "448a7e3f5484a0c2aa06ea90d81b1b81fdc2973d392627b255248b2cd424d895",
+   "1": "448a7e3f5484a0c2aa06ea90d81b1b81fdc2973d392627b255248b2cd424d895",
+   "2": "2af3968ad0aa1de8639501736f27d0986277a4d639bb0a7e53f71dd9875e19bc"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_jazz_recovers_zz#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "79bbbd72d2ea667ecb6662567515891fba00eb34f88cdc4520c215c87165872c",
+   "1": "ae1d7450858ac7c804ca18e9c27ece66a236b3368eb1c1574685e7af66ce2ac4"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_local_phases_write_is_zz_free[-1.2]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "daf50461bb7c976c13c290f3198764c30f8f15702e762d880c663ffde2ec5977",
+   "1": "59c377c064c6057b2d7d5d801558f46164bddab74457958140ba1cf7b2754b63"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_local_phases_write_is_zz_free[-1.2]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "94dd798a4484170db1829303759fe5b9196ac57892ce4e1601cdc38101763908",
+   "1": "a6995548c9ea3fbb31d9f2fdffa114e5e8a128a2ce265794128f37465f734f51"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_local_phases_write_is_zz_free[-1.5707963267948966]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "daf50461bb7c976c13c290f3198764c30f8f15702e762d880c663ffde2ec5977",
+   "1": "59c377c064c6057b2d7d5d801558f46164bddab74457958140ba1cf7b2754b63"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_local_phases_write_is_zz_free[-1.5707963267948966]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "94dd798a4484170db1829303759fe5b9196ac57892ce4e1601cdc38101763908",
+   "1": "a6995548c9ea3fbb31d9f2fdffa114e5e8a128a2ce265794128f37465f734f51"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_relative_phase_recovers_the_peak#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "c4a4d067188a1be737edb790561ed8d06aec8e710b15b64996800012e8b5244c",
+   "1": "5fe4be33ecbcde0fe22128e239759aea7f073d8b14429e1b851da17104940b83"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_rpe_amplitude_recovers_the_planted_over_rotation#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e4097e5f25fb6181b1959df6d4f7b5b2bfc940f611fcf3d56374d615e1131f3e"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_rpe_frequency_recovers_the_planted_detuning#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "f660f6825ad85408297f714b7941e427e592f89bd044f0ac8720c4b4fc3c5bf2"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_rpe_phase_recovers_the_planted_axis_tilt#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "1216ee1c131b439fb2385aeaca4d0c188321e6ab3f49647ad6f70af1a1b6d103"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_rpe_phase_recovers_the_planted_axis_tilt#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "5166c159e112fa9a01ad07e6d78b9b478d07eb9b6e02131e62b3d39185765346"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_cals_twoqubit.py::test_spectator_phase_recovers_planted_phase#0": {
+  "build": "sim-2q1c",
+  "cores": {
+   "0": "65e7465584479b8aa2acd7b8602b709ba18cc6feeb869cafa8b19005547b7c2d",
+   "1": "dde0539ec70aad8a9356c328c98c547d3bdecdbda770487326548a9fb6083124",
+   "2": "a48d0d5f36977d86b8fb180917e79bb97edee9d5cee904b631c5f4b08bbde58f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_hostwin.py::test_cal_raw_iq_captures_live_in_the_window#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "9ef22c46e0dd4687cda0b3ae0bfb02a75f6b5e94f195d9d4245e055391d6f2a0"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_results_path.py::test_cal_iqsum_and_ram_raw_still_compile_on_antq#0": {
+  "build": "sim-2q-antq",
+  "cores": {
+   "0": "7ecbb53b9fc6e52d128e4e088a8b3154165ef1ce0412412f18b92399ac7db925"
+  },
+  "results_path": "antq_uplink"
+ },
+ "tests/test_results_path.py::test_cal_iqsum_and_ram_raw_still_compile_on_antq#1": {
+  "build": "sim-2q-antq",
+  "cores": {
+   "0": "151440b84f96bbca508f1a39e9d126d077499133c67941586f7e410d750aa2a5"
+  },
+  "results_path": "antq_uplink"
+ },
+ "tests/test_sequence.py::test_amplitude_recovers_the_planted_rabi[1-X90-span0]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "0ced7a81769565656678fa6d4058cec84c7edb7f32568970adb7a2692eed1a78"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_amplitude_recovers_the_planted_rabi[2-X-span2]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "38511b60a186ecb374ade15d6cf5eaa95f3933b2168f1196fac993866e205681"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_amplitude_recovers_the_planted_rabi[4-X90-span1]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "473d41b5c6567c4e6048d3f0b560198edb8cf5348afe3e4dcb3cc2c6f381aafd"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_frequency_recovers_the_planted_detuning[-60]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "426605ee05a58627972884c788f864729dc6ebd91edf983b8a84f591a20c538f"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_frequency_recovers_the_planted_detuning[60]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "fabc3cb07ea584d6995151cebdb19c1ac5fc796b08da1ef8d196a08e470eb2d8"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_leakage_picks_the_planted_minimum#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "82661dcd56e7856f3ec4f9164d8641daacd2c71b8d43706978b52d9918004b22"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_leakage_picks_the_planted_minimum#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "b434758c345b7f8f81adea2ef6278e3952ce75c892357d76600f0142e53a5f6b"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_leakage_picks_the_planted_minimum#2": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "287d53797aac4ffb6103cdff2ab77404e1fd7a2cf72cfd6fae169cd3812d5cdb"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_leakage_picks_the_planted_minimum#3": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e843301b72ea7134d8108a7e23097095e661759aa0c8e9d8f5f49480b9947081"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_leakage_picks_the_planted_minimum#4": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "8872b23dee5814638c7b2f9ca2b912a35e1b09b66a557e60252b0f8a8438fb26"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_phase_recovers_the_planted_axis[X90]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e5352aef72cf0b125544319e01da69b39d2980bb75e63478a5a29e8b032e9e8a"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_phase_recovers_the_planted_axis[X90]#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "e86bffc7d1f042afeef0c5048816439d2effd748aeb119e3e681bacccbb2fc0c"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_phase_recovers_the_planted_axis[X]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "927e4e0431bbb22a902b247e31c40f56025f989e61c1875b92aa272a7715a7a9"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_t1_recovers_the_planted_decay[X90]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "897b4d6ee65d999e4c029b2f7fdd6f4e64a1ec4befe860c99d5e491e2482cb3d"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_t1_recovers_the_planted_decay[X]#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "f56d4890f7c5a1a3566bc8d971f8e311d4050325fbd86e4cb1b859df547aacfb"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_sequence.py::test_t2_recovers_the_planted_decay#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "2497c8c6bcc638948c3ef75d24c1891edfbb7bb8ea7e874046127b69b0bb91b5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_amplitude_gate_x_knob#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "3649233ba5a31af433c5bfa48ddf240ac929387912c44abaabdd605936e9a84b"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_cals_capture_in_the_classifiers_zero_demod_frame#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "3e65a3f0ab97bfadc0770556c41215abc291e9f85162acec1f7080d255419a17"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_cals_capture_in_the_classifiers_zero_demod_frame#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "af7443ef8457c706bdb0dcbf65c7f7a0e4e978da58339e6fc22d3dea2dbb938e"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_cals_capture_in_the_classifiers_zero_demod_frame#2": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d4d886d0d51fb352cef918cbac059dd364a6d0fdf7bad8b28eade12bad031bfe"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_cals_capture_in_the_classifiers_zero_demod_frame#3": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "61152d7a0f5ee154341f7a9d2994eaf5c08f4f903aebc38e8e1689e801bbd874"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_cals_capture_in_the_classifiers_zero_demod_frame#4": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "467b59a500c842841fc594d8beb7f03db15f625fd337676d8a7ddd4450ff79a8"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_cals_capture_in_the_classifiers_zero_demod_frame#5": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "72a93fb6a03598ca9754b1f917d9d2db2e0ec1cf6de125bcabb74fcdafde7648"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_cals_capture_in_the_classifiers_zero_demod_frame#6": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "7ac30223625374daab21098455303e22f7a0ba8db14e027546cebbe2a4bc1f39"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_cals_capture_in_the_classifiers_zero_demod_frame#7": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "da50630b25848f7aea69bd0e5cfa9ab0521f2aefd06ac5d039013ebbb25526da"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_phase_recovers_planted_vz#0": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "db9199379f85fa28d1ae4204b42dee8b0f58a9dfbb0ce52a9f1488405c6df6f5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_phase_recovers_planted_vz#1": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d4e5371d74d5684fa78e8452038426f95d6b8984927209f90a369744e419b5fe"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_phase_recovers_planted_vz#2": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "db9199379f85fa28d1ae4204b42dee8b0f58a9dfbb0ce52a9f1488405c6df6f5"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit.py::test_ef_phase_recovers_planted_vz#3": {
+  "build": "sim-2q",
+  "cores": {
+   "0": "d4e5371d74d5684fa78e8452038426f95d6b8984927209f90a369744e419b5fe"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit_cosim.py::test_ef_phase_writes_the_vz_pair#0": {
+  "build": "sim-2q1c",
+  "cores": {
+   "0": "c2256f9ec85242e65e2a6f2e249fdda5c550fbca9ddbb9035b94c474eef15173"
+  },
+  "results_path": "hostwindow"
+ },
+ "tests/test_twoqubit_cosim.py::test_ef_phase_writes_the_vz_pair#1": {
+  "build": "sim-2q1c",
+  "cores": {
+   "0": "d6858118339fb47ba051561ed8b1537d7fcb34a221fcdfa5dee7cdd5adea26ac"
+  },
+  "results_path": "hostwindow"
+ }
+}

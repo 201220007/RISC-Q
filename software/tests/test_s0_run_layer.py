@@ -522,16 +522,54 @@ def test_g3_stray_takes_the_flush_and_saturation_is_logged():
     assert any("STRAY {1: '≥ 65535'}" in n for n in s.notes)
 
 
-def test_an_unproven_run_flushes_before_the_next_uplink_run_only():
+def _log_flushes_and_releases(f):
+    """Record the order of pl_resetn0 pulses and core-reset releases on `f`."""
+    events, pulse, kernel_ = [], f.pl_reset, f.on_release
+    f.pl_reset = lambda: (events.append("flush"), pulse())
+    f.on_release = lambda fake: (events.append("release"), kernel_(fake))
+    return events
+
+
+def test_after_an_unproven_run_every_release_is_preceded_by_the_flush():
+    """§4.6: after a run that was not queue-proven, the next release (an uplink-free RAM or COUNTS
+    rerun too) is preceded by the hardware flush; a setup runs it before the load."""
     f, m, progs, exp = _antq(marker=False)
+    events = _log_flushes_and_releases(f)
     rq.rerun(f, m, progs, uplink=up(exp))
     s = S.session(f)
-    assert s.pending_flush.reason == S.FLUSH_UNPROVEN
-    rq.rerun(f, m, progs)                          # uplink-free: the caller's, no flush
-    rq.setup(f, m, progs)                          # a setup: no flush either
-    assert f.pl_resets == 0
-    rq.rerun(f, m, progs, uplink=up(exp))          # the next certification point
-    assert f.pl_resets == 1 and s.runs[-1].flushed == S.FLUSH_UNPROVEN
+    assert s.pending_flush.reason == S.FLUSH_UNPROVEN and events == ["release"]
+    rq.rerun(f, m, progs)                          # uplink-free: flushed, then released
+    assert events == ["release", "flush", "release"] and s.runs[-1].flushed == S.FLUSH_UNPROVEN
+    assert s.pending_flush.reason == S.FLUSH_UNPROVEN                    # itself unproven
+    rq.setup(f, m, progs)                          # the setup flushes before it loads
+    assert events[-1] == "flush" and s.pending_flush is None and f.pl_resets == 2
+    rq.rerun(f, m, progs, uplink=up(exp))          # nothing pending: no flush
+    rq.rerun(f, m, progs, uplink=up(exp))          # the next one flushes in its quiesce
+    assert events == ["release", "flush", "release", "flush", "release", "flush", "release"]
+    assert s.runs[-1].flushed == S.FLUSH_UNPROVEN and s.runs[-2].flushed is None
+
+
+def test_an_uplink_free_rerun_is_refused_while_a_flush_is_pending_and_the_uplink_has_a_run_open():
+    """A rerun without uplink= whose caller has prepared the uplink itself cannot take the flush
+    (it would reset the caller's run), so it is refused before any write until recover()."""
+    from riscq.ddr import readout_for
+    f, m, progs, exp = _antq(marker=False)
+    rq.rerun(f, m, progs, uplink=up(exp))          # unproven
+    rd = readout_for(f, m)
+    rd.prepare(0x2000, expected=exp)               # the caller's own protocol
+    events = _log_flushes_and_releases(f)
+    writes = len(f.mem)
+    with pytest.raises(S.RecoveryRequired, match="the uplink has a run open"):
+        rq.rerun(f, m, progs)
+    assert events == [] and len(f.mem) == writes and f.up.run_active
+    rq.recover(f, m)
+    assert events == ["flush"] and S.session(f).pending_flush is None
+    rd.prepare(0x2000, expected=exp)
+    out = rq.rerun(f, m, progs)
+    assert events == ["flush", "release"] and out[0]["out"].shape == (N_OUT,)
+    rd.flush()
+    re, im = rd.drain(0x2000, exp)[0]                 # the raw fields
+    assert [x + 8 for p in zip(re, im) for x in p] == _iq(WORDS[0])
 
 
 def test_proven_runs_take_no_flush():
@@ -542,17 +580,22 @@ def test_proven_runs_take_no_flush():
     assert f.pl_resets == 0 and S.session(f).pending_flush is None
 
 
-def test_a_failed_run_refuses_an_uplink_free_rerun_until_recovered():
+def test_a_failed_run_is_flushed_before_an_uplink_free_rerun_and_at_setup():
     f, m, progs, exp = _antq()
     f.on_release = kernel(results=WORDS, done=False)
     with pytest.raises(TimeoutError):
         rq.rerun(f, m, progs, uplink=up(exp), timeout=2)
     f.on_release = kernel(results=WORDS)
-    with pytest.raises(S.RecoveryRequired, match="recover"):
-        rq.rerun(f, m, progs)
+    events = _log_flushes_and_releases(f)
+    rq.rerun(f, m, progs)                          # the cleanup closed the admission: flush, release
+    s = S.session(f)
+    assert events == ["flush", "release"] and s.runs[-1].flushed == S.FLUSH_FAILED
+    assert s.pending_flush is None
+    f.on_release = kernel(results=WORDS, done=False)
+    with pytest.raises(TimeoutError):
+        rq.rerun(f, m, progs, timeout=2)
     rq.setup(f, m, progs)                          # setup runs the pending flush
-    assert f.pl_resets == 1
-    rq.rerun(f, m, progs)
+    assert events[-1] == "flush" and s.pending_flush is None
 
 
 # ── quiesce and the flush's own failures (POISONED) ──

@@ -41,7 +41,8 @@ def demod_table() -> ParamTable:
 
 
 @kernel
-def k_shots(demod: ParamTable, grp: Group, out: Array, code: int, n: int, a0: int, a1: int, a2: int, a3: int):
+def k_shots(demod: ParamTable, grp: Group, out: Array, code: int, n: int, a0: int, a1: int, a2: int, a3: int,
+            fin: int):
     init_pulse_params(demod.pulses)  # noqa: F821
     set_freq(demod, code)  # noqa: F821
     for i in range(n):
@@ -61,11 +62,12 @@ def k_shots(demod: ParamTable, grp: Group, out: Array, code: int, n: int, a0: in
         out[3 * i] = read_res()  # noqa: F821
         out[3 * i + 1] = read_real()  # noqa: F821
         out[3 * i + 2] = read_imag()  # noqa: F821
+    out[fin] = 1                     # the completion marker (see _progs)
 
 
 @kernel
 def k_shots_dio(demod: ParamTable, ttl: ParamTable, grp: Group, out: Array, code: int, n: int,
-                a0: int, a1: int, a2: int, a3: int):
+                a0: int, a1: int, a2: int, a3: int, fin: int):
     init_pulse_params(demod.pulses)  # noqa: F821
     init_pulse_params(ttl.pulses)  # noqa: F821
     set_freq(demod, code)  # noqa: F821
@@ -90,15 +92,24 @@ def k_shots_dio(demod: ParamTable, ttl: ParamTable, grp: Group, out: Array, code
         out[3 * i] = read_res()  # noqa: F821
         out[3 * i + 1] = read_real()  # noqa: F821
         out[3 * i + 2] = read_imag()  # noqa: F821
+    out[fin] = 1
 
 
 def _progs(m):
+    """Both kernels end with a completion marker (qubic3 S0, plan P4 v2 §4.6): the last `read_res`
+    returns after the last demod window, which ends after the shot's DIO edges, so nothing is
+    queued when the marker is stored and every run is queue-proven. An unmarked run would leave the
+    hardware flush pending, and these tests' own prepare (the caller's protocol) would then refuse
+    the next rerun."""
     grp = Group([0, 1], id=0)
     ttl = DioTable(m.channel_named("ttl", 0), {"on": (0x0001, 0x0001, 6), "off": (0x0001, 0x0000, 6)})
-    kw = dict(grp=grp, out=Array(3 * SHOTS), code=pack16(4 * F),
+    kw = dict(grp=grp, out=Array(3 * SHOTS + 1), code=pack16(4 * F), fin=3 * SHOTS,
               **{f"a{k}": c for k, c in enumerate(AMP_CODES)})
-    return {0: compile_kernel(k_shots_dio, m, core=0, tables=dict(demod=demod_table(), ttl=ttl), **kw),
-            1: compile_kernel(k_shots, m, core=1, tables=dict(demod=demod_table()), **kw)}
+    progs = {0: compile_kernel(k_shots_dio, m, core=0, tables=dict(demod=demod_table(), ttl=ttl), **kw),
+             1: compile_kernel(k_shots, m, core=1, tables=dict(demod=demod_table()), **kw)}
+    for prog in progs.values():
+        prog.marker = ("out", 3 * SHOTS)
+    return progs
 
 
 def _trunc28(v) -> np.ndarray:
@@ -148,7 +159,7 @@ def test_two_real_kernel_runs_through_the_done_lifecycle(cosim_antq, request):
         stats = drv.sim.ddr_config()
         delta = {k: stats[k] - before[k] for k in stats}
         for c in progs:
-            cpu = np.asarray(out[c]["out"], dtype=np.int64).reshape(SHOTS, 3)
+            cpu = np.asarray(out[c]["out"][:3 * SHOTS], dtype=np.int64).reshape(SHOTS, 3)
             re, im = got[c]
             assert len(re) == SHOTS, f"run {r + 1} core {c}: {len(re)} DDR words for {SHOTS} shots"
             assert np.array_equal(re, _trunc28(cpu[:, 1])), f"run {r + 1} core {c} real: DDR {re} CPU {cpu[:, 1]}"
@@ -194,5 +205,5 @@ def test_bresp_and_rresp_errors_refuse_the_run(cosim_antq):
     out = rq.rerun(drv, m, progs, params={c: {"n": SHOTS} for c in progs}, timeout=4_000_000)
     got = d.drain(0x200000, expected, status=d.flush(timeout=120))
     for c in progs:
-        cpu = np.asarray(out[c]["out"], dtype=np.int64).reshape(SHOTS, 3)
+        cpu = np.asarray(out[c]["out"][:3 * SHOTS], dtype=np.int64).reshape(SHOTS, 3)
         assert np.array_equal(got[c][0], _trunc28(cpu[:, 1]))

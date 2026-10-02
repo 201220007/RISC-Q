@@ -331,8 +331,8 @@ def setup(drv, m: SocMap, progs: dict[int, Program]) -> None:
 
     S0 (plan P4 v2 §4.2, §4.5): the session's loaded set is cleared first and recorded only after a
     complete load, so a failed setup leaves none; on an antq_uplink build `quiesce()` runs first
-    (with the cores in reset), and a pending FAILED or STRAY flush runs here. A POISONED session
-    refuses."""
+    (with the cores in reset). A pending hardware flush (FAILED, STRAY, UNPROVEN) runs here, before
+    the load. A POISONED session refuses."""
     # antq_uplink: no HostWindow chain, so a program with host-window arrays is refused before anything
     # is loaded (compile_kernel already refuses host=True against such a map; this catches a Program
     # compiled for another build). Checked before the remote hop too, so it fails client-side.
@@ -349,8 +349,8 @@ def setup(drv, m: SocMap, progs: dict[int, Program]) -> None:
         reset(drv, m, on=True)
         rd = _readout(drv, m)
         if rd is not None:
-            quiesce(drv, m, rd=rd, certify=False, held=True)
-        elif s.pending_flush is not None and s.pending_flush.reason == FLUSH_FAILED:
+            quiesce(drv, m, rd=rd, held=True)
+        elif s.pending_flush is not None:
             _flush_or_poison(drv, m, s)
         # point the funnel at this driver's result buffer while the reset is held (spec 22 §2.3). A
         # host-pure test double carries no buffer: leave the funnel disabled — correct, since without a
@@ -440,7 +440,12 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
     returns each reading core's IQ as `out[c]["__uplink"]` = int32 [re0, im0, re1, im1, ...], the
     midpoint estimates of the drained 28-bit fields (`riscq.ddr.reconstruct`, field + 8 LSB).
     `stop=StopSpec(...)` opens the stop mailbox (the P4 seam). `identities` are the setup identities a
-    remote client expects; they are checked against the loaded set too."""
+    remote client expects; they are checked against the loaded set too.
+
+    On an antq_uplink build a run where a programmed core has no marker is not queue-proven, and
+    every later release waits for the hardware flush too (§4.6), uplink-free ones included; an
+    uplink-free rerun with a flush pending is refused (RecoveryRequired) while the uplink has a run
+    open, which is then its caller's own protocol."""
     _check_results_path(m, progs)
     remote = getattr(drv, "remote", None)
     if remote is not None:
@@ -463,12 +468,14 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
         if identities is not None:
             s.check_loaded({int(c): str(i) for c, i in dict(identities).items()})
         pend = s.pending_flush
-        if (uplink is None and m.params.with_antq_uplink and pend is not None
-                and pend.reason in (FLUSH_FAILED, FLUSH_STRAY)):
-            raise RecoveryRequired(
-                f"a {pend.reason} flush is pending ({pend.detail}); a rerun without uplink= leaves the "
-                f"uplink to its caller, and the flush would reset it underneath them: call "
-                f"riscq.run.recover(drv, m) or setup() first")
+        if uplink is None and pend is not None and m.params.with_antq_uplink:
+            held_by = _readout(drv, m)
+            if held_by is not None and _uplink_open(held_by):
+                raise RecoveryRequired(
+                    f"a {pend.reason} flush is pending ({pend.detail}) and must precede this release, "
+                    f"but the uplink has a run open: a rerun without uplink= leaves the uplink to its "
+                    f"caller, and the flush would reset it underneath them. Call "
+                    f"riscq.run.recover(drv, m) or setup() before the caller's prepare")
         run = s.begin(progs, uplink is not None)
         if stop is not None:
             run.mailbox = StopMailbox(run.run_id)
@@ -481,7 +488,7 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                                      f"no uplink to run through")
                 run.stage = "QUIESCE"
                 n_flush = len(s.flushes)
-                quiesce(drv, m, rd=rd, certify=True)
+                quiesce(drv, m, rd=rd)
                 if len(s.flushes) > n_flush:
                     run.flushed = s.flushes[-1][0]
                 run.stage = "PREFLIGHT"
@@ -490,10 +497,11 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                 span = {int(c): max(int(n), int(nominal.get(c, 0))) for c, n in uplink.expected.items()}
                 run.preflight = preflight(span, uplink.base, rd.bank_bytes, rd.chunk_bytes(),
                                           remote_reply=uplink.remote_reply, budget=uplink.mem_budget)
-            elif s.pending_flush is not None and s.pending_flush.reason == FLUSH_FAILED:
+            elif s.pending_flush is not None:
                 run.stage = "FLUSH_HW"
+                reason = s.pending_flush.reason
                 _flush_or_poison(drv, m, s)
-                run.flushed = FLUSH_FAILED
+                run.flushed = reason
             run.stage = "PARAMS"
             run.wrote = True
             for core, prog in progs.items():
@@ -745,6 +753,15 @@ def _wait(cond, timeout: float, what: str) -> None:
         _time.sleep(0.001)
 
 
+def _uplink_open(rd) -> bool:
+    """Whether the uplink has a run open or starting: run_active, the DSP side admitting, or the
+    start crossing busy or pending (a caller's own prepare)."""
+    rd._gate(QUIESCE_TIMEOUT)
+    st, diag = rd._status(), rd._diag()
+    return bool(st >> rd_regs.S_RUN_ACTIVE & 1 or st >> rd_regs.S_DSP_ADMIT & 1
+                or diag["start_busy"] or diag["start_pend"])
+
+
 def _quiet(rd, s) -> list:
     """What keeps the uplink from being quiet, with the cores in reset; [] when quiet."""
     st, diag = rd._status(), rd._diag()
@@ -802,7 +819,8 @@ def hardware_flush(drv, m: SocMap, reason: str = "RECOVER", rd=None, settle: Upl
 
 
 def _flush_or_poison(drv, m: SocMap, s) -> None:
-    """The pending FAILED flush of a build without the uplink; a flush that fails POISONs."""
+    """The pending flush outside quiesce (a setup of a build without the uplink, an uplink-free
+    rerun); a flush that fails POISONs."""
     reason = s.pending_flush.reason
     try:
         hardware_flush(drv, m, reason)
@@ -812,14 +830,13 @@ def _flush_or_poison(drv, m: SocMap, s) -> None:
                               f"reload the PL") from e
 
 
-def quiesce(drv, m: SocMap, rd=None, certify: bool = True, timeout: float | None = None,
-            held: bool = False) -> list:
-    """Quiescence (§4.2), before every uplink prepare (`certify=True`) and every setup of an
-    antq_uplink build: the cores in reset; `run_idle` with no flush or drain in flight; the S2MM
-    channel idle (otherwise reset); then G3 (§4.6): REJECTED or early_late is EXPECTED_DISCARD if an
-    uplink-free rerun ran since the last uplink run, else STRAY. A FAILED or STRAY flush runs here;
-    an UNPROVEN one only when `certify` (before an uplink run). Any failure POISONs the session.
-    `held` says the caller has just asserted the core reset. Returns the notes it made."""
+def quiesce(drv, m: SocMap, rd=None, timeout: float | None = None, held: bool = False) -> list:
+    """Quiescence (§4.2), before every uplink prepare and every setup of an antq_uplink build: the
+    cores in reset; `run_idle` with no flush or drain in flight; the S2MM channel idle (otherwise
+    reset); then G3 (§4.6): REJECTED or early_late is EXPECTED_DISCARD if an uplink-free rerun ran
+    since the last uplink run, else STRAY. A pending flush runs here: a FAILED or STRAY one first,
+    an UNPROVEN one after G3 (or the STRAY G3 finds). Any failure POISONs the session. `held` says
+    the caller has just asserted the core reset. Returns the notes it made."""
     s = session(drv)
     rd = _readout(drv, m) if rd is None else rd
     if rd is None:
@@ -866,7 +883,7 @@ def quiesce(drv, m: SocMap, rd=None, certify: bool = True, timeout: float | None
                 notes.append(f"STRAY {counts}, early_late {st >> rd_regs.S_EARLY_LATE & 1}")
                 s.request_flush(FLUSH_STRAY, f"REJECTED {counts}")
         p = s.pending_flush
-        if p is not None and (certify or p.reason != FLUSH_UNPROVEN):
+        if p is not None:
             hardware_flush(drv, m, p.reason, rd=rd)
             notes.append(f"hardware flush ({p.reason}: {p.detail})")
     except SessionPoisoned:
@@ -900,7 +917,7 @@ def recover(drv, m: SocMap) -> list:
                     reset_dma()
                     notes.append("S2MM reset")
                 s.poisoned = None
-                notes += quiesce(drv, m, rd=rd, certify=True)
+                notes += quiesce(drv, m, rd=rd)
         except Exception as e:                          # noqa: BLE001
             s.poisoned = f"recover failed: {type(e).__name__}: {e}"
             raise SessionPoisoned(f"{s.poisoned}: reload the PL") from e

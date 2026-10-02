@@ -53,6 +53,15 @@ def k_echo(offset: int, xs: Array, out: Array, n: int):
         out[i] = xs[i] + offset
 
 
+@kernel
+def k_echo_fin(offset: int, xs: Array, out: Array, n: int, fin: int):
+    """k_echo with a completion marker at out[fin], for an antq_uplink build: it queues nothing, so
+    its last store follows all of its work and the run is queue-proven (qubic3 S0, P4 v2 §4.6)."""
+    for i in range(n):
+        out[i] = xs[i] + offset
+    out[fin] = 1
+
+
 def test_run_still_works(cosim):
     """Sanity: the refactored one-shot `run` (= setup + one rerun) still boots and returns."""
     drv, m = cosim
@@ -97,10 +106,17 @@ def test_rerun_op_budget_size_independent(cosim):
 
     FLOOR: ~20 k = one `setup` of the 64-word image plus two `rerun`s that each move a 64-word input
     block in and a 64-word output block out (a co-sim AXI word is ~22 dspClk cycles, so the blocks
-    ARE the cost). Running two batch sizes is the whole claim, and the large one has to be large."""
+    ARE the cost). Running two batch sizes is the whole claim, and the large one has to be large.
+
+    On an antq_uplink build the kernel carries a completion marker: an unproven first rerun would put
+    the hardware flush, and its ops, in front of the second one only."""
     drv, m = cosim
     N = 64
-    prog = compile_kernel(k_echo, m, xs=Array(N, input=True), out=Array(N))
+    if m.params.with_antq_uplink:
+        prog = compile_kernel(k_echo_fin, m, xs=Array(N, input=True), out=Array(N + 1), fin=N)
+        prog.marker = ("out", N)
+    else:
+        prog = compile_kernel(k_echo, m, xs=Array(N, input=True), out=Array(N))
     rq.setup(drv, m, {0: prog})
     cd = CountingDriver(drv)
 
@@ -114,7 +130,7 @@ def test_rerun_op_budget_size_independent(cosim):
     large = rq.rerun(cd, m, {0: prog}, params={0: {"offset": 0, "n": N}},
                      arrays={0: {"xs": list(range(N))}})[0]["out"]
     large_ops = cd.ops
-    assert list(large) == list(range(N)), "large rerun wrong"
+    assert list(large[:N]) == list(range(N)), "large rerun wrong"
 
     print(f"\n[size-indep] n=4 -> {small_ops} ops, n={N} -> {large_ops} ops")
     assert small_ops == large_ops, \

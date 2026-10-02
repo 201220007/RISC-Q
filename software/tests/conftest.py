@@ -77,6 +77,27 @@ def _cosim_build(request, name: str):
 
 _batch_log: list[tuple[str, int]] = []
 
+# qubic3 S0 r1 (plan P4 v2 §4.6): on an antq_uplink build, after a run that was not queue-proven (a test
+# kernel without a completion marker) the next release takes the hardware flush. One flush costs about
+# 6.1 k co-sim batches on a 2-core build (the bench's pl_resetn0, ~14 uplink register reads at an idle
+# tick each, the 2 048-batch settle of the quiet check, ~800 more per extra core). A co-sim test starts
+# from a session with no flush pending, so it never pays for an earlier test's run, and every flush its
+# own runs take adds FLUSH_ALLOWANCE to its cap.
+FLUSH_ALLOWANCE = 8_000
+_FLUSHED_FIXTURES = ("cosim", "cosim_2q1c", "cosim_antq", "cosim_mm", "cosim_dio")
+
+
+def _flushes(drv) -> int:
+    s = getattr(drv, "_rq_session", None)
+    return 0 if s is None else len(s.flushes)
+
+
+def _start_flushed(drv, m) -> None:
+    s = getattr(drv, "_rq_session", None)
+    if s is not None and s.pending_flush is not None and s.poisoned is None:
+        from riscq import run as rq
+        rq.hardware_flush(drv, m, s.pending_flush.reason)
+
 
 @pytest.fixture(autouse=True)
 def sim_batches(request):
@@ -87,20 +108,27 @@ def sim_batches(request):
     so it never starts a simulator that the test did not ask for.
     """
     names = [n for n in ("cosim", "cosim_2q1c", "cosim_antq") if n in request.fixturenames]
+    for n in (n for n in _FLUSHED_FIXTURES if n in request.fixturenames):
+        _start_flushed(*request.getfixturevalue(n))
     if not names:
         yield
         return
     drvs = [request.getfixturevalue(n)[0] for n in names]
     before = [d.sim.cycles() for d in drvs]
+    flushes = [_flushes(d) for d in drvs]
     yield
     spent = sum(max(0, d.sim.cycles() - t0) for d, t0 in zip(drvs, before))
+    flushed = sum(_flushes(d) - f0 for d, f0 in zip(drvs, flushes))
     _batch_log.append((request.node.nodeid, spent))
     cap = request.config.getoption("--batch-cap")
     override = request.node.get_closest_marker("batch_cap")
     if override:                       # a documented structural floor, not a licence to be slow
         cap = int(override.args[0])
+    if cap and flushed:                # the §4.6 flushes of the test's own unproven runs
+        cap += flushed * FLUSH_ALLOWANCE
     if cap and spent > cap and "slow" not in request.node.keywords:   # anchors are not budgeted
-        pytest.fail(f"simulated {spent:,} batches, over the {cap:,} cap "
+        pytest.fail(f"simulated {spent:,} batches, over the {cap:,} cap"
+                    f"{f' ({flushed} hardware flushes allowed for)' if flushed else ''} "
                     f"(~{spent / 7000:.1f}s of co-sim). Cut points/shots, shrink the relax head, "
                     f"or move the assertion to a cheaper tier "
                     f"(specs/software-test-refactor/01-test-tiers.md).", pytrace=False)

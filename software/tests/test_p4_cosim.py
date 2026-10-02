@@ -252,7 +252,7 @@ def test_next_mid_run_and_before_the_first_check(grid):
 def test_a_margin_sweep_classifies_every_request_consistently(grid):
     """C2: AT(None) at progress 4 with m = 0..3, so S lands where some cores may already have begun
     its check. VERIFIED runs FIRE at S; the others are FIRED, CONSISTENT_LATE or INCONSISTENT as the
-    counts say (accepted with truncate), never INTERNAL_ERROR; each run certifies, and so does the
+    counts say (accepted with accept_inconsistent), never INTERNAL_ERROR; each run certifies, and so does the
     run after them.
 
     FLOOR: five reruns at ~5 k batches of host ops each plus ~8-12 shots each at 384 batches."""
@@ -260,7 +260,7 @@ def test_a_margin_sweep_classifies_every_request_consistently(grid):
     _tone(drv, m)
     seen = []
     for margin in range(4):
-        _, rec = _go(grid, 40, _spec(st.AtProgress(4), margin=margin, truncate=True))
+        _, rec = _go(grid, 40, _spec(st.AtProgress(4), margin=margin, accept_inconsistent=True))
         r = rec.request
         seen.append((margin, r["v_pre"], r["v_post"], r["S"], r["verified"], rec.outcome, rec.shots))
         assert r["verified"] == st.verified(r["S"], r["v_post"], 1)
@@ -299,7 +299,7 @@ def test_a_late_issue_gives_inconsistent_consistent_late_and_internal_error(grid
     drv, m, progs = grid
     _tone(drv, m)
     spec = S.StopSpec(issue=_late_issue(3 * PERIOD), policy=st.AtProgress(4), poll_cycles=256)
-    with pytest.raises(S.StopInconsistent, match="common prefix") as ei:
+    with pytest.raises(S.StopInconsistent, match="joint on the cores' common grid") as ei:
         rq.rerun(drv, m, progs, params=_params(progs, 40), results=["rq_status", "out"], stop=spec)
     rec = ei.value.record
     _check(rec, ei.value.out, 40, readers=(0, 1))

@@ -240,7 +240,8 @@ def finish(run, opting: dict, out: dict, n: dict, uplink=None) -> StopRecord:
             why = f"cores read more results than the uplink's nominal, prepare's footprint (reads, nominal): {over}"
     rec = StopRecord(tuple(run.run_id), outcome, counts, {c: int(n[c]) for c in counts}, request,
                      [(t.request.kind, t.request.S, t.outcome) for t in tickets], late_by,
-                     min((k.shots for k in counts.values()), default=0))
+                     min((k.shots for k in counts.values()), default=0),
+                     all(bool(opting[c].stop.get("at")) for c in opting))
     run.stop = rec
     if outcome == INTERNAL_ERROR:
         raise StopInternalError(f"INTERNAL_ERROR in run {tuple(run.run_id)}: {why}")
@@ -333,19 +334,20 @@ def _policy_from_wire(w):
 
 
 def spec(policy=None, margin: int = 0, reference: int | None = None, poll_interval: float = 0.0,
-         poll_cycles: int = 2_000, truncate: bool = False) -> StopSpec:
+         poll_cycles: int = 2_000, accept_inconsistent: bool = False) -> StopSpec:
     """The StopSpec of a stoppable run with P4's issue step (`Issuer(margin, reference)`). With
     `policy` None or one of this module's policies it also carries its wire form, so it works through
-    a remote driver too (the server builds the same spec next to its hardware). `truncate` accepts an
-    INCONSISTENT outcome instead of raising `StopInconsistent`."""
+    a remote driver too (the server builds the same spec next to its hardware).
+    `accept_inconsistent` returns an INCONSISTENT run's certified data and record instead of raising
+    `StopInconsistent`; it cuts nothing (see `StopRecord.prefix`)."""
     to_wire = getattr(policy, "to_wire", None)
     wire = None
     if policy is None or to_wire is not None:
         wire = {"margin": int(margin), "reference": reference, "poll_interval": float(poll_interval),
-                "poll_cycles": int(poll_cycles), "truncate": bool(truncate),
+                "poll_cycles": int(poll_cycles), "accept_inconsistent": bool(accept_inconsistent),
                 "policy": None if policy is None else to_wire()}
     return StopSpec(issue=Issuer(margin, reference), policy=policy, poll_interval=float(poll_interval),
-                    poll_cycles=int(poll_cycles), truncate=bool(truncate), wire=wire)
+                    poll_cycles=int(poll_cycles), accept_inconsistent=bool(accept_inconsistent), wire=wire)
 
 
 def from_wire(w: dict) -> StopSpec:
@@ -354,7 +356,7 @@ def from_wire(w: dict) -> StopSpec:
     return spec(_policy_from_wire(w.get("policy")), int(w.get("margin", 0)),
                 None if w.get("reference") is None else int(w["reference"]),
                 float(w.get("poll_interval", 0.0)), int(w.get("poll_cycles", 2_000)),
-                bool(w.get("truncate", False)))
+                bool(w.get("accept_inconsistent", False)))
 
 
 def last(drv) -> StopRecord | None:

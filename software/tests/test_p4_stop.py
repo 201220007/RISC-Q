@@ -7,7 +7,7 @@ counts and their validity: NOT_BOOTED, UNFINISHED, TIMEOUT; reserved params refu
 step (NEXT on every core, AT(S) with its read-backs and progress reads, TOO_LATE before any write
 with the request left open, AT refused on a NEXT-only kernel, a failed read-back); the arithmetic
 of S and VERIFIED; the outcome table, with INTERNAL_ERROR, CONSISTENT_LATE, INCONSISTENT and
-`truncate`; the uplink drain on counted reads and the nominal bound; stale requests across epochs
+`accept_inconsistent`; the uplink drain on counted reads and the nominal bound; stale requests across epochs
 and generations; the next run after each kind of stop; the policies (`AtProgress`, `Landed` on a
 scripted CUR_ADDR); the latency arithmetic; the spec's wire form and the board server's remote
 path, with `post_stop` reaching a run that holds the server's lock."""
@@ -68,7 +68,9 @@ class StopSoc(FakeSoc):
     rq_stop_at`, or s == n) and either posts one shot (rq_status[0] = s, [1] += reads_per_shot[c],
     one uplink result per read on an antq build) or ends: fin = rq_epoch (unless `skip_fin`) and its
     DONE bit. `hang` cores never end. `tick_on_status` makes every read of a core's rq_status[0]
-    (the issue step's progress reads) a tick too, so the run moves during the broadcast."""
+    (the issue step's progress reads) a tick too, so the run moves during the broadcast, and
+    `tick_on_publish` = k makes every read-back of a core's rq_stop_epoch k ticks, so a core
+    published late may already have passed S."""
 
     def __init__(self, text=HW):
         super().__init__(text)
@@ -76,9 +78,10 @@ class StopSoc(FakeSoc):
         self.on_release = self._release
 
     def arm(self, progs, every=None, hang=(), skip_fin=(), no_boot=(), reads=None, tick_on_status=False,
-            hold=False):
+            hold=False, tick_on_publish=0):
         self.model = dict(progs=progs, every=every or {}, hang=set(hang), skip_fin=set(skip_fin),
-                          no_boot=set(no_boot), reads=reads or {}, tick_on_status=tick_on_status, hold=hold)
+                          no_boot=set(no_boot), reads=reads or {}, tick_on_status=tick_on_status, hold=hold,
+                          tick_on_publish=tick_on_publish)
         self.state = {}
 
     def a(self, core, name, i=0):
@@ -133,6 +136,9 @@ class StopSoc(FakeSoc):
                 self.tick()
             elif self.model["tick_on_status"] and any(addr == self.a(c, "rq_status", 0) for c in self.state):
                 self.tick()
+            elif self.model["tick_on_publish"] and any(addr == self.a(c, "rq_stop_epoch") for c in self.state):
+                for _ in range(self.model["tick_on_publish"]):
+                    self.tick()
         return super().read32(addr)
 
 
@@ -317,6 +323,18 @@ def test_too_late_writes_nothing_and_leaves_the_request_open():
     assert stop_at_writes == [9, 9]                  # S = 9 only (the release's clears are block writes)
 
 
+def test_the_prefix_is_a_joint_shot_count_only_on_a_common_grid():
+    """after-stage r1 #11: `common_grid` says every core states C1; a NEXT-only kernel's prefix is
+    only the smallest count."""
+    for at in (True, False):
+        f, m, progs = stopsoc(at=at)
+        f.arm(progs, every={1: 2})
+        rq.rerun(f, m, progs, params=params(progs, 30), stop=st.spec(st.AtProgress(4, S.NEXT)))
+        rec = st.last(f)
+        assert rec.outcome == S.STOPPED_EACH and rec.prefix == min(rec.shots.values())
+        assert rec.common_grid is at and S.StopRecord.from_wire(rec.to_wire()).common_grid is at
+
+
 def test_at_on_a_next_only_kernel_is_refused_and_next_still_works():
     f, m, progs = stopsoc(at=False)
     f.arm(progs)
@@ -431,7 +449,7 @@ def _forced(S_, gap=0):
     return issue
 
 
-def test_consistent_late_inconsistent_and_truncate_on_the_model():
+def test_consistent_late_inconsistent_and_accept_inconsistent_on_the_model():
     f, m, progs = stopsoc()
     f.arm(progs)
     rq.rerun(f, m, progs, params=params(progs, 40),
@@ -439,7 +457,7 @@ def test_consistent_late_inconsistent_and_truncate_on_the_model():
     rec = st.last(f)
     assert rec.outcome == S.CONSISTENT_LATE and rec.shots == {0: 8, 1: 8} and rec.late_by == 5
     f.arm(progs)
-    with pytest.raises(S.StopInconsistent, match="common prefix of 8 shots") as ei:
+    with pytest.raises(S.StopInconsistent, match="shots < 8 are joint on the cores' common grid") as ei:
         rq.rerun(f, m, progs, params=params(progs, 40),
                  stop=S.StopSpec(issue=_forced(3, gap=3), policy=st.AtProgress(8)))
     rec = ei.value.record
@@ -448,8 +466,9 @@ def test_consistent_late_inconsistent_and_truncate_on_the_model():
     assert S.session(f).pending_flush is None                     # not a lifecycle failure
     f.arm(progs)
     out = rq.rerun(f, m, progs, params=params(progs, 40),
-                   stop=S.StopSpec(issue=_forced(3, gap=3), policy=st.AtProgress(8), truncate=True))
+                   stop=S.StopSpec(issue=_forced(3, gap=3), policy=st.AtProgress(8), accept_inconsistent=True))
     assert st.last(f).outcome == S.INCONSISTENT and out[0]["rq_status"][0] == 8
+    assert out[1]["rq_status"][0] == 11 and st.last(f).common_grid          # the data are not cut
 
 
 def test_a_verified_request_that_does_not_fire_is_an_internal_error():
@@ -518,7 +537,7 @@ def test_the_next_run_after_each_kind_of_stop_is_exact(first):
     f.arm(progs, every={0: 2} if first == "internal" else None)
     spec = {"fired": st.spec(st.AtProgress(4), margin=1), "next": st.spec(st.AtProgress(4, S.NEXT)),
             "too_late": st.spec(st.AtProgress(4, S.AT, 2)),
-            "inconsistent": S.StopSpec(issue=_forced(1, gap=2), policy=st.AtProgress(4), truncate=True),
+            "inconsistent": S.StopSpec(issue=_forced(1, gap=2), policy=st.AtProgress(4), accept_inconsistent=True),
             "internal": st.spec(st.AtProgress(4))}[first]
     try:
         rq.rerun(f, m, progs, params=params(progs, 40), stop=spec)
@@ -623,9 +642,10 @@ def test_the_latency_budget():
 
 def test_spec_wire_round_trip():
     for pol in (None, st.AtProgress(7, S.AT, 30, 1), st.Landed(100, 14)):
-        sp = st.spec(pol, margin=3, reference=1, poll_interval=1e-4, poll_cycles=300, truncate=True)
+        sp = st.spec(pol, margin=3, reference=1, poll_interval=1e-4, poll_cycles=300, accept_inconsistent=True)
         back = st.from_wire(sp.wire)
-        assert back.wire == sp.wire and back.truncate and back.issue.margin == 3 and back.issue.reference == 1
+        assert back.wire == sp.wire and back.accept_inconsistent and back.issue.margin == 3
+        assert back.issue.reference == 1
     assert st.spec(lambda ctx: None).wire is None                # an arbitrary callable stays local
 
 
@@ -676,3 +696,29 @@ def test_a_remote_stoppable_run_and_post_stop_outside_the_server_lock(board, mon
     rec = st.last(drv)
     assert rec.outcome == S.STOPPED_EACH and rec.shots == {0: 0, 1: 0}
     assert rec.tickets == [(S.NEXT, None, S.ACCEPTED)]
+
+
+def test_a_remote_inconsistent_run_raises_on_the_client_with_its_data_and_record(board, monkeypatch):
+    """after-stage r1 #10: an INCONSISTENT run through the board server. The server's run certifies;
+    instead of a RuntimeError naming StopInconsistent it returns the data and the StopRecord, and
+    the client raises StopInconsistent with both. With accept_inconsistent the client gets the data.
+    The model makes P4's own issuer late: every read-back is 5 ticks, so core 1, published second,
+    has passed S when its request lands."""
+    monkeypatch.setattr(rq, "POLL_MIN_S", 5.0)
+    drv, _, fake = board
+    m = fake.m
+    progs = {c: sprog(c) for c in (0, 1)}
+    rq.setup(drv, m, progs)
+    for accept in (False, True):
+        fake.arm(progs, tick_on_publish=5)
+        spec = st.spec(st.AtProgress(10), margin=0, accept_inconsistent=accept)
+        if not accept:
+            with pytest.raises(S.StopInconsistent, match="INCONSISTENT") as ei:
+                rq.rerun(drv, m, progs, params=params(progs, 40), stop=spec)
+            rec, out = ei.value.record, ei.value.out
+        else:
+            out = rq.rerun(drv, m, progs, params=params(progs, 40), stop=spec)
+            rec = st.last(drv)
+        assert rec.outcome == S.INCONSISTENT and not rec.request["verified"] and rec is st.last(drv)
+        assert rec.shots[0] < rec.shots[1] and rec.prefix == rec.shots[0] and rec.common_grid
+        assert [list(out[c]["rq_status"][:2]) for c in progs] == [[rec.shots[c], rec.reads[c]] for c in progs]

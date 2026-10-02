@@ -466,7 +466,8 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
     read the epoch (UNFINISHED, or NOT_BOOTED while the sentinel is still there), `out[c]["rq_status"]`
     is [shots, reads, fin], and the run's `StopRecord` (`riscq.stop.last(drv)`) carries the outcome of
     §5.6. INTERNAL_ERROR fails the run; INCONSISTENT completes it, certified, and then raises
-    `StopInconsistent` unless the spec says `truncate`. The uplink drains exactly `reads` words of
+    `StopInconsistent` (with the data and the record, also through a remote driver) unless the spec
+    says `accept_inconsistent`. The uplink drains exactly `reads` words of
     such a core (`uplink.expected`, or `uplink.nominal`, is then the upper bound `prepare` checks).
     A `stop` spec needs the convention on every programmed core; remotely, only one with a wire form
     (`riscq.stop.spec`) crosses to the server."""
@@ -485,10 +486,14 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
             kw["stop"] = stop.wire
         raw = dict(remote.rerun(list(progs), params or {}, arrays or {}, results, timeout, **kw))
         rec = raw.pop("__stop", None)
+        out = {int(core): {name: np.frombuffer(buf, dtype="<i4").copy() for name, buf in d.items()}
+               for core, d in raw.items()}
         if rec is not None:
-            session(drv).last_stop = StopRecord.from_wire(rec)
-        return {int(core): {name: np.frombuffer(buf, dtype="<i4").copy() for name, buf in d.items()}
-                for core, d in raw.items()}
+            record = session(drv).last_stop = StopRecord.from_wire(rec)
+            # P4: the server returns an INCONSISTENT run's certified data and record; it raises here
+            if record.outcome == INCONSISTENT and (stop is None or not stop.accept_inconsistent):
+                raise _inconsistent(record, out)
+        return out
     params = params or {}
     arrays = arrays or {}
     s = session(drv)
@@ -583,7 +588,7 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
                 s.last_stop = finish(run, opting, out, n_shots, uplink)
                 if expected is not None:
                     expected.update({c: k.reads for c, k in run.stop.counts.items()})
-                if run.stop.outcome == INCONSISTENT and (stop is None or not stop.truncate):
+                if run.stop.outcome == INCONSISTENT and (stop is None or not stop.accept_inconsistent):
                     inconsistent = run.stop
             if uplink is not None:
                 run.stage = "FLUSH"
@@ -612,13 +617,20 @@ def rerun(drv, m: SocMap, progs: dict[int, Program],
             _fail(drv, m, s, run, exc, rd, progs)
             raise
         if inconsistent is not None:                               # certified, then raised (§5.6)
-            raise StopInconsistent(
-                f"INCONSISTENT: AT({inconsistent.request['S']}) was not VERIFIED (v_pre "
-                f"{inconsistent.request.get('v_pre')}, v_post {inconsistent.request.get('v_post')}) and the "
-                f"cores stopped at {inconsistent.shots}; the run is certified and each core's data exact, "
-                f"the joint data is the common prefix of {inconsistent.prefix} shots (pass "
-                f"riscq.stop.spec(truncate=True) to take it without this error)", inconsistent, out)
+            raise _inconsistent(inconsistent, out)
         return out
+
+
+def _inconsistent(rec: StopRecord, out: dict) -> StopInconsistent:
+    """The StopInconsistent of a certified INCONSISTENT run (locally, or rebuilt by a remote client
+    from its server's reply)."""
+    r = rec.request or {}
+    joint = (f"shots < {rec.prefix} are joint on the cores' common grid" if rec.common_grid else
+             f"the smallest count is {rec.prefix}; the cores state no common grid")
+    return StopInconsistent(
+        f"INCONSISTENT: AT({r.get('S')}) was not VERIFIED (v_pre {r.get('v_pre')}, v_post {r.get('v_post')}) "
+        f"and the cores stopped at {rec.shots}; the run is certified and each core's data exact ({joint}). "
+        f"Pass riscq.stop.spec(accept_inconsistent=True) to take the data without this error", rec, out)
 
 
 def run(drv, m: SocMap, progs: dict[int, Program],

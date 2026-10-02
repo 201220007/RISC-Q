@@ -212,6 +212,7 @@ STOP_ALLOWED = frozenset({
     "set_phase_offset", "set_dc_offset", "fire", "play", "init_pulse_params", "read_res", "read_real",
     "read_imag", "dio_slot", "publish", "remote", "signal"})
 STOP_PRE_LOOP = frozenset({"barrier", "wait_signal"})     # halt on a peer: the pre-loop rendezvous only
+STOP_RESULT_READS = frozenset({"read_res", "read_real", "read_imag"})   # need a result sink at CTRL_RES
 STOP_EVENT_READS = frozenset({"pop_event", "event_word", "event_time", "event_seq", "event_count"})
 
 
@@ -269,12 +270,21 @@ def compile_kernel(k: Kernel, soc_map: SocMap, tables: dict[str, ParamTable] | N
     must be declared, `rq_status` is bound to Array(3), and the body may call only the allow-list
     `STOP_ALLOWED`, with `barrier`/`wait_signal` only in top-level statements before the first
     one that reads the stop words (the pre-loop rendezvous); every other name, the event reads and
-    any helper of an included header among them, is refused. The Program carries `stop` (the
-    stated convention) and the completion marker `rq_status[2]`, whose value is the run's epoch."""
+    any helper of an included header among them, is refused, and so is `include=` itself (a header
+    could redefine an allowed name as a macro). The result reads need the core's result sink at
+    CTRL_RES; fin is stored outside any loop, after the loop that checks the stop words. The
+    Program carries `stop` (the stated convention) and the completion marker `rq_status[2]`,
+    whose value is the run's epoch."""
     bindings = dict(bindings)
     if stop is not None:
         if not isinstance(stop, StopConvention):
             raise KernelCompileError(f"stop= takes a StopConvention, got {type(stop).__name__}")
+        if include:
+            raise KernelCompileError(
+                "a stoppable kernel takes no include=: a header included after riscq.h could redefine an "
+                "allowed primitive as a macro (say read_res as pop_event), and the allow-list checks the "
+                "names the kernel calls, not what they expand to. Its calls are riscq.h primitives only, "
+                "so it needs no header")
         bindings.setdefault(STOP_STATUS, Array(3))
     fe = _FrontEnd(k, soc_map, dict(tables or {}), bindings, int(core), stop)
     kir = fe.compile()
@@ -416,17 +426,47 @@ class _FrontEnd:
             self._err(self.fdef, f"a stoppable kernel publishes rq_status[0] (posted shots), [1] (reads) "
                                  f"and [2] (fin, the epoch, after its last pulse); no store to "
                                  f"rq_status{missing}")
-        for i, s in enumerate(body):                  # fin: only after the shot loop, at top level
-            for n in status_stores(s):
-                if not (isinstance(n.slice, ast.Constant) and n.slice.value in (0, 1)) and i <= boundary:
+        # fin (rq_status[2], or a computed index that may be 2): only after the last top-level statement
+        # that holds a stop-check loop (a loop reading both stop words), and never inside a loop
+        checks = [i for i, s in enumerate(body)
+                  if any(isinstance(n, (ast.While, ast.For)) and reads(n, ("rq_stop_epoch",))
+                         and reads(n, ("rq_stop_at",)) for n in ast.walk(s))]
+        if not checks:
+            self._err(self.fdef, "a stoppable kernel checks both stop words in one loop: no loop reads "
+                                 "rq_stop_epoch and rq_stop_at together")
+        last_check = checks[-1]
+
+        def in_loop_stores(node, inside=False):
+            for child in ast.iter_child_nodes(node):
+                loop = inside or isinstance(child, (ast.While, ast.For))
+                if loop and child in status_set:
+                    yield child
+                yield from in_loop_stores(child, loop)
+
+        for i, s in enumerate(body):
+            stores = [n for n in status_stores(s)
+                      if not (isinstance(n.slice, ast.Constant) and n.slice.value in (0, 1))]
+            status_set = set(stores)
+            nested = set(in_loop_stores(s, isinstance(s, (ast.While, ast.For))))
+            for n in stores:
+                if i <= last_check or n in nested:
                     self._err(n, "rq_status[2] (fin) says the counts are final and every posted pulse has "
-                                 "ended: store it in a top-level statement after the shot loop, past the "
-                                 "completion epilogue, never in or before the loop")
+                                 "ended: store it outside any loop, in a top-level statement after the "
+                                 "loop that checks the stop words, past the completion epilogue")
+        sinks = {base: (sname, kind) for sname, kind, base in self.m.sinks(self.core)}
+        at_res = sinks.get(self.m.CTRL_RES)
         for i, s in enumerate(body):
             for node in ast.walk(s):
                 if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
                     continue
                 name = node.func.id
+                if name in STOP_RESULT_READS and (at_res is None or at_res[1] != "result"):
+                    what = "no sink" if at_res is None else f"the {at_res[1]} sink of channel {at_res[0]!r}"
+                    self._err(node, f"{name}() reads the result sink at {self.m.CTRL_RES:#x}, but on core "
+                                    f"{self.core} that address holds {what}: read_res there would "
+                                    f"{'pop an event and halt until one arrives' if at_res else 'read nothing'}, "
+                                    f"which a stoppable kernel may not do (the core's first reporting "
+                                    f"channel must be its demod)")
                 if name in ("ptr", "range") or name in STOP_ALLOWED:
                     continue
                 if name in STOP_PRE_LOOP:

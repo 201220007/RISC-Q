@@ -736,13 +736,16 @@ class DriverServer:
         up = None if uplink is None else _run.UplinkRun.from_wire(dict(uplink))
         if up is not None:
             up.remote_reply = True
-        out = _run.rerun(self, self._m, progs,
-                         params={int(c): v for c, v in dict(params).items()},
-                         arrays={int(c): v for c, v in dict(arrays).items()},
-                         results=(None if results is None else list(results)), timeout=int(timeout),
-                         uplink=up, identities=(None if identities is None else
-                                                {int(c): str(i) for c, i in dict(identities).items()}),
-                         stop=None if stop is None else _stop.from_wire(dict(stop)))
+        try:
+            out = _run.rerun(self, self._m, progs,
+                             params={int(c): v for c, v in dict(params).items()},
+                             arrays={int(c): v for c, v in dict(arrays).items()},
+                             results=(None if results is None else list(results)), timeout=int(timeout),
+                             uplink=up, identities=(None if identities is None else
+                                                    {int(c): str(i) for c, i in dict(identities).items()}),
+                             stop=None if stop is None else _stop.from_wire(dict(stop)))
+        except _run.StopInconsistent as exc:    # qubic3 P4: certified; the client raises it with the data
+            out = exc.out
         reply = {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()} for c, d in out.items()}
         rec = _run.session(self).runs[-1].stop      # qubic3 P4: the run's StopRecord goes back too
         if rec is not None:

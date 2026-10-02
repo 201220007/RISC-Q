@@ -130,8 +130,9 @@ class StopInternalError(RunLayerError):
 class StopInconsistent(RunLayerError):
     """P4 (§5.6): INCONSISTENT. An AT(S) that was not VERIFIED ended with cores at different counts.
     Not a lifecycle failure: the run is CERTIFIED, each core's data exact. Raised unless the stop spec
-    has `truncate=True`; `record` is the run's StopRecord and `out` its certified data, whose joint
-    part is the common prefix of `record.prefix` shots."""
+    has `accept_inconsistent=True` (locally, and on a remote client, whose server returns the data and
+    the record instead of raising); `record` is the run's StopRecord and `out` its certified per-core
+    data, not cut: which shots are joint is `record.prefix` under the qualifications there."""
 
     def __init__(self, msg: str, record: "StopRecord", out: dict):
         super().__init__(msg)
@@ -164,7 +165,14 @@ class StopRecord:
     """The P4 record of a run of stoppable programs (§5.6): its outcome, every core's counts and n,
     the applied request (kind, S, VERIFIED, v_pre, v_post, L, m, the reference core and the issue
     timestamps), every request's (kind, S, outcome), S' - S for CONSISTENT_LATE, and `prefix`, the
-    shot count of the joint data (min over the cores of `shots`)."""
+    smallest count over the cores (min of `shots`).
+
+    `prefix` is a joint shot count only on a common grid: `common_grid` says every core states C1
+    (StopConvention(at=True)), so shot k of every core sits at t0 + kP and shots < prefix were
+    played by all of them. On a NEXT-only kernel the cores share no stated grid and `prefix` is just
+    the smallest count. Neither case cuts the data: a fixed-read core's first prefix x r reads are
+    its part of the joint shots, but a heralded core's mapping from shots to reads is the kernel's,
+    and the run layer does not know it."""
 
     run_id: tuple
     outcome: str
@@ -174,6 +182,7 @@ class StopRecord:
     tickets: list = field(default_factory=list)
     late_by: int | None = None
     prefix: int = 0
+    common_grid: bool = False
 
     @property
     def shots(self) -> dict:
@@ -189,7 +198,7 @@ class StopRecord:
                 "n": {str(c): int(v) for c, v in self.n.items()},
                 "request": None if self.request is None else dict(self.request),
                 "tickets": [list(t) for t in self.tickets], "late_by": self.late_by,
-                "prefix": int(self.prefix)}
+                "prefix": int(self.prefix), "common_grid": bool(self.common_grid)}
 
     @classmethod
     def from_wire(cls, w: dict) -> "StopRecord":
@@ -197,7 +206,8 @@ class StopRecord:
                    {int(c): Counts.from_wire(k) for c, k in dict(w["counts"]).items()},
                    {int(c): int(v) for c, v in dict(w["n"]).items()},
                    None if w.get("request") is None else dict(w["request"]),
-                   [tuple(t) for t in w.get("tickets", [])], w.get("late_by"), int(w.get("prefix", 0)))
+                   [tuple(t) for t in w.get("tickets", [])], w.get("late_by"), int(w.get("prefix", 0)),
+                   bool(w.get("common_grid", False)))
 
 
 @dataclass
@@ -347,15 +357,16 @@ class StopSpec:
     writes the stop words) and returns its outcome (see `StopMailbox.drain`); `policy(ctx)` runs
     once per poll iteration and may return a request `(kind, S)`. Either raising fails the run.
     `poll_interval` (seconds, 0 = busy poll) paces the loop on hardware, `poll_cycles` in co-sim.
-    P4: `truncate` accepts an INCONSISTENT outcome (the joint data is the common prefix) instead
-    of raising `StopInconsistent`; `wire` is the serpent-safe form `riscq.stop.spec` builds, which a
-    remote driver sends to its server (None: this spec runs only next to the hardware)."""
+    P4: `accept_inconsistent` returns an INCONSISTENT run's certified data instead of raising
+    `StopInconsistent` (nothing is cut; see `StopRecord.prefix`); `wire` is the serpent-safe form
+    `riscq.stop.spec` builds, which a remote driver sends to its server (None: this spec runs only
+    next to the hardware)."""
 
     issue: object
     policy: object = None
     poll_interval: float = 0.0
     poll_cycles: int = 2_000
-    truncate: bool = False
+    accept_inconsistent: bool = False
     wire: dict | None = None
 
 

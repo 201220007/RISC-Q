@@ -220,9 +220,8 @@ def k_helper(rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int, rq_status: Arra
     (k_helper, "seq_shot.. is not on the allow-list"),
 ])
 def test_event_reads_from_host_and_opaque_helpers_are_refused(k, match):
-    with pytest.raises(KernelCompileError, match=match):
-        compile_kernel(k, _sim2q(), stop=StopConvention("n"),
-                       include=[("seq.h", "static inline void seq_shot(int s) { (void)s; }\n")])
+    with pytest.raises(KernelCompileError, match=match):           # refused by name, before any C
+        compile_kernel(k, _sim2q(), stop=StopConvention("n"))
 
 
 @pytest.mark.parametrize("k,match", [
@@ -343,6 +342,35 @@ def k_fin_by_index(rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int, rq_status
     rq_status[2] = e
 
 
+@kernel
+def k_fin_after_a_preliminary_read(rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int, rq_status: Array, n: int):
+    e = rq_epoch
+    first = rq_stop_at                              # a preliminary read before the shot loop
+    s = 0
+    while s < n:
+        if rq_stop_epoch == e and s >= rq_stop_at:
+            break
+        s = s + 1
+        rq_status[0] = s
+        rq_status[1] = first
+        rq_status[2] = e                            # fin inside the loop that checks the stop words
+    rq_status[2] = e
+
+
+@kernel
+def k_fin_in_a_later_loop(rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int, rq_status: Array, n: int):
+    e = rq_epoch
+    s = 0
+    while s < n:
+        if rq_stop_epoch == e and s >= rq_stop_at:
+            break
+        s = s + 1
+        rq_status[0] = s
+        rq_status[1] = 0
+    for i in range(2):
+        rq_status[2] = e                            # fin inside a loop after the shot loop
+
+
 def test_the_convention_is_checked():
     m = _sim2q()
     conv = StopConvention("n")
@@ -354,8 +382,8 @@ def test_the_convention_is_checked():
         compile_kernel(k_no_loop_check, m, stop=conv)
     with pytest.raises(KernelCompileError, match=r"no store to rq_status\[2\]"):
         compile_kernel(k_no_fin, m, stop=conv)
-    for k in (k_fin_in_loop, k_fin_by_index):                  # fin published before the loop ended
-        with pytest.raises(KernelCompileError, match=r"rq_status\[2\] \(fin\)"):
+    for k in (k_fin_in_loop, k_fin_by_index, k_fin_after_a_preliminary_read, k_fin_in_a_later_loop):
+        with pytest.raises(KernelCompileError, match=r"rq_status\[2\] \(fin\)"):   # after-stage r1 #5
             compile_kernel(k, m, stop=conv)
     with pytest.raises(KernelCompileError, match="cannot be bound"):
         _compile(k_ok, rq_epoch=5)
@@ -367,3 +395,68 @@ def test_the_convention_is_checked():
         _compile(k_ok, stop=StopConvention("shots"))
     with pytest.raises(ValueError):
         StopConvention("n", lead=0)
+
+
+# ── after-stage r1 #3 and #4: no headers, and a result sink under read_res ──
+
+def test_a_stoppable_kernel_takes_no_include():
+    """A header included after riscq.h could `#define read_res() pop_event(0)`; the allow-list checks
+    names, so stoppable kernels take no header at all."""
+    with pytest.raises(KernelCompileError, match="takes no include"):
+        _compile(k_ok, period=256, include=[("evil.h", "#define read_res() pop_event(0)\n")])
+    assert _compile(k_ok, period=256).stop is not None
+
+
+def _dio_first():
+    """sim-dio with core 0's DIO bank listed before its demod (its first reporter, so the FIFO sink
+    sits at 0x4200) and a third core with no reporting channel."""
+    import json
+    d = json.loads((CONFIGS / "sim-dio.json").read_text())
+    c0 = d["cores"][0]["channels"]
+    c0[:] = [c for c in c0 if c["kind"] != "dio"][:2] + [c for c in c0 if c["kind"] == "dio"] + \
+        [c for c in c0 if c["kind"] == "demod"]
+    d["cores"].append({"name": "c2", "role": "coupler", "channels": [dict(d["cores"][1]["channels"][0], dac=2)]})
+    d["name"] = "sim-dio-first"
+    return SocMap(SocParams.from_json(json.dumps(d)))
+
+
+@kernel
+def k_reads(demod: ParamTable, rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int, rq_status: Array, n: int):
+    e = rq_epoch
+    s = 0
+    while s < n:
+        if rq_stop_epoch == e and s >= rq_stop_at:
+            break
+        s = s + 1
+        rq_status[0] = s
+        rq_status[1] = s
+        read_res()  # noqa: F821
+    rq_status[2] = e
+
+
+@kernel
+def k_no_reads(rq_epoch: int, rq_stop_epoch: int, rq_stop_at: int, rq_status: Array, n: int):
+    e = rq_epoch
+    s = 0
+    while s < n:
+        if rq_stop_epoch == e and s >= rq_stop_at:
+            break
+        s = s + 1
+        rq_status[0] = s
+        rq_status[1] = 0
+    rq_status[2] = e
+
+
+def test_read_res_needs_the_result_sink_at_0x4200():
+    m = _dio_first()
+    assert [(k, b) for _, k, b in m.sinks(0)][:2] == [("fifo", 0x4200), ("result", 0x4220)]
+    conv = StopConvention("n")
+    demod0 = ParamTable(m.channel_named("demod", 0), 0.0, {"sq": Pulse(envelopes.square(40), amp=1.0)})
+    with pytest.raises(KernelCompileError, match="0x4200, but on core 0 that address holds the fifo sink of channel 'ttl'"):
+        compile_kernel(k_reads, m, core=0, tables=dict(demod=demod0), stop=conv)
+    demod1 = ParamTable(m.channel_named("demod", 1), 0.0, {"sq": Pulse(envelopes.square(40), amp=1.0)})
+    assert compile_kernel(k_reads, m, core=1, tables=dict(demod=demod1), stop=conv).stop is not None
+    with pytest.raises(KernelCompileError, match="on core 2 that address holds no sink"):
+        compile_kernel(k_reads, m, core=2, tables=dict(demod=ParamTable(0, 0.0, {"sq": Pulse(envelopes.square(40), amp=1.0)})),
+                       stop=conv)
+    assert compile_kernel(k_no_reads, m, core=0, stop=conv).stop is not None      # a non-reader is fine

@@ -257,50 +257,113 @@ def _antq_board_driver(fake_board, tmp_path):
     return drv, readout_for(drv, SocMap(drv.params))
 
 
-class _DrainBuf:
-    nbytes, freed = 1 << 16, 0
+_FREED: list = []
+
+
+class _CmaBuf:
+    """pynq's PynqBuffer as far as freeing goes: `freebuffer()`, which its destructor also calls."""
+
+    nbytes, device_address = 1 << 16, 0x7000_0000
+
+    def __init__(self, name):
+        self.name, self.freed = name, False
 
     def freebuffer(self):
-        self.freed += 1
+        if not self.freed:
+            self.freed = True
+            _FREED.append(self.name)
+
+    def __del__(self):
+        self.freebuffer()
 
 
-def test_pynq_driver_close_keeps_the_readout_until_the_dma_stop_is_confirmed(fake_board, tmp_path):
-    """qubic3 S0 after-stage r2 #1: with a transfer in flight and an S2MM reset that fails, close()
-    keeps the DdrBoard referenced (dropping it would let pynq's buffer destructor free pages the DMA
-    may still write), does not free the buffer, marks the driver unusable and raises; a later
-    close() whose reset succeeds frees the buffer and drops the readout."""
+class _Dma:
+    """The S2MM channel's control register: a soft reset clears at once, or (`stuck`) cannot be
+    written, so it is never confirmed."""
+
+    def __init__(self, stuck=False):
+        self.stuck, self.regs, self.resets = stuck, {}, 0
+
+    def write(self, off, val):
+        if off == 0x30 and val & 4:
+            if self.stuck:
+                raise OSError("bus error on DMACR")
+            self.resets += 1
+            val = 0                                      # the reset self-clears
+        self.regs[off] = val
+
+    def read(self, off):
+        return self.regs.get(off, 0)
+
+
+def _arm(port, buf, stuck=False):
+    """`port` as a drain leaves it while its transfer is in flight, over a stand-in DMA window."""
+    from riscq.ddr import DdrMap
+    dma = _Dma(stuck)
+    port._mmio[(DdrMap().dma_base, DdrMap().dma_size)] = dma
+    port._buf, port._active = buf, (buf, 4096)
+    return dma
+
+
+def test_a_discarded_driver_cannot_free_a_buffer_the_dma_may_still_write(fake_board, tmp_path):
+    """qubic3 r3 #1, #4: close() with a transfer in flight and a reset that cannot be confirmed
+    quarantines the buffer, marks the driver unusable (the uplink's own windows refuse too) and
+    raises. Dropping the driver and its readout and collecting garbage then frees nothing, although
+    pynq frees in the destructor; only a confirmed reset of the channel releases the buffer."""
     import gc
-    import weakref
+    from riscq.board.ddr_board import DdrBoard, quarantined
+    from riscq.ddr import DdrMap
+    _FREED.clear()
     drv, rd = _antq_board_driver(fake_board, tmp_path)
-    port, drain = rd.drv, _DrainBuf()
-    port._buf, port._active = drain, (drain, 4096)           # a drain in flight
-
-    def stuck():
-        raise RuntimeError("the S2MM soft reset did not clear within 1 s (DMACR=0x00000004)")
-    port.dma_reset = stuck
-    alive = weakref.ref(port)
-    with pytest.raises(RuntimeError, match="could not stop the uplink's S2MM channel"):
+    port = rd.drv
+    _arm(port, _CmaBuf("drain"), stuck=True)
+    with pytest.raises(RuntimeError, match="quarantined"):
         drv.close()
-    del port, rd
-    gc.collect()
-    assert alive() is not None and drv._rq_readout.drv is alive()   # still owned by the driver
-    assert drain.freed == 0 and alive()._buf is drain and alive()._active is not None
     with pytest.raises(RuntimeError, match="unusable"):
-        drv.read32(0)                                         # every MMIO access refuses
-    alive().dma_reset = lambda: setattr(alive(), "_active", None)   # the stop now succeeds
-    drv.close()
-    assert drain.freed == 1 and drv._rq_readout is None
+        port.read32(DdrMap().ctrl_base + 0x2C)          # STATUS, through DdrBoard's own window
+    del drv, rd, port
+    gc.collect()
+    assert _FREED == [] and [buf.name for _, buf, _ in quarantined()] == ["drain"]
+    rescue = DdrBoard()                                 # a confirmed reset of the same channel
+    rescue._mmio[(DdrMap().dma_base, DdrMap().dma_size)] = _Dma()
+    rescue.dma_reset()
+    gc.collect()
+    assert quarantined() == [] and _FREED == ["drain"]
+
+
+def test_attach_readout_is_refused_while_quarantined_or_unusable(fake_board, tmp_path):
+    """qubic3 r3 #2: a new readout cannot replace the cached one while a buffer is quarantined (a
+    failed drain's reset) or once the driver is unusable (a failed close), even after the stop."""
+    from riscq.board.ddr_board import DdrBoard
+    from riscq.ddr import DdrReadout, attach_readout
+    from riscq.map import SocMap
+    drv, rd = _antq_board_driver(fake_board, tmp_path)
+    m, port = SocMap(drv.params), rd.drv
+    dma = _arm(port, _CmaBuf("a"), stuck=True)
+    with pytest.raises(OSError):
+        port.dma_reset()                                # quarantined; the driver is still usable
+    with pytest.raises(RuntimeError, match="quarantined"):
+        attach_readout(drv, DdrReadout(DdrBoard(soc=drv), soc_map=m))
+    assert drv._rq_readout is rd and not drv._unusable
+    with pytest.raises(RuntimeError, match="quarantined"):
+        drv.close()
+    dma.stuck = False
+    port.dma_reset()                                    # the reset that stays possible
+    with pytest.raises(RuntimeError, match="unusable"):
+        attach_readout(drv, DdrReadout(DdrBoard(soc=drv), soc_map=m))
+    assert drv._rq_readout is rd
 
 
 def test_pynq_driver_close_stops_a_transfer_in_flight_then_frees(fake_board, tmp_path):
-    """The success path of r2 #1: the S2MM reset is confirmed, then the buffer is freed and the
-    readout dropped, and close() returns normally."""
+    """The success path: the S2MM reset is confirmed, then the buffer is freed, the readout dropped,
+    nothing quarantined, and close() returns normally."""
+    from riscq.board.ddr_board import quarantined
+    _FREED.clear()
     drv, rd = _antq_board_driver(fake_board, tmp_path)
-    port, drain, resets = rd.drv, _DrainBuf(), []
-    port._buf, port._active = drain, (drain, 4096)
-    port.dma_reset = lambda: (resets.append(1), setattr(port, "_active", None))
+    dma = _arm(rd.drv, _CmaBuf("drain"))
     drv.close()
-    assert resets == [1] and drain.freed == 1 and drv._rq_readout is None and drv._unusable is None
+    assert dma.resets == 1 and _FREED == ["drain"] and drv._rq_readout is None
+    assert drv._unusable is None and quarantined() == []
 
 
 def test_pynq_driver_hostwindow_allocates_after_the_shim(fake_board, tmp_path):

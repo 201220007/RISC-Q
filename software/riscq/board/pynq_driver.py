@@ -159,21 +159,20 @@ class PynqDriver:
         """Release the CMA buffers. Called before a reload so the next driver's `pynq.allocate`
         sees the pool free (specs/software/22 §3). On an antq_uplink build that includes the run
         layer's cached uplink readout (qubic3 S0 r1): its `DdrBoard.close()` stops an S2MM transfer
-        still in flight before it frees the drain buffer (a fixed buffer stays its owner's). The
-        cache is dropped only once that stop is confirmed (r2): if the channel cannot be stopped,
-        the driver keeps the readout, so the buffer stays allocated, marks itself unusable (every
-        MMIO access raises) and raises. A later close() tries the stop again."""
+        still in flight before it frees the drain buffer (a fixed buffer stays its owner's). If the
+        channel cannot be stopped (r3), the buffer stays in `riscq.board.ddr_board`'s quarantine,
+        and the driver marks itself unusable and raises: its MMIO, the uplink's windows and
+        `attach_readout` refuse from then on, all but the S2MM reset a later close() retries."""
         rd = getattr(self, "_rq_readout", None)
         port = getattr(rd, "drv", None)
         if port is not None and port is not self and hasattr(port, "close"):
             try:
-                stopped, why = port.close() is not False, "DdrBoard.close() could not reset it"
-            except Exception as e:                      # noqa: BLE001 - kept, then raised below
-                stopped, why = False, f"{type(e).__name__}: {e}"
-            if not stopped:
-                self._unusable = (f"close() could not stop the uplink's S2MM channel ({why}); its drain "
-                                  f"buffer is kept, and the PL needs a reload or a power cycle")
-                raise RuntimeError(self._unusable)
+                port.close()
+            except Exception as e:
+                self._unusable = (f"close() could not stop the uplink's S2MM channel ({type(e).__name__}: "
+                                  f"{e}); its drain buffer is quarantined, and the PL needs a reload or a "
+                                  f"power cycle")
+                raise RuntimeError(self._unusable) from e
         self._rq_readout = None
         buf, self._host_buf = getattr(self, "_host_buf", None), None
         if buf is not None:

@@ -535,7 +535,17 @@ class DdrReadout:
 
 def attach_readout(drv, readout):
     """Make `readout` the DdrReadout the run layer uses for `drv` (qubic3 S0/P6), e.g. one over a
-    `DdrBoard` holding a fixed, externally owned DMA buffer."""
+    `DdrBoard` holding a fixed, externally owned DMA buffer. Refused while `drv` is unusable or any
+    DMA buffer is quarantined (qubic3 r3, `riscq.board.ddr_board`): a new readout must not take over
+    a channel that may still be writing."""
+    why = getattr(drv, "_unusable", None)
+    if why:
+        raise RuntimeError(f"attach_readout refused: the driver is unusable ({why})")
+    from riscq.board.ddr_board import quarantined
+    held = quarantined()
+    if held:
+        raise RuntimeError(f"attach_readout refused: {len(held)} DMA buffer(s) quarantined, the S2MM "
+                           f"channel at {held[0][0]:#x} not yet stopped ({held[0][2]})")
     setattr(drv, "_rq_readout", readout)
     return readout
 

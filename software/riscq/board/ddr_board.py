@@ -29,6 +29,19 @@ log = logging.getLogger(__name__)
 SOC_BASE = 0x8000_0000
 SOC_SIZE = 0x1000_0000
 
+# qubic3 S0 r3: the quarantine. A DMA buffer the S2MM channel may still be writing (a transfer was
+# armed, possibly in part, and no reset of the channel has been confirmed since) is held here by a strong
+# reference, keyed by the DMA's base address, whatever happens to the DdrBoard, the driver or any cache:
+# pynq frees a buffer in its destructor, so dropping the last other reference cannot free it. Only a
+# confirmed soft reset of that channel (`DdrBoard.dma_reset` returning) takes its buffers out. Process
+# exit is not covered: that is the board kit's owner/child pattern.
+_QUARANTINE: dict[int, list] = {}
+
+
+def quarantined(dma_base: int | None = None) -> list:
+    """The quarantined buffers as (dma_base, buffer, reason), of one DMA channel or of all."""
+    return [(b, buf, why) for b, held in _QUARANTINE.items() if dma_base in (None, b) for buf, why in held]
+
 
 class DdrBoard:
     """The four-method driver surface, plus pass-through to a wrapped `PynqDriver`.
@@ -63,8 +76,12 @@ class DdrBoard:
         return min(int(self._buf.nbytes), MAX_RD_SIZE) if self._fixed else MAX_RD_SIZE
 
     # ── lazily-imported pynq objects ───────────────────────────────────────────────────
-    def _win(self, base, size):
-        """One `pynq.MMIO` per window, created on first use."""
+    def _win(self, base, size, recovering=False):
+        """One `pynq.MMIO` per window, created on first use. Refused once the wrapped driver is
+        unusable (qubic3 r3), except for the S2MM reset (`recovering`), the only way to confirm a stop."""
+        why = getattr(self.soc, "_unusable", None)
+        if why and not recovering:
+            raise RuntimeError("the board driver is unusable: %s" % why)
         key = (base, size)
         if key not in self._mmio:
             import pynq
@@ -152,23 +169,35 @@ class DdrBoard:
             self._buf = pynq.allocate(shape=(n,), dtype="u1")
         return self._buf
 
-    def _dma_win(self):
-        return self._win(self.map.dma_base, self.map.dma_size)
+    def _dma_win(self, recovering=False):
+        return self._win(self.map.dma_base, self.map.dma_size, recovering)
 
     def dma_reset(self):
         """Soft-reset the S2MM channel and leave it halted. Used before arming and after any failure --
         r27-#6: an errored or timed-out channel is otherwise left active/faulted, and the next drain
-        would inherit it."""
+        would inherit it.
+
+        qubic3 r3: a reset that returns is the confirmed stop, and releases the channel's quarantined
+        buffers. One that fails while a transfer may be in flight quarantines that transfer's buffer
+        and raises."""
         import time
-        dma = self._dma_win()
-        dma.write(self.S2MM_DMACR, self.DMACR_RESET)
-        t0 = time.monotonic()
-        while dma.read(self.S2MM_DMACR) & self.DMACR_RESET:
-            if time.monotonic() - t0 > 1.0:
-                raise RuntimeError("the S2MM soft reset did not clear within 1 s "
-                                   "(DMACR=0x%08x)" % dma.read(self.S2MM_DMACR))
-            time.sleep(0.001)
+        try:
+            dma = self._dma_win(recovering=True)
+            dma.write(self.S2MM_DMACR, self.DMACR_RESET)
+            t0 = time.monotonic()
+            while dma.read(self.S2MM_DMACR) & self.DMACR_RESET:
+                if time.monotonic() - t0 > 1.0:
+                    raise RuntimeError("the S2MM soft reset did not clear within 1 s "
+                                       "(DMACR=0x%08x)" % dma.read(self.S2MM_DMACR))
+                time.sleep(0.001)
+        except Exception as e:
+            if self._active is not None:
+                held = _QUARANTINE.setdefault(self.map.dma_base, [])
+                if not any(buf is self._active[0] for buf, _ in held):
+                    held.append((self._active[0], "%s: %s" % (type(e).__name__, e)))
+            raise
         self._active = None
+        _QUARANTINE.pop(self.map.dma_base, None)
 
     def dma_idle(self) -> bool:
         """qubic3 S0 quiesce: no transfer armed here, and the S2MM channel halted or idle."""
@@ -209,6 +238,9 @@ class DdrBoard:
             if sr & self.DMASR_ERRS:
                 log.warning("S2MM_DMASR shows 0x%08x before arming; resetting the channel", sr)
                 self.dma_reset()
+            # qubic3 r3: possibly armed from the first arming write on, so a failure below whose
+            # reset also fails leaves the transfer recorded, and its buffer quarantined
+            self._active = (buf, int(nbytes))
             dma.write(self.S2MM_DMACR, self.DMACR_RS)           # RS = 1 (run)
             # r27-#5: RS must actually take. A channel left Halted reports IDLE too, and a wait on it
             # would return the buffer's previous contents as a successful drain.
@@ -249,9 +281,8 @@ class DdrBoard:
             try:
                 self.dma_reset()
             except Exception:                                    # noqa: BLE001
-                log.exception("the S2MM reset after a failed arm also failed")
+                log.exception("the S2MM reset after a failed arm also failed; the buffer is quarantined")
             raise
-        self._active = (buf, int(nbytes))
         return buf
 
     def dma_recv_wait(self, buf, nbytes, timeout=5.0):
@@ -291,7 +322,7 @@ class DdrBoard:
             try:
                 self.dma_reset()
             except Exception:                      # noqa: BLE001 - never mask the original failure
-                log.exception("the S2MM reset after a failed drain also failed")
+                log.exception("the S2MM reset after a failed drain also failed; the buffer is quarantined")
             raise
         self._active = None
         buf.invalidate()                           # the PL wrote it; drop stale cache lines
@@ -302,18 +333,11 @@ class DdrBoard:
         if the reset fails, keep the buffer -- leaking it is strictly better than handing its pages back
         to the kernel while a DMA is writing them.
 
-        Returns True once no transfer is in flight (the buffer freed, unless it is fixed), False when the
-        channel could not be stopped and the buffer is still held. A caller seeing False must keep this
-        object referenced: dropping it would let pynq's buffer destructor free the pages (qubic3 r2)."""
+        qubic3 r3: a failed reset leaves the buffer in the quarantine (`dma_reset`), so it stays
+        allocated whatever happens to this object, and close() raises. It frees the buffer (unless it
+        is fixed) only with no transfer possibly in flight."""
         if self._active is not None:
-            try:
-                self.dma_reset()
-            except Exception:                                    # noqa: BLE001
-                log.exception("could not reset the S2MM channel at close(); NOT freeing the CMA buffer "
-                              "-- a live DMA writing freed pages would corrupt unrelated memory")
-                return False
-        self._active = None
+            self.dma_reset()                       # raises, the buffer quarantined, if it cannot stop
         if self._buf is not None and not self._fixed:      # a fixed buffer belongs to its owner
             self._buf.freebuffer()
             self._buf = None
-        return True

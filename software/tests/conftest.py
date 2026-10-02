@@ -153,6 +153,17 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
                   f"(<={total / 7000 / 60:.1f} min of simulated RTL)")
 
 
+@pytest.fixture(autouse=True)
+def _dma_quarantine():
+    """qubic3 r3: the DMA buffer quarantine (`riscq.board.ddr_board`) is process-wide; each test
+    leaves it as it found it, so a test's deliberately stuck channel cannot refuse a later attach."""
+    from riscq.board import ddr_board
+    saved = {k: list(v) for k, v in ddr_board._QUARANTINE.items()}
+    yield
+    ddr_board._QUARANTINE.clear()
+    ddr_board._QUARANTINE.update(saved)
+
+
 @pytest.fixture(scope="session")
 def socmap():
     """The sim-2q `SocMap`, without starting a simulator — the host-pure tests derive every code

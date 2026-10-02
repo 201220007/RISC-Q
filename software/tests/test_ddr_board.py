@@ -239,10 +239,10 @@ def test_close_stops_the_channel_before_freeing_the_buffer(fake_pynq):
     b = _board()
     buf = b.dma_recv_prepare(32)
     dma = fake_pynq[DdrMap().dma_base]
-    assert b.close() is True
+    b.close()
     reset_at = [i for i, e in enumerate(dma.log) if e[0] == "w" and e[1] == 0x30 and e[2] & 0x4]
     assert reset_at, "close() must reset the channel when a transfer is in flight"
-    assert buf.freed == 1
+    assert buf.freed == 1 and _quarantined() == []
 
 
 def test_close_keeps_the_buffer_if_the_channel_cannot_be_stopped(fake_pynq):
@@ -252,8 +252,52 @@ def test_close_keeps_the_buffer_if_the_channel_cannot_be_stopped(fake_pynq):
     buf = b.dma_recv_prepare(32)
     dma = fake_pynq[DdrMap().dma_base]
     dma.model_dma = False                       # the reset bit will never self-clear
-    assert b.close() is False                   # the caller learns it must keep the board referenced
+    with pytest.raises(RuntimeError, match="did not clear"):
+        b.close()
     assert buf.freed == 0, "the buffer must NOT be freed when the DMA could not be stopped"
+    assert [x[1] for x in _quarantined()] == [buf]      # qubic3 r3: held whatever happens to `b`
+    dma.model_dma = True                        # the reset now clears: the confirmed stop
+    b.close()
+    assert buf.freed == 1 and _quarantined() == []
+
+
+def _quarantined():
+    from riscq.board.ddr_board import quarantined
+    return quarantined()
+
+
+class _StuckAfterLength(FakeMMIO):
+    """An S2MM channel that errors once LENGTH is written and then cannot be reset."""
+
+    def write(self, off, val):
+        if off == 0x30 and val & self.RESET and self.regs.get(0x58):
+            raise OSError("bus error on DMACR")             # the reset cannot be confirmed
+        super().write(off, val)
+        if off == 0x58:
+            self.regs[0x34] |= 0x10                         # DMAIntErr right after the start
+
+
+def test_an_exception_after_length_with_a_failed_reset_quarantines_and_raises(fake_pynq):
+    """qubic3 r3 #3: the transfer is recorded before the first arming write, so a failure after
+    LENGTH whose reset also fails leaves the board possibly armed: the buffer is quarantined, a
+    new arm is refused, and close() raises without freeing. A confirmed reset releases it."""
+    from riscq.board.ddr_board import DdrBoard
+    m = DdrMap()
+    stuck = _StuckAfterLength(m.dma_base, m.dma_size)
+    b = DdrBoard()
+    b._mmio[(m.dma_base, m.dma_size)] = stuck
+    with pytest.raises(RuntimeError, match="error immediately after LENGTH"):
+        b.dma_recv_prepare(32)
+    buf = b._buf
+    assert b._active == (buf, 32) and [x[1] for x in _quarantined()] == [buf]
+    with pytest.raises(RuntimeError, match="already in flight"):
+        b.dma_recv_prepare(32)
+    with pytest.raises(OSError, match="bus error"):
+        b.close()
+    assert buf.freed == 0 and [x[1] for x in _quarantined()] == [buf]
+    stuck.regs.pop(0x58)                                    # the reset works again
+    b.close()
+    assert buf.freed == 1 and _quarantined() == [] and b._active is None
 
 
 def test_a_failed_arm_resets_the_channel(fake_pynq):

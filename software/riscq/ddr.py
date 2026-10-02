@@ -578,8 +578,10 @@ def _mem_available():
 
 
 def preflight(expected, base, bank_bytes, chunk, remote_reply=False, budget=None, mem_available=None):
-    """The many-shot preflight (qubic3 P6, plan P6 v2 §4.5), host-side arithmetic run before
-    `prepare` so a refusal costs no hardware state. W = Σ expected words; the footprint F =
+    """The many-shot preflight (qubic3 P6, plan P6 v2 §4.5): host-side arithmetic that `rerun` runs
+    after quiescence (which may have asserted the core reset, reset an S2MM channel or run a pending
+    flush) and before the run's own first write, so a refusal leaves none of the run on the hardware:
+    no params, marker, BASE_RESET or release. W = Σ expected words; the footprint F =
     bank·⌈8W/bank⌉ (`max_bytes`) must fit the ring from a `WR_BASE_ALIGN`-aligned `base`; the drain
     reads F_read = 32·⌈8W/32⌉ in K = ⌈F_read/chunk⌉ chunks; the PS memory the drain needs is modelled
     on today's code as 2·F_read (the chunk list and its join) + 32W (the parse_words temporaries and

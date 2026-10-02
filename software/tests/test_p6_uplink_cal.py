@@ -470,18 +470,22 @@ def test_preflight_arithmetic_and_boundaries():
         2 * 96 + 32 * 9 + (4 * 72) // 3 + 72
 
 
-def test_preflight_refusal_costs_no_hardware_state():
+def test_a_preflight_refusal_writes_none_of_the_run():
+    """The preflight runs after quiescence (which holds the core reset, and may reset the S2MM channel
+    or run a pending flush) and before the run's own first write: a refusal leaves no params, marker,
+    BASE_RESET or release behind, and no flush pending."""
     f = FakeSoc(ANTQ.read_text())
     m = f.m
     from tests.test_s0_run_layer import kernel, prog
     progs = {0: prog(marker=True)}
     rq.setup(f, m, progs)
     f.on_release = kernel(results={0: [(16, 16)]})
+    mem = dict(f.mem)
     with pytest.raises(S.PreflightRefused, match="PS memory"):
         rq.rerun(f, m, progs, uplink=rq.UplinkRun(expected={0: 1}, settle_s=0, mem_budget=10))
     s = S.session(f)
     assert s.last_failure.kind == "PREFLIGHT" and s.pending_flush is None
-    assert f.up.base_resets == 0 and f.releases == 0
+    assert f.mem == mem and f.up.base_resets == 0 and f.releases == 0 and f.reset_held
     rq.rerun(f, m, progs, uplink=rq.UplinkRun(expected={0: 1}, settle_s=0))
 
 

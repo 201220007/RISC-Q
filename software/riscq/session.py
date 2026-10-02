@@ -62,9 +62,10 @@ class SessionPoisoned(RunLayerError):
 
 
 class RecoveryRequired(RunLayerError):
-    """A run without the uplink seam on an antq_uplink build while a FAILED or STRAY flush is
-    pending: the caller runs its own uplink protocol, which the flush would reset underneath it.
-    Call `riscq.run.recover()` (or `setup()`) first."""
+    """A run without the uplink seam on an antq_uplink build while a hardware flush is pending and
+    the uplink has a run open: its caller runs its own uplink protocol, which the flush (due before
+    the release, §4.6) would reset underneath it. Call `riscq.run.recover()` (or `setup()`) before
+    the caller's prepare."""
 
 
 class LoadedSetError(RunLayerError):

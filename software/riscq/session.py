@@ -111,6 +111,17 @@ class RecoveryUnavailable(RunLayerError):
     """The driver cannot pulse pl_resetn0, so the hardware flush is impossible here: PL reload."""
 
 
+class PulseUnconfirmed(RunLayerError):
+    """qubic3 BT: the pl_resetn0 pulse could not be confirmed released (an exception after the write
+    that drove the resets low, or a last read-back other than high). The driver is unusable and refuses
+    every PL access from then on; only a PL reload recovers."""
+
+
+class RfReplayError(RunLayerError):
+    """qubic3 BT: after a pl_resetn0 pulse the RF data converter did not come back ready, or the RF
+    replay (MTS, Nyquist zones, VOP) missed. The session POISONs; a PL reload recovers."""
+
+
 class NotBooted(Unfinished):
     """P4 (§4.4): a programmed core raised DONE while its `rq_status` still holds the sentinel the
     run layer wrote before the release: it never ran this run's start.S. NOT_BOOTED."""

@@ -87,10 +87,19 @@ class DdrBoard:
     # ── lazily-imported pynq objects ───────────────────────────────────────────────────
     def _win(self, base, size, recovering=False):
         """One `pynq.MMIO` per window, created on first use. Refused once the wrapped driver is
-        unusable (qubic3 r3), except for the S2MM reset (`recovering`), the only way to confirm a stop."""
+        unusable (qubic3 r3), except for the S2MM reset (`recovering`), the only way to confirm a stop.
+        qubic3 BT: every access path to the uplink and the DMA comes through here (`_route` and the
+        DMA methods), so it also refuses while the wrapped driver pulses pl_resetn0, the reset
+        included, and from any thread but the driver's bound PL thread (`PynqDriver.bind_pl_thread`)."""
         why = getattr(self.soc, "_unusable", None)
         if why and not recovering:
             raise RuntimeError("the board driver is unusable: %s" % why)
+        pulse = getattr(self.soc, "_pulse", None)
+        if pulse:
+            raise RuntimeError("PL access refused: %s" % pulse)
+        t = getattr(self.soc, "_pl_thread", None)
+        if t is not None and threading.get_ident() != t:
+            raise RuntimeError("PL access refused: only the board driver's PL thread may access the PL")
         key = (base, size)
         if key not in self._mmio:
             import pynq

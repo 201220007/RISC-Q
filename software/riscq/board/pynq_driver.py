@@ -153,11 +153,20 @@ class PynqDriver:
         return buf[:nbytes]
 
     def close(self) -> None:
-        """Release the CMA result buffer. Called before a reload so the next driver's
-        `pynq.allocate` sees the pool free (specs/software/22 §3)."""
-        buf, self._host_buf = getattr(self, "_host_buf", None), None
-        if buf is not None:
-            buf.freebuffer()
+        """Release the CMA buffers. Called before a reload so the next driver's `pynq.allocate`
+        sees the pool free (specs/software/22 §3). On an antq_uplink build that includes the run
+        layer's cached uplink readout (qubic3 S0 r1): its `DdrBoard.close()` stops an S2MM transfer
+        still in flight before it frees the drain buffer (a fixed buffer stays its owner's), and
+        the cache is dropped."""
+        rd, self._rq_readout = getattr(self, "_rq_readout", None), None
+        try:
+            port = getattr(rd, "drv", None)
+            if port is not None and port is not self and hasattr(port, "close"):
+                port.close()
+        finally:
+            buf, self._host_buf = getattr(self, "_host_buf", None), None
+            if buf is not None:
+                buf.freebuffer()
 
     def read_host(self, offset: int, nbytes: int) -> bytes:
         """Read the CMA result buffer at buffer-relative `offset` (specs/software/22 §2.6). Only

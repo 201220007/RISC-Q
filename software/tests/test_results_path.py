@@ -219,6 +219,35 @@ def test_pynq_driver_antq_allocates_no_host_window(fake_board, tmp_path):
     drv.close()                                   # nothing to free, must not raise
 
 
+def test_pynq_driver_close_tears_down_the_cached_uplink_readout(fake_board, tmp_path):
+    """qubic3 S0 after-stage r1 #13: close() also closes the DdrBoard under the run layer's cached
+    DdrReadout, so its drain buffer goes back to CMA before a reload, and drops the cache; a fixed
+    buffer belongs to its owner and is not freed."""
+    from riscq.board.ddr_board import DdrBoard
+    from riscq.ddr import DdrReadout, attach_readout, readout_for
+    from riscq.map import SocMap
+    pd, events = fake_board
+    board = {**pd.BOARD_DEFAULTS, "mts": None, "dac_nyquist": {"default": 2}}
+    drv = pd.PynqDriver("x.xsa", str(_board_cfg(tmp_path, "sim-2q-antq.json")), board=board)
+    m = SocMap(drv.params)
+
+    class Buf:
+        nbytes, freed = 1 << 16, 0
+
+        def freebuffer(self):
+            self.freed += 1
+    port = readout_for(drv, m).drv
+    assert isinstance(port, DdrBoard) and port.soc is drv
+    port._buf = drain = Buf()                       # as a drain leaves it
+    drv.close()
+    assert drain.freed == 1 and port._buf is None and drv._rq_readout is None
+    owned = Buf()
+    attach_readout(drv, DdrReadout(DdrBoard(soc=drv, buffer=owned), soc_map=m))
+    drv.close()
+    assert owned.freed == 0 and drv._rq_readout is None
+    drv.close()                                     # nothing cached: a no-op
+
+
 def test_pynq_driver_hostwindow_allocates_after_the_shim(fake_board, tmp_path):
     pd, events = fake_board
     board = {**pd.BOARD_DEFAULTS, "mts": None, "dac_nyquist": {"default": 2}}

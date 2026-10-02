@@ -515,3 +515,94 @@ def test_m2_the_slack_of_the_gate_fire(probe):
             hi = mid
     print(f"\n[P4 M2] k_probe's gate fire: corrupted from pad {hi}: slack {hi - 1} cycles")
     assert hi - 1 >= 16, hi
+
+
+# ── M2 and M3 on k_batched, the calibration kernel (not stoppable in P4: plan Q3). Last: it reloads core 0 ──
+
+def _batched(m, herald):
+    """A k_batched Experiment on core 0: an x90 amplitude sweep of two points of one shot each, so
+    consecutive drives differ and a late fire shows; heralded or not; DC carriers (the capture is
+    then the same in every run) and a short relax head."""
+    from riscq.cal.axes import Axis
+    from riscq.cal.experiment import Experiment
+    from riscq.cal.measure import Measure
+    from riscq.cal.sequence import Gate
+    from tests.cal_fixtures import _cfg2
+    amp = Axis.amp(0.3, 0.7, 2)
+    return Experiment(_cfg2(m, freqs=(0.0, 0.0), relax=64), [0], {0: [Gate("x90", amp=amp)]}, {0: (amp,)}, (),
+                      Measure.counts(herald=herald), 1, label=f"m2-{'herald' if herald else 'plain'}")
+
+
+def _batched_runner(drv, m, exp):
+    """Load `exp` once; `run(ops)` reruns it through a `Sched` wrapper capturing core 0's gate DAC."""
+    progs, _signs, timeout = exp.compile(drv)
+    comp, axes, rcore, npts = exp.compiled[0]
+    words = exp._pairs(axes, ())
+    par = {c: {k: v for k, v in words.items() if k in progs[c].params} for c in set(comp.cores()) | set(rcore)}
+    dac = m.channel_named("gate", 0).dac
+    n_cap = progs[0].bindings["period"] * (npts + 1) + 800          # through the second drive
+
+    def run(ops=None):
+        w = Sched(drv, m, ops=ops, captures=[(dac, n_cap)])
+        with _lockstep(drv):
+            rq.rerun(w, m, progs, params=par, results=["out"], timeout=timeout)
+        t0, cap = drv.sim.dac_capture_get(w.handles[0])
+        return w, t0, cap
+    return progs, npts, run
+
+
+def _harmless_pattern(m, progs, R, x):
+    """M3's 44-access AT pattern on a program without stop words: core 0's progress reads and its
+    publish land on __rq_magic (read, written back with its own value, read back), core 1's 13
+    publishes on an unused word of its RAM (core 1 is parked)."""
+    magic = st.word_addr(m, 0, progs[0], "__rq_magic")
+    other = m.to_host_addr(1, 0x8000_0400)
+    ops = [(R + x, "read32", magic), (None, "write32", magic, rq.MAGIC), (None, "write32", magic, rq.MAGIC),
+           (None, "read32", magic)]
+    for _ in range(13):
+        ops += [(None, "write32", other, 0), (None, "write32", other, 0), (None, "read32", other)]
+    return ops + [(None, "read32", magic)]
+
+
+@pytest.mark.batch_cap(460_000)
+def test_m2_m3_k_batched_drives_under_host_traffic(cosim):
+    """M2 and M3 on k_batched (plan P4 v2 §6), the calibration kernel P4 keeps non-stoppable (Q3):
+    how much host traffic its drive fire takes, heralded (the drive is posted when the herald read
+    returns, which by herald_offset's design is at its nominal LEAD deadline, so its post lands just
+    after that deadline) and not. M2: one host access, at most one stall cycle (M1), started every 3
+    cycles from 60 before the second drive's deadline (start - LEAD) to 100 after it; M1 found that an
+    access stalls the core only from runs of three consecutive offsets, so this hits each run. A
+    stall that corrupts the drive at some offset means the fire class has no slack there. M3: the
+    44-access AT pattern swept the same way across the heralded drive's window. A capture is corrupt
+    when it differs from the run without traffic (which a rerun reproduces bit for bit). The offsets
+    are recorded for the report; what P4 relies on is asserted: the non-heralded drive takes a stall
+    anywhere in its window.
+
+    FLOOR: two image loads and about 170 runs of ~2.5 k batches (two short-relax shots each, with
+    their DAC capture through the second drive)."""
+    drv, m = cosim
+    drv.sim.set_model({"kind": "zero"})
+    found = {}
+    for herald in (False, True):
+        progs, npts, run = _batched_runner(drv, m, _batched(m, herald))
+        w, t0, ref = run()
+        assert np.array_equal(run()[2], ref)                           # a rerun without traffic: the same
+        nz = np.nonzero(np.any(ref != 0, axis=1))[0]
+        starts = [int(nz[0])] + [int(nz[i]) for i in range(1, len(nz)) if nz[i] != nz[i - 1] + 1]
+        assert len(starts) == npts, starts                             # one drive per point
+        dl = w.cycle(t0 + starts[1] - LEAD) - w.R                      # the 2nd drive's posting deadline
+        found[("window", herald)] = (f"period {progs[0].bindings['period']}, drives at R + "
+                                     f"{[w.cycle(t0 + r) - w.R for r in starts]}, deadline R + {dl}")
+        magic = st.word_addr(m, 0, progs[0], "__rq_magic")
+        xs = range(dl - 60, dl + 102, 3)
+        found[("M2", herald)] = [x - dl for x in xs
+                                 if not np.array_equal(run(lambda R, rid, x=x: [(R + x, "read32", magic)])[2], ref)]
+        if herald:
+            found[("M3", herald)] = [x - dl for x in xs
+                                     if not np.array_equal(run(lambda R, rid, x=x: _harmless_pattern(m, progs, R, x))[2],
+                                                           ref)]
+    print("\n[P4 M2/M3 k_batched] offsets (cycles from the drive's posting deadline) where traffic corrupts the "
+          "second drive: " + "; ".join(f"{k[0]} {'heralded' if k[1] else 'plain'}: {v or 'none'}"
+                                       for k, v in found.items()))
+    assert not found[("M2", False)], found
+    assert all(isinstance(found[k], list) for k in found if k[0] != "window")

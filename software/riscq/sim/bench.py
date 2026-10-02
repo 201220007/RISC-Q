@@ -23,7 +23,7 @@ from cocotb.utils import get_sim_time
 import Pyro5.api
 import serpent
 
-from riscq.map import ADC_BATCH, BATCH_SIZE, DIO_PIPE, SocMap, SocParams
+from riscq.map import ADC_BATCH, BATCH_SIZE, DIO_PIPE, MEM_BASE, SocMap, SocParams
 from riscq.sim import models
 
 CLK_PERIOD_NS = 10        # both clk and dspClk (period equality is fine in sim)
@@ -244,36 +244,64 @@ class DacWatch:
     the stamp where the last nonzero stretch began (the start of the last pulse). qubic3 P4 adds the
     timed-DIO outputs `dios` (board port names, active while the level is nonzero, DIO_PIPE modelled
     out) and, per output, every nonzero stretch [first, last] (up to STRETCHES), so one watch can
-    follow several runs and the gaps between them."""
+    follow several runs and the gaps between them. qubic3 BT (C-D) adds the completion monitors: with
+    `marks` = {core: [CPU addresses]}, every store of that core's CPU to one of the words (the cycle it
+    is on port 0 of the core's RAM, the batch time then, the address, the data), and every change of
+    the host-domain DONE bits (what HOST_DONE reads) and of the cores' reset, each as [cycle, batch
+    time, value], so one watch orders each core's last output activity, marker write and DONE rise."""
 
     STRETCHES = 4096
 
-    def __init__(self, dac_ids, dios=()):
+    def __init__(self, dac_ids, dios=(), marks=None):
         self.dac_ids = list(dac_ids)
         self.dios = list(dios)
         self.stats = {d: {"batches": 0, "peak": 0, "first": None, "last": None, "last_rise": None,
                           "stretches": []}
                       for d in self.dac_ids + [f"dio:{n}" for n in self.dios]}
+        self.marks = {int(c): sorted({(int(a) - MEM_BASE) >> 2 for a in addrs}) for c, addrs in (marks or {}).items()}
+        self.events = {"marks": {c: [] for c in self.marks}, "done": [], "reset": []}
         self.stop = False
         self.done = False
+
+
+def _core_ram(dut, core: int):
+    """Core `core`'s unified RAM (`RiscvSoc.mem`); its port 0 carries the CPU's data stores."""
+    return getattr(getattr(dut, f"riscqArea_riscqCores_{core}_riscvSoc"), "mem")
 
 
 async def _watch_run(dut, st: "_BenchState", w: DacWatch) -> None:
     keys = w.dac_ids + [f"dio:{n}" for n in w.dios]
     prev = {d: False for d in keys}
+    pipes = {d: DIO_PIPE if isinstance(d, str) else st.m.dac_pipe(d) for d in keys}
+    ram = {c: _core_ram(dut, c) for c in w.marks}
+    words = {c: set(v) for c, v in w.marks.items()}
+    mon = [(dut.doneHostCd, w.events["done"]), (dut.riscqReset, w.events["reset"])] if w.marks else []
+    seen = [None] * len(mon)
     try:
         while not w.stop:
             await FallingEdge(dut.dspClk)
+            if w.marks:
+                now = _cycle()
+                tb = None if st.mirror.origin_cycle is None else st.mirror.time_of_cycle(now)
+                for c, p in ram.items():
+                    if _int_or_zero(p.io_port0_enable) and _int_or_zero(p.io_port0_write):
+                        a = _int_or_zero(p.io_port0_address)
+                        if a in words[c]:
+                            w.events["marks"][c].append([now, tb, MEM_BASE + 4 * a, _int_or_zero(p.io_port0_wdata)])
+                for i, (sig, ev) in enumerate(mon):
+                    v = _int_or_zero(sig)
+                    if v != seen[i]:
+                        ev.append([now, tb, v])
+                        seen[i] = v
             if st.mirror.origin_cycle is None:
                 continue
             t = st.mirror.time_of_cycle(_cycle())
             for d in keys:
                 if isinstance(d, str):
                     peak = _int_or_zero(getattr(dut, f"io_dio_{d[4:]}_out"))
-                    stamp = t - DIO_PIPE
                 else:
                     peak = int(np.abs(_read_dac(dut, d)).max())
-                    stamp = t - st.m.dac_pipe(d)
+                stamp = t - pipes[d]
                 rec = w.stats[d]
                 rec["batches"] += 1
                 if peak:
@@ -721,8 +749,9 @@ class DriverServer:
     def dac_capture_get(self, handle):
         return self._submit("dac_get", int(handle))
 
-    def dac_watch_start(self, dac_ids, dios=None):
-        return self._submit("watch_start", [int(d) for d in dac_ids], [str(n) for n in (dios or ())])
+    def dac_watch_start(self, dac_ids, dios=None, marks=None):
+        return self._submit("watch_start", [int(d) for d in dac_ids], [str(n) for n in (dios or ())],
+                            {int(c): [int(a) for a in v] for c, v in dict(marks or {}).items()})
 
     def dac_watch_stop(self, handle):
         return self._submit("watch_stop", int(handle))
@@ -910,7 +939,15 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
         for n in dios:
             if not hasattr(dut, f"io_dio_{n}_out"):
                 raise ValueError(f"no such DIO port: io_dio_{n}_out")
-        w = DacWatch(args[0], dios)
+        marks = {int(c): [int(a) for a in v] for c, v in dict(args[2] if len(args) > 2 and args[2] else {}).items()}
+        for c in marks:
+            if not 0 <= c < len(st.m.params.cores):
+                raise ValueError(f"no core {c} on {st.m.params.name}")
+            if not all(hasattr(_core_ram(dut, c), f"io_port0_{s}") for s in ("enable", "write", "address", "wdata")):
+                raise ValueError(f"core {c}: no RAM port 0 to monitor")
+        if marks and not (hasattr(dut, "doneHostCd") and hasattr(dut, "riscqReset")):
+            raise ValueError("no doneHostCd / riscqReset signal to monitor")
+        w = DacWatch(args[0], dios, marks)
         handle = st.new_capture(w)
         cocotb.start_soon(_watch_run(dut, st, w))
         return handle
@@ -921,7 +958,11 @@ async def _handle(axi: AxiMaster, dut, st: _BenchState, op: str, args: tuple):
         w.stop = True
         while not w.done:
             await ClockCycles(dut.dspClk, 1)
-        return {str(d): rec for d, rec in w.stats.items()}
+        out = {str(d): rec for d, rec in w.stats.items()}
+        if w.marks:
+            out["mon"] = {"marks": {str(c): ev for c, ev in w.events["marks"].items()}, "done": w.events["done"],
+                          "reset": w.events["reset"]}
+        return out
     if op == "dio_arm":
         name, n_batches, start_batch = args
         sig = f"io_dio_{name}_out"

@@ -105,17 +105,30 @@ class _SimExtras:
         samples = np.frombuffer(_to_bytes(data), dtype="<i2").reshape(int(n), 16).copy()
         return int(t0), samples
 
-    def dac_watch_start(self, dac_ids, dios=()) -> int:
+    def dac_watch_start(self, dac_ids, dios=(), marks=None) -> int:
         """Start watching whole DAC outputs (qubic3 P6, a test observation): every batch from now
         until `dac_watch_stop`, which returns {dac: {batches, peak, first, last, last_rise,
         stretches}} with the batch stamps of the first and last nonzero sample, of the start of the
         last pulse, and (qubic3 P4) every nonzero stretch [first, last]. `dios` adds timed-DIO board
-        ports (`<core>_<channel>`), keyed "dio:<port>", active while their level is nonzero."""
-        return int(self._proxy.dac_watch_start([int(d) for d in dac_ids], [str(n) for n in dios]))
+        ports (`<core>_<channel>`), keyed "dio:<port>", active while their level is nonzero.
+        qubic3 BT: `marks` = {core: [CPU addresses]} adds the completion monitors, returned under
+        "mon": {"marks": {core: [[cycle, batch time, address, data], ...]}, "done": [[cycle, batch
+        time, DONE bits], ...], "reset": [[cycle, batch time, core reset], ...]}: every store of the
+        core's CPU to one of those words (on its RAM's port 0), and every change of the host-domain
+        DONE bits and of the core reset."""
+        return int(self._proxy.dac_watch_start([int(d) for d in dac_ids], [str(n) for n in dios],
+                                               {str(c): [int(a) for a in v] for c, v in dict(marks or {}).items()}))
 
     def dac_watch_stop(self, handle: int) -> dict:
-        return {(d if str(d).startswith("dio:") else int(d)): dict(rec)
-                for d, rec in dict(self._proxy.dac_watch_stop(int(handle))).items()}
+        out = {}
+        for d, rec in dict(self._proxy.dac_watch_stop(int(handle))).items():
+            if d == "mon":
+                rec = dict(rec)
+                out[d] = {"marks": {int(c): [list(e) for e in ev] for c, ev in dict(rec["marks"]).items()},
+                          "done": [list(e) for e in rec["done"]], "reset": [list(e) for e in rec["reset"]]}
+            else:
+                out[d if str(d).startswith("dio:") else int(d)] = dict(rec)
+        return out
 
     def dio_capture_arm(self, name: str, n_batches: int, start_batch: int | None = None) -> int:
         """ARM a timed-DIO capture of the board port `io_dio_<name>_out` (`<core>_<channel>`), like

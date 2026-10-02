@@ -490,8 +490,9 @@ class PynqDriver:
           6. readiness within READY_TIMEOUT_S: all 8 tiles enabled, state 15, powered up; DAC2's and
              ADC2's PLLs locked; every tile's clock source as rfdc-config.tcl distributes it;
           7. the RF replay (`rf_replay`), mandatory;
-          8. the record (the drain reads, the read-backs, the step times, the readiness snapshot, the
-             replay's latencies and zones), appended to `pl_resets` and returned.
+          8. the record (the drain reads, the read-backs, the step times, `t_high` = time.monotonic() at the
+             high read-back, the readiness snapshot, the replay's latencies and zones), appended to
+             `pl_resets` and returned.
         Readiness and replay failures raise RfReplayError: the run layer POISONs, a reload recovers."""
         t0 = time.monotonic()
         why = getattr(self, "_unusable", None)
@@ -528,7 +529,7 @@ class PynqDriver:
             finally:
                 g.write(GPIO_MASK_DATA_5_MSW, RESETS_HIGH)
                 high = int(g.read(GPIO_DATA_5))
-                rec["data5_high"] = f"0x{high:08x}"
+                rec["data5_high"], rec["t_high"] = f"0x{high:08x}", time.monotonic()
         except BaseException as e:                           # noqa: BLE001 -- after the low write: fail-stop
             err = e
         if err is not None or high is None or (high >> 28) & 0xF != 0xF:

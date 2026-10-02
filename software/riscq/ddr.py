@@ -110,8 +110,9 @@ class DdrReadout:
         self.soc_map = soc_map
         self.legacy_no_ddr_status = legacy_no_ddr_status
         self._geom = None
-        # qubic3 S0: True from the BASE_RESET write of `prepare` until the run's admission is closed
-        # again (a completed `flush`, or `close_admission` after a failure)
+        # qubic3 S0: True from just before the BASE_RESET write of `prepare` until the run's admission
+        # is closed again (a completed `flush`, or `close_admission` after a failure); conservative, so
+        # an uncertain write counts as issued
         self._base_reset_issued = False
 
     # -- geometry, read from the ui_clk side only after readiness is established ----------
@@ -299,8 +300,10 @@ class DdrReadout:
         self._wr(WR_BASE, wr_base)
         if self._rd(WR_BASE) != wr_base:
             raise DdrUplinkError("wr_base rejected by hardware: %s" % status_str(self._status()))
-        self._wr(BASE_RESET, 1)
+        # qubic3 S0 r1: set before the write, so a write that lands and then raises (an interrupted
+        # MMIO, a remote hop that fails after the store) still counts as issued for close_admission
         self._base_reset_issued = True
+        self._wr(BASE_RESET, 1)
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
             s = self._status()

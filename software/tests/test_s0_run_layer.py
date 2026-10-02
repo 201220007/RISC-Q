@@ -414,6 +414,26 @@ def test_prepare_timeout_zero_raises_after_base_reset_and_the_cleanup_flushes():
     assert f.pl_resets == 1 and list(out[0]["__uplink"]) == _iq(WORDS[0])
 
 
+def test_a_base_reset_that_lands_and_then_raises_counts_as_issued():
+    """After-stage r1 #3: the issuance flag is set before the BASE_RESET write, so a write that
+    completes and then raises (an interrupted MMIO store) still has its admission closed."""
+    f, m, progs, exp = _antq()
+    real, ctrl = f.write32, f.up.base + R.BASE_RESET
+
+    def write32(addr, value):
+        real(addr, value)
+        if addr == ctrl:
+            raise RuntimeError("the MMIO store raised after it landed")
+    f.write32 = write32
+    with pytest.raises(RuntimeError, match="after it landed"):
+        rq.rerun(f, m, progs, uplink=up(exp))
+    rec = S.session(f).last_failure
+    assert rec.kind == "PREPARE" and rec.cleanup[-1] == "admission: flushed (not drained)"
+    assert not f.up.run_active and f.up.base_resets == 1
+    f.write32 = real
+    assert list(rq.rerun(f, m, progs, uplink=up(exp))[0]["__uplink"]) == _iq(WORDS[0])
+
+
 def test_a_failing_cleanup_poisons_until_recover():
     f, m, progs, exp = _antq()
     f.up.script |= {"start_dropped", "start_dropped_twice"}

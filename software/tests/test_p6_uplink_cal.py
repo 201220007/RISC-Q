@@ -2,10 +2,12 @@
 
 U1 the backend table across both results paths, and the refusals before any setup; U2 the UPLINK
 mode's C, the completion epilogue, and `tend` maximised over swept readout knobs; U3 the decode
-through `parse_words` at the extremes and in order; U4 the readout cals on sim-2q-antq with 28-bit
-IQ (their own tests and assertions, through the Responder's uplink path), each fitted quantity's
-shift from the 32-bit run reported; U5 the preflight arithmetic; U6 the S0 failure paths under an
-Experiment, each raising with no data and followed by an Experiment that certifies."""
+through `parse_words` at the extremes and in order, and the run layer's half step (no flooring bias);
+U4 the readout cals on sim-2q-antq with 28-bit IQ (their own tests and assertions, through the
+Responder's uplink path), each fitted quantity's shift from the 32-bit run reported, `classifier3`
+compared numerically, and Punchout's low-signal case kept as the expected limit; U5 the preflight
+arithmetic; U6 the S0 failure paths under an Experiment, each raising with no data and followed by
+an Experiment that certifies."""
 
 import math
 from pathlib import Path
@@ -312,16 +314,16 @@ def _report(name, hw, antq, raw):
 def _u4_cases():
     from tests import test_cals_readout as t
     return [(t.test_readout_calibration_finds_the_chain_angle, 1), (t.test_readout_fidelity_is_the_planted_gaussian_error, 1),
-            (t.test_separation_argmax_is_the_dispersive_centre, 1), (t.test_punchout_rows_track_the_drive_amp, 251)]
+            (t.test_separation_argmax_is_the_dispersive_centre, 1), (t.test_punchout_rows_track_the_drive_amp, 1)]
 
 
 @pytest.mark.parametrize("test,scale", _u4_cases(),
                          ids=lambda x: x.__name__.replace("test_", "") if callable(x) else f"x{x}")
 def test_readout_cals_pass_their_own_assertions_with_28_bit_iq(test, scale, monkeypatch, capsys):
     """Each test runs twice: on sim-2q (32-bit IQ, the HostWindow path) and on sim-2q-antq (the
-    uplink path, 28-bit IQ). Both must pass the test's own assertions; the fitted quantities' shifts
-    are reported (P6 v2 Q1). Punchout runs at decoder-like scale (x251: its planted rows are 10^2 to
-    10^3 counts; see the next test)."""
+    uplink path, 28-bit IQ). Both must pass the test's own assertions, at their own tolerances; the
+    fitted quantities' shifts are reported (P6 v2 Q1). Punchout plants decoder-scale rows (its
+    PUNCHOUT_GAIN); the next test keeps the low-signal case as the expected limit."""
     hw_r, hw = _run_existing(test, HW, monkeypatch, scale)
     antq_r, antq = _run_existing(test, ANTQ, monkeypatch, scale)
     raw = any(u is not None for r in antq_r for u in r.uplinks)
@@ -330,16 +332,19 @@ def test_readout_cals_pass_their_own_assertions_with_28_bit_iq(test, scale, monk
         _report(f"{test.__name__} x{scale}", hw, antq, raw)
 
 
-def test_punchout_at_its_planted_scale_is_below_the_uplinks_resolution(monkeypatch):
-    """A finding for P6 v2 Q1: Punchout's planted rows are (amp code) x a Lorentzian, 10^2 to 10^3
-    counts, and its assertion asks the two rows' ratio to match the amplitude codes' within 2e-3. The
-    uplink keeps real[31:4], a 16-count step, which moves the wings' ratio by more than that, so the
-    test passes on the HostWindow path and fails on the uplink at that scale; at x251 (the previous
-    test) it passes on both."""
-    from tests.test_cals_readout import test_punchout_rows_track_the_drive_amp as t
-    _run_existing(t, HW, monkeypatch)
-    with pytest.raises(AssertionError):
-        _run_existing(t, ANTQ, monkeypatch)
+@pytest.mark.expected_limit
+def test_punchout_at_10e3_counts_is_below_the_uplinks_resolution(monkeypatch):
+    """The precision limit of the 28-bit uplink (P6 v2 Q1): Punchout's rows planted at 1 count per
+    drive-amplitude code (|IQ| 6.4·10^2 to 4.0·10^3, the test's scale before r1) against its
+    unchanged tolerance, the two rows' ratio equal to the amplitude codes' within 2e-3. The uplink
+    keeps real[31:4], a 16-count step (an error up to 8 counts with the half step), which moves the
+    wings' ratio by more than that: the HostWindow path passes, the uplink fails. Readout integrals
+    are 10^5 and up (the previous test)."""
+    from tests import test_cals_readout as t
+    monkeypatch.setattr(t, "PUNCHOUT_GAIN", 1.0)
+    _run_existing(t.test_punchout_rows_track_the_drive_amp, HW, monkeypatch)
+    with pytest.raises(AssertionError, match="allclose"):
+        _run_existing(t.test_punchout_rows_track_the_drive_amp, ANTQ, monkeypatch)
 
 
 SCALE = 1 << 12          # decoder-like integrals: the classifier fixtures' unit-scale means x 4096
@@ -352,10 +357,19 @@ def _clf_scaled(seed=3):
     return ClassifierN([SCALE * (_MEANS[k] + 0.1 * rng.standard_normal((30, 2))) for k in range(3)])
 
 
+NOISE = 450.0            # counts: the readout-noise figure of the after-stage review (r1 #10)
+
+
+def _noise(shape, seed):
+    """Off the uplink's 16-count grid: rounded Gaussian readout noise."""
+    return np.round(NOISE * np.random.default_rng(seed).standard_normal(shape))
+
+
 def test_three_level_fidelity_and_leakage_with_28_bit_iq(monkeypatch, capsys):
     """The 3-level confusion and Leakage tests plant centroids at unit scale (10 counts), which the
     uplink's 16-count resolution cannot carry; at decoder-like scale (x4096, the classifier trained
-    there too) both give the planted answer on both builds."""
+    there too), with NOISE counts of readout noise so the IQ is off the 16-count grid, both give the
+    planted answer on both builds."""
     from riscq.cal import ReadoutFidelity
     from riscq.cal.cals.single import Leakage
     from tests.cal_fixtures import _MEANS, _levels_iq
@@ -369,7 +383,8 @@ def test_three_level_fidelity_and_leakage_with_28_bit_iq(monkeypatch, capsys):
             for q, prog in progs.items():
                 level = 2 if "ReadoutFidelity3_ef" in prog.c_source else int(params[q]["r0"])
                 n = int(prog.bindings["shots"])
-                out[q] = {"out": np.tile(SCALE * _MEANS[level], (n, 1)).reshape(-1).astype(np.int64)}
+                iq = np.tile(SCALE * _MEANS[level], (n, 1)) + _noise((n, 2), level)
+                out[q] = {"out": iq.reshape(-1).astype(np.int64)}
             return out
         cfg = _cfg(M_HW, x90_amp=0.495)
         cfg["qubit/0/EF/freq"] = 45e6
@@ -383,8 +398,8 @@ def test_three_level_fidelity_and_leakage_with_28_bit_iq(monkeypatch, capsys):
         def _(progs, params):
             p = 0.05 + 2.0 * (phases[state["runs"] % len(phases)] - star) ** 2
             state["runs"] += 1
-            return {q: {"out": (SCALE * _levels_iq(p, int(prog.bindings["shots"]))).astype(np.int64)}
-                    for q, prog in progs.items()}
+            return {q: {"out": (SCALE * _levels_iq(p, n) + _noise(2 * n, state["runs"])).astype(np.int64)}
+                    for q, prog in progs.items() for n in [int(prog.bindings["shots"])]}
         from tests.test_cal_drag import _leakage_cfg
         lk = Leakage(_leakage_cfg(), 0, _clf_scaled(), "qubit/{q}/x90/vz", [[p, p] for p in phases],
                      n_gates=8, shots=8).run(r2.drv)
@@ -394,6 +409,43 @@ def test_three_level_fidelity_and_leakage_with_28_bit_iq(monkeypatch, capsys):
     with capsys.disabled():
         (f32, y32), (f28, y28) = results["sim-2q.json"], results["sim-2q-antq.json"]
         print(f"\n[U4] 3-level fidelity {f32} -> {f28}; Leakage P(2) max shift {np.max(np.abs(y28 - y32)):.3g}")
+
+
+def test_classifier3_agrees_numerically_with_28_bit_iq(monkeypatch, capsys):
+    """P6 v2 U4's `classifier3` comparison: the |0>/|1>/|2> reference clouds at decoder-like scale
+    (the fixtures' centroids x4096) with NOISE counts of readout noise, trained on sim-2q (32-bit IQ)
+    and through the uplink on sim-2q-antq (28-bit). The centroids differ by at most the half step's
+    bound (8 counts per component), the minimum pairwise SNR by under 1e-3 relative, and both
+    classify every reference shot and a held-out set the same way."""
+    from riscq.cal import classifier3
+    from tests.cal_fixtures import _MEANS
+    shots = 64
+    clouds = [SCALE * _MEANS[k] + _noise((shots, 2), 20 + k) for k in range(3)]
+    held = np.concatenate([SCALE * _MEANS[k] + _noise((200, 2), 30 + k) for k in range(3)])
+    got = {}
+    for config in (HW, ANTQ):
+        r = Responder(monkeypatch, Path(config).read_text())
+        state = {"level": 0}
+
+        @r.answer
+        def _(progs, params):
+            level = state["level"]                     # classifier3 prepares |0>, |1>, |2> in turn
+            state["level"] += 1
+            return {q: {"out": clouds[level].reshape(-1).astype(np.int64)} for q in progs}
+        cfg = _cfg(M_HW, x90_amp=0.495)
+        cfg["qubit/0/EF/freq"] = 45e6
+        cfg["qubit/0/EF/x/amp"] = 0.6
+        got[config.name] = classifier3(cfg, 0, r.drv, shots=shots)[0]
+        assert state["level"] == 3 and all(u is None for u in r.uplinks) == (config == HW)
+    c32, c28 = got["sim-2q.json"], got["sim-2q-antq.json"]
+    shift = c28.means - c32.means
+    assert np.abs(shift).max() <= 8.0
+    assert abs(c28.separation / c32.separation - 1) < 1e-3
+    assert np.array_equal(c28.confusion(), np.eye(3)) and np.array_equal(c32.confusion(), np.eye(3))
+    assert np.array_equal(c28.classify(held), c32.classify(held))
+    with capsys.disabled():
+        print(f"\n[U4] classifier3: centroid shifts {np.round(shift, 2).tolist()} counts, separation "
+              f"{c32.separation:.6g} -> {c28.separation:.6g}")
 
 
 # ── U5: the preflight ──

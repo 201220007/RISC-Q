@@ -248,6 +248,11 @@ def test_resonator_magnitude_peaks_on_the_planted_pole(responder, socmap):
         units.code_to_freq(pole, m.params), abs=units.code_to_freq(1, m.params))
 
 
+# counts of integral per drive-amplitude code: |IQ| of 6.4·10^4 to 4.0·10^5 over the two rows (codes 995
+# and 3979), a decoder integral's scale (a 40-batch demod window of the co-sim loopback gives over 2·10^4)
+PUNCHOUT_GAIN = 100.0
+
+
 def test_punchout_rows_track_the_drive_amp(responder, socmap):
     """The |0> response is planted as (drive amp) × a Lorentzian at the sweep centre: every
     amplitude row peaks at the centre, and the rows scale by the ratio of the amplitude CODES."""
@@ -261,7 +266,7 @@ def test_punchout_rows_track_the_drive_amp(responder, socmap):
             codes = _q16(prog, params[q])
             amp = int(params[q]["r0"]) >> 16
             shots = int(prog.bindings["shots"])
-            z = np.repeat(1e3 * amp / 1000.0 * _lorentzian(4 * codes, 2048, 40.0, 0.0, 1), shots)
+            z = np.repeat(PUNCHOUT_GAIN * amp * _lorentzian(4 * codes, 2048, 40.0, 0.0, 1), shots)
             out[q] = {"out": raw_iq(z)}
         return out
 

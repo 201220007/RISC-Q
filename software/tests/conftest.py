@@ -39,6 +39,11 @@ def pytest_configure(config):
         "regression net for the tier split: if a host-pure responder or an L2 analytic target "
         "drifts from what the hardware really does, these are what notice "
         "(specs/software-test-refactor/01 §5).")
+    config.addinivalue_line(
+        "markers",
+        "expected_limit: documents a known precision limit of a results path. The test asserts the "
+        "limit itself (the check fails where the limit says it must), so a change that lifts or "
+        "moves the limit shows up (qubic3 P6, the 28-bit uplink IQ).")
 
 
 def pytest_collection_modifyitems(config, items):

@@ -13,6 +13,10 @@ Run protocol (hardware plan v5 s1 / v7):
                          commit the last partial bank; done when the writer's final BVALID lands
     drain(expected)   -> validate the whole contract, then return the per-core I/Q
 
+Live read (qubic3 S1): `stream(wr_base, expected)` instead of `drain()` reads the run WHILE it runs. It follows
+the committed frontier (CUR_ADDR, which moves only after a bank's B), hands out provisional chunks, and after
+FLUSH / write_done reads the tail to FINAL_ADDR and applies every gate of `drain()`. See `DdrStream`.
+
 Word format (identical to QubiC): [63:56] tag=core  [55:28] real[31:4]  [27:0] imag[31:4]
 """
 
@@ -30,7 +34,7 @@ from .ddr_regs import (  # noqa: F401  (re-exported for callers/tests)
     STATUS_NAMES, FATAL_BITS, STICKY_MASK, DIAG_NAMES, status_str,
     S_RD_DONE, S_WRITE_DONE, S_FLUSH_BUSY, S_INJ_BUSY, S_OVF_ANY, S_RUN_ACTIVE, S_DSP_ADMIT, S_AXI_RST_FAULT,
     S_ERR_BADSIZE, S_ERR_BASE_BUSY, S_ERR_FLUSH_REFUSED, S_ERR_START_DROPPED, S_ERR_INJ_BUSY,
-    S_ERR_INJ_RANGE,
+    S_ERR_INJ_RANGE, S_EARLY_LATE, S_SKID_OVF, S_DSP_IN_RESET,
 )
 
 
@@ -411,16 +415,26 @@ class DdrReadout:
         chunks, off = [], 0
         while off < nbytes:
             n = min(nbytes - off, MAX_RD_SIZE)
-            self._wr(RD_BASE, base + off)
-            self._wr(RD_SIZE, n)
-            buf = self.drv.dma_recv_prepare(n)
-            self._wr(RD_START, 1)
-            s = self._status()
-            if s >> S_ERR_BADSIZE & 1:
-                raise DdrUplinkError("rd_start rejected (size/alignment): %s" % status_str(s))
-            chunks.append(self.drv.dma_recv_wait(buf, n))
+            chunks.append(self._dma_read(base + off, n))
             off += n
         return b"".join(chunks)
+
+    def _dma_read(self, base, n):
+        """One chunk through the drain engine and the S2MM DMA. The DMA is armed BEFORE `rd_start`, so no AXIS
+        beat can meet a halted channel, and completion is the DMA's own (TLAST), never `rd_done`."""
+        self._wr(RD_BASE, base)
+        self._wr(RD_SIZE, n)
+        buf = self.drv.dma_recv_prepare(n)
+        self._wr(RD_START, 1)
+        s = self._status()
+        if s >> S_ERR_BADSIZE & 1:
+            raise DdrUplinkError("rd_start rejected (size/alignment): %s" % status_str(s))
+        return self.drv.dma_recv_wait(buf, n)
+
+    # -- live read (qubic3 S1) -------------------------------------------------------------
+    def stream(self, wr_base, expected, max_chunk=None, clock=time.monotonic):
+        """Open a live read of the run that `prepare(wr_base, expected)` started. See `DdrStream`."""
+        return DdrStream(self, wr_base, expected, max_chunk=max_chunk, clock=clock)
 
     # -- test injector (board self-test without RF) --------------------------------------
     def inject(self, core, real, imag, timeout=0.5):
@@ -441,3 +455,254 @@ class DdrReadout:
             time.sleep(0.001)
         raise DdrUplinkError("injection did not complete within %ss: %s"
                              % (timeout, status_str(self._status())))
+
+
+# -- live read (qubic3 S1) -------------------------------------------------------------------
+@dataclass(frozen=True)
+class StreamChunk:
+    """One provisional piece of a live read: the run's words `[first, first + n)` in DDR order, little-endian u64
+    exactly as the uplink wrote them (pad lanes are never included). Provisional: only the run's certificate, which
+    exists after write_done, makes it valid; a refused run invalidates every chunk it handed out."""
+    first: int
+    data: bytes
+    t: float          # the stream's clock (time.monotonic by default) when the chunk was in PS memory
+
+    @property
+    def n(self) -> int:
+        return len(self.data) // WORD_BYTES
+
+    @property
+    def words(self) -> np.ndarray:
+        return np.frombuffer(self.data, dtype="<u8")
+
+
+class DdrStream:
+    """The live read of one run (qubic3 S1): results reach PS memory while the run is still writing them.
+
+        ro.prepare(wr_base, expected)
+        st = ro.stream(wr_base, expected)
+        ... start the program ...
+        while not st.finished:
+            chunk = st.step()            # one poll, then one chunk if anything new is committed
+            ... hand the chunk on; once the program is DONE, ro.flush() ...
+        st.certificate                   # every gate of drain() passed (else DdrUplinkError was raised)
+
+    Frontier. CUR_ADDR moves only after a bank's last B response, so `[run_base, CUR_ADDR)` is in DDR and a read
+    issued afterwards returns it. The writer parks CUR_ADDR back at run_base when the run's final bank lands, so the
+    stream keeps the largest CUR_ADDR - run_base it has seen (max-hold), and after write_done the end is FINAL_ADDR.
+    It reads only `[sent, committed)`: whole 512-B banks up to `max_chunk` before write_done, whole beats after it,
+    and never past the footprint `prepare()` admitted (the no-wrap rule).
+
+    Early warnings, each reported once in `warnings` as soon as it is seen: a live STATUS bit that will fail the
+    certificate (`ovf_any`, `skid_ovf`, `early_late` with the per-core REJECTED counts, `dsp_in_reset`, and every
+    fatal bit), a core with more words than expected, a word that carries no core's tag.
+
+    Certificate. When a poll first sees write_done, the stream applies drain()'s gates before reading the tail:
+    run_base, the fatal bits of that status and of every status seen during the run, REJECTED = 0, ACCEPTED =
+    expected, final_addr a whole number of beats with 0..3 pad lanes and not below the frontier. After the last read
+    it applies drain()'s gates after a read (no fatal bit raised meanwhile, write_done still set, run_base
+    unchanged), and the per-core tag histogram of everything read must equal ACCEPTED. A failure raises
+    DdrUplinkError. A run without `certificate` is invalid, whatever its chunks said.
+    """
+
+    # live bits that are not in FATAL_BITS but still mean the run will not certify
+    WARN_BITS = (S_DSP_IN_RESET,)
+
+    def __init__(self, ro, wr_base, expected, max_chunk=None, clock=time.monotonic):
+        ro._gate(1.0)
+        g = ro._ensure_geometry()
+        self.ro, self.wr_base, self.clock = ro, wr_base, clock
+        self.num_ch, self.bank = g["num_ch"], g["bank_bytes"]
+        stray = [c for c in expected if not 0 <= c < self.num_ch]
+        if stray:
+            raise DdrUplinkError("expected[] names cores %s, but this build has %d (0..%d)"
+                                 % (stray, self.num_ch, self.num_ch - 1))
+        self.expected = [int(expected.get(c, 0)) for c in range(self.num_ch)]
+        self.footprint = ro.max_bytes(expected)
+        if wr_base % WR_BASE_ALIGN or wr_base + self.footprint > RING_LIMIT:
+            raise ValueError("a run at 0x%x with a %d-B footprint breaks the no-wrap rule (%d-B aligned, end <= 0x%x)"
+                             % (wr_base, self.footprint, WR_BASE_ALIGN, RING_LIMIT))
+        mc = MAX_RD_SIZE if max_chunk is None else int(max_chunk)
+        if not (self.bank <= mc <= MAX_RD_SIZE and mc % self.bank == 0):
+            raise ValueError("max_chunk %d must be a multiple of the %d-B bank, at most %d" % (mc, self.bank, MAX_RD_SIZE))
+        self.max_chunk = mc
+        run_base = ro._rd(RUN_BASE)
+        if run_base != wr_base:
+            raise DdrUplinkError("run_base 0x%x != wr_base 0x%x" % (run_base, wr_base))
+        self.sent = 0               # bytes of the run already read into PS memory
+        self.committed = 0          # bytes of the run that are safe to read (max-held frontier, then final_addr)
+        self.final_bytes = None     # final_addr - run_base, known once write_done is seen
+        self.total = None           # sum(ACCEPTED) at write_done
+        self.accepted = self.rejected = None
+        self.status_end = None      # the STATUS that showed write_done
+        self.seen = 0               # OR of every STATUS read by the stream
+        self.hist = np.zeros(self.num_ch, dtype=np.int64)
+        self.stray = 0
+        self.words_out = 0
+        self.warnings = []          # {"t", "what", "detail", "sent"}, the first occurrence of each
+        self._warned = set()
+        self.certificate = None
+        self.n_polls = self.n_chunks = 0
+        self.t_open = clock()
+        s = ro._status()
+        if not (s >> S_RUN_ACTIVE & 1 or s >> S_WRITE_DONE & 1):
+            raise DdrUplinkError("no run to stream at 0x%x (neither run_active nor write_done; prepare() first): %s"
+                                 % (wr_base, status_str(s)))
+        self._observe(s)
+
+    @property
+    def ended(self) -> bool:
+        """write_done has been seen: the frontier is final_addr."""
+        return self.final_bytes is not None
+
+    @property
+    def finished(self) -> bool:
+        return self.certificate is not None
+
+    # -- the loop ----------------------------------------------------------------------------
+    def step(self):
+        """One poll and at most one chunk; returns the chunk or None. Certifies once everything is read."""
+        self.poll()
+        chunk = self.read()
+        if self.ended and self.sent >= self.final_bytes and self.certificate is None:
+            self._certify()
+        return chunk
+
+    def poll(self) -> int:
+        """Read STATUS, then CUR_ADDR (before write_done) or the run's end (once write_done is set). Returns the
+        number of bytes now safe to read."""
+        if not self.ended:
+            self.n_polls += 1
+            s = self.ro._status()
+            self._observe(s)
+            if s >> S_WRITE_DONE & 1:
+                self._end(s)
+            elif not s >> S_RUN_ACTIVE & 1:
+                raise DdrUplinkError("the run ended without write_done (a reset, or a refused or timed-out flush): %s"
+                                     % status_str(s))
+            else:
+                self._frontier(self.ro._rd(CUR_ADDR))
+        return self.committed - self.sent
+
+    def read(self):
+        """Read the next piece of [sent, committed) into PS memory, or return None if nothing is due."""
+        n = min(self.committed - self.sent, self.max_chunk)
+        if n <= 0:
+            return None
+        data = self.ro._dma_read(self.wr_base + self.sent, n)
+        t = self.clock()
+        first = self.sent // WORD_BYTES
+        nwords = n // WORD_BYTES
+        if self.total is not None:          # after write_done: the final beat's pad lanes are not data
+            nwords = max(0, min(nwords, self.total - first))
+        self.sent += n
+        chunk = StreamChunk(first, data if nwords * WORD_BYTES == len(data) else data[:nwords * WORD_BYTES], t)
+        self._account(chunk)
+        self.n_chunks += 1
+        return chunk
+
+    # -- internals ---------------------------------------------------------------------------
+    def _warn(self, what, detail):
+        if what not in self._warned:
+            self._warned.add(what)
+            self.warnings.append({"t": self.clock() - self.t_open, "what": what, "detail": detail,
+                                  "sent": self.sent})
+
+    def _observe(self, s):
+        new = s & ~self.seen
+        self.seen |= s
+        for b in FATAL_BITS + self.WARN_BITS:
+            if new >> b & 1:
+                detail = status_str(s)
+                if b == S_EARLY_LATE:
+                    detail += "; rejected per core %s" % self.ro._rejected()
+                self._warn(STATUS_NAMES[b], detail)
+
+    def _frontier(self, cur):
+        rel = cur - self.wr_base
+        if rel == 0:                        # nothing committed yet, or the end-of-run park (max-hold keeps the frontier)
+            return
+        if rel < 0 or rel % self.bank or rel < self.committed:
+            raise DdrUplinkError("CUR_ADDR 0x%x is not a bank boundary at or above the %d B already committed at run_base "
+                                 "0x%x: the pointer was reset, re-based or wrapped under the stream"
+                                 % (cur, self.committed, self.wr_base))
+        if rel > self.footprint:
+            self._warn("overproduction", "CUR_ADDR 0x%x is past the run's %d-B footprint: more results than expected"
+                       % (cur, self.footprint))
+            rel = self.footprint            # never read past the admitted footprint before write_done
+        self.committed = rel
+
+    def _account(self, chunk):
+        n = chunk.n
+        if n:
+            tags = np.frombuffer(chunk.data, dtype=np.uint8)[WORD_BYTES - 1::WORD_BYTES]   # byte 7 of each LE word
+            bc = np.bincount(tags, minlength=256)
+            self.hist += bc[:self.num_ch]
+            stray = int(bc[self.num_ch:].sum())
+            if stray:
+                self.stray += stray
+                self._warn("stray_tag", "%d words from word %d on carry no core's tag" % (stray, chunk.first))
+            over = [c for c in range(self.num_ch) if self.hist[c] > self.expected[c]]
+            if over:
+                self._warn("overproduction", "cores %s already have more words than expected" % over)
+        self.words_out += n
+
+    def _end(self, s):
+        """write_done: drain()'s gates before its read, on this status and on every status seen during the run."""
+        ro = self.ro
+        self.status_end = s
+        run_base = ro._rd(RUN_BASE)
+        if run_base != self.wr_base:
+            raise DdrUplinkError("run_base 0x%x != wr_base 0x%x" % (run_base, self.wr_base))
+        sall = s | self.seen
+        bad = [STATUS_NAMES[b] for b in FATAL_BITS if sall >> b & 1]
+        if bad:
+            raise DdrUplinkError("run invalid (%s): %s" % (", ".join(bad), status_str(sall)))
+        acc, rej = ro._accepted(), ro._rejected()
+        self.accepted, self.rejected = acc, rej
+        if any(rej):
+            raise DdrUplinkError("results were rejected per core: %s" % rej)
+        for core in range(self.num_ch):
+            if acc[core] != self.expected[core]:
+                raise DdrUplinkError("core %d: hardware accepted %d results, program expected %d"
+                                     % (core, acc[core], self.expected[core]))
+        total = sum(acc)
+        nbytes = ro._rd(FINAL_ADDR) - run_base
+        if nbytes < 0 or nbytes % BEAT_BYTES:
+            raise DdrUplinkError("final_addr-run_base = %d is not a multiple of %d bytes" % (nbytes, BEAT_BYTES))
+        pad = nbytes // WORD_BYTES - total
+        if not 0 <= pad <= 3:
+            raise DdrUplinkError("final_addr implies %d words but %d were accepted (pad %d, expected 0..3)"
+                                 % (nbytes // WORD_BYTES, total, pad))
+        if nbytes < self.committed:
+            raise DdrUplinkError("final_addr-run_base = %d is below the %d B that CUR_ADDR showed committed"
+                                 % (nbytes, self.committed))
+        self.total, self.final_bytes, self.committed = total, nbytes, nbytes
+
+    def _certify(self):
+        """After the last read: drain()'s gates after a read, then the histogram against ACCEPTED."""
+        ro = self.ro
+        s2 = ro._status()
+        self._observe(s2)
+        bad = [STATUS_NAMES[b] for b in FATAL_BITS if s2 >> b & 1]
+        if bad:
+            raise DdrUplinkError("error raised DURING the drain (%s): %s" % (", ".join(bad), status_str(s2)))
+        if not s2 >> S_WRITE_DONE & 1:
+            raise DdrUplinkError("write_done vanished during the drain (uplink was reset): %s" % status_str(s2))
+        if ro._rd(RUN_BASE) != self.wr_base:
+            raise DdrUplinkError("run_base changed during the drain (0x%x -> 0x%x)" % (self.wr_base, ro._rd(RUN_BASE)))
+        if self.stray:
+            raise DdrUplinkError("%d words carry no core's tag" % self.stray)
+        for core in range(self.num_ch):
+            if self.hist[core] != self.accepted[core]:
+                raise DdrUplinkError("core %d: %d words carry its tag but %d were accepted"
+                                     % (core, self.hist[core], self.accepted[core]))
+        if self.words_out != self.total:
+            raise DdrUplinkError("%d words were read for %d accepted" % (self.words_out, self.total))
+        self.certificate = {
+            "wr_base": self.wr_base, "total": self.total, "accepted": list(self.accepted),
+            "final_addr": self.wr_base + self.final_bytes, "pad": self.final_bytes // WORD_BYTES - self.total,
+            "status_end": self.status_end, "status_after": s2, "chunks": self.n_chunks, "polls": self.n_polls,
+            "bytes_read": self.sent, "warnings": [w["what"] for w in self.warnings],
+        }
+        return self.certificate

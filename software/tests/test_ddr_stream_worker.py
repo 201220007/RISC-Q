@@ -217,6 +217,22 @@ def test_a_chunk_that_lands_after_done_is_not_counted_early():
     assert reader.end["stats"]["bytes_before_done"] == 0 and reader.end["stats"].get("chunks_before_done") is None
 
 
+def test_once_caught_up_the_worker_polls_once_per_period():
+    """A bank every few time units and a long poll period, on the fake's clock: once the worker has read up to the
+    frontier it waits out the rest of the period, so a chunk carries about rate x poll_s bytes -- not the one or two
+    banks a spin of the loop finds, which is what made the per-chunk cost dominate at realistic rates."""
+    fake, ro, exp, words = _setup([4000] * 4, rate=16.0)               # 4 units per bank, ~1000 units in all
+    w = _worker(fake, ro, exp, poll_s=100.0, run_timeout_s=1e9, clock=lambda: float(fake.t),
+                idle=lambda s: fake.tick(max(1, round(s))))
+    w.start()
+    reader, chunks, err = _consume(w)
+    w.join(5)
+    assert err is None and reader.certificate["total"] == 16000
+    assert [int(x) for c in chunks for x in c.words] == [tag_word(*x) for x in words]
+    sizes = sorted(len(c.words) * 8 for c in chunks)
+    assert len(sizes) <= 16 and sizes[len(sizes) // 2] >= 16 * BANK, sizes
+
+
 def test_frames_round_trip():
     c = StreamChunk(5, bytes(range(16)), 1.5)
     blob = data_frame(c, 1.0) + json_frame(F_WARN, {"what": "x"}) + frame(F_END, b"{}")
@@ -277,6 +293,45 @@ def test_the_frame_queue_bounds_data_but_never_control_frames():
     assert got == [True] and q.get(1 << 20, 0.0) == b"e" * 10
     q.close()
     assert q.get(1 << 20, 1.0) == b"" and q.drained
+
+
+def test_a_lingering_get_gathers_frames_but_never_holds_back_a_backlog():
+    q = FrameQueue(1000)
+    q.put_data(b"a" * 100, 0.0)
+    t0 = time.monotonic()
+    assert q.get(1 << 20, 0.0, linger=0.1) == b"a" * 100            # nothing more came: back after the linger
+    assert 0.08 < time.monotonic() - t0 < 1.0
+    q.put_data(b"b" * 300, 0.0)
+    q.put_data(b"c" * 300, 0.0)
+    t0 = time.monotonic()
+    assert q.get(500, 0.0, linger=5.0) == b"b" * 300                 # max_bytes already waiting: no linger
+    assert q.get(300, 0.0, linger=5.0) == b"c" * 300
+    assert time.monotonic() - t0 < 0.5
+
+    def later():
+        time.sleep(0.05)
+        q.put_data(b"e" * 100, 0.0)
+        time.sleep(0.05)
+        q.put_data(b"f" * 400, 0.0)
+    q.put_data(b"d" * 100, 0.0)
+    th = threading.Thread(target=later)
+    th.start()
+    t0 = time.monotonic()
+    assert q.get(600, 0.0, linger=5.0) == b"d" * 100 + b"e" * 100 + b"f" * 400   # gathered until max_bytes
+    assert time.monotonic() - t0 < 1.0
+    th.join(2)
+
+    q = FrameQueue(250)                                               # a put waiting for room cuts it short
+    q.put_data(b"g" * 200, 0.0)
+    th = threading.Thread(target=lambda: q.put_data(b"h" * 100, 5.0))
+    th.start()
+    time.sleep(0.05)
+    t0 = time.monotonic()
+    assert q.get(1 << 20, 0.0, linger=5.0) == b"g" * 200
+    th.join(2)
+    q.close()                                                         # and so does the stream's end
+    assert q.get(1 << 20, 0.0, linger=5.0) == b"h" * 100
+    assert time.monotonic() - t0 < 1.0
 
 
 # ── KernelControl: the run-layer sequence, over a recording SoC fake ─────────────────────────────────────────

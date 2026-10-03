@@ -208,10 +208,11 @@ class BoardServer:
             raise RuntimeError(f"no streamed run {sid} (the current one is {self._stream_id or None})")
         return w
 
-    def ddr_stream_read(self, sid, max_bytes=4 << 20, timeout=1.0):
+    def ddr_stream_read(self, sid, max_bytes=4 << 20, timeout=1.0, linger=0.0):
         """The next frames of streamed run `sid` (riscq.board.ddr_stream): up to `max_bytes` of whole frames,
-        b"" if none arrived within `timeout` s. END or ERROR is the last frame."""
-        return self._stream_of(sid).frames.get(int(max_bytes), float(timeout))
+        b"" if none arrived within `timeout` s; once one is waiting, up to `linger` s more for `max_bytes` to
+        gather (FrameQueue.get). END or ERROR is the last frame."""
+        return self._stream_of(sid).frames.get(int(max_bytes), float(timeout), float(linger))
 
     def ddr_stream_abort(self, sid):
         """Stop streamed run `sid`: the worker stops the programs, flushes the run and ends with ERROR."""

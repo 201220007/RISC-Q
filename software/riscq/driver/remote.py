@@ -97,7 +97,7 @@ class RemoteDriver:
 
     def ddr_stream(self, m, progs, expected: dict, wr_base: int, params=None, arrays=None,
                    serializer: str = "marshal", read_bytes: int = 4 << 20, read_timeout: float = 1.0,
-                   **opts) -> "DdrStreamClient":
+                   linger: float = 0.01, **opts) -> "DdrStreamClient":
         """Run the programs `riscq.run.setup` loaded once, with the live readout (qubic3 S1), and return the
         iterator over its provisional chunks (`riscq.ddr.StreamChunk`, in DDR order). The run is valid only once
         the iterator ends with `certificate` set; an uncertified run raises `riscq.ddr.DdrUplinkError`.
@@ -108,7 +108,7 @@ class RemoteDriver:
                                            arrays or {}, {int(c): int(n) for c, n in expected.items()},
                                            int(wr_base), opts)
         return DdrStreamClient(self._uri, sid, serializer=serializer, read_bytes=read_bytes,
-                               read_timeout=read_timeout)
+                               read_timeout=read_timeout, linger=linger)
 
     def close(self) -> None:
         self._proxy._pyroRelease()
@@ -124,11 +124,15 @@ class DdrStreamClient:
     with a recoverable ConsumerStalled error, and stays in PL DDR for `drain()`."""
 
     def __init__(self, uri: str, sid: int, serializer: str = "marshal", read_bytes: int = 4 << 20,
-                 read_timeout: float = 1.0):
+                 read_timeout: float = 1.0, linger: float = 0.01):
+        """`linger`: once a frame waits on the board, a read gathers up to that long more (default 10 ms) unless
+        `read_bytes` are already waiting, so the host makes few large calls instead of one per chunk (the per-call
+        cost is what dominates on the board's A53 at realistic rates); it adds at most that to the host latency."""
         self._proxy = Pyro5.api.Proxy(uri)
         self._proxy._pyroSerializer = serializer
-        self._proxy._pyroTimeout = read_timeout + 60.0     # a dead board raises instead of hanging the host
+        self._proxy._pyroTimeout = read_timeout + linger + 60.0   # a dead board raises instead of hanging the host
         self.sid, self.read_bytes, self.read_timeout = int(sid), int(read_bytes), float(read_timeout)
+        self.linger = float(linger)
         self.reader = FrameReader()
 
     certificate = property(lambda self: self.reader.certificate)
@@ -137,7 +141,8 @@ class DdrStreamClient:
 
     def __iter__(self):
         while not self.reader.done:
-            blob = _to_bytes(self._proxy.ddr_stream_read(self.sid, self.read_bytes, self.read_timeout))
+            blob = _to_bytes(self._proxy.ddr_stream_read(self.sid, self.read_bytes, self.read_timeout,
+                                                         self.linger))
             yield from self.reader.feed(blob)
 
     def abort(self) -> None:

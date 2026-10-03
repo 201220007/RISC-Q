@@ -117,6 +117,30 @@ def test_a_streamed_run_reaches_the_host_live_and_certified(board, serializer):
     cl.close()
 
 
+def test_the_host_batches_its_reads(board, monkeypatch):
+    """One bank per chunk: lingering, the host pulls many frames per call instead of one call per chunk (the
+    per-call cost on the board's A53 is what `linger` amortises)."""
+    from riscq.board.ddr_stream import FrameQueue
+    calls = []
+    get = FrameQueue.get
+
+    def counted(self, max_bytes, timeout, linger=0.0):
+        out = get(self, max_bytes, timeout, linger)
+        calls.append(len(out))
+        return out
+    monkeypatch.setattr(FrameQueue, "get", counted)
+    drv, srv, m, new_run = board
+    new_run([3000, 3000], rate=0.1)
+    rq.setup(drv, m, {})
+    cl = drv.ddr_stream(m, {}, {0: 3000, 1: 3000}, BASE, read_timeout=0.2, linger=0.1, poll_s=1e-5,
+                        max_chunk=512)
+    words = [int(w) for c in cl for w in c.words]
+    assert words == [tag_word(*w) for w in schedule(2, [3000, 3000])]
+    chunks = cl.end["stats"]["chunks"]
+    assert chunks >= 90 and len(calls) <= chunks // 2, (len(calls), chunks)
+    cl.close()
+
+
 def test_a_slow_host_cannot_stall_the_board(board):
     """The host reads nothing for a while: the board keeps at most its bound queued, waits consumer_timeout_s,
     then ends the run itself (DONE, flush) with a recoverable error -- the PS never waits on the host forever."""

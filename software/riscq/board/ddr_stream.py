@@ -4,7 +4,8 @@ One `StreamWorker` runs one live-read run end to end, next to the MMIO, in its o
 
     prepare(wr_base, expected)              BASE_RESET: the run is open, its accounting cleared
     control.start()                         the program runs (KernelControl: params, then the core reset released)
-    loop:  stream.step()                    one poll of STATUS / CUR_ADDR, at most one chunk into PS memory
+    loop:  stream.step()                    one poll of STATUS / CUR_ADDR, at most one chunk into PS memory;
+                                            once caught up with the frontier, at most one poll per poll_s
            frames.put_data(chunk)           to the consumer, bounded (below)
            control.done() -> stop(), flush()     DONE ends the run: core reset back on, FLUSH, write_done
     stream.certificate                      every gate of drain() (riscq.ddr.DdrStream)
@@ -152,6 +153,7 @@ class FrameQueue:
         self.wait_total = 0.0        # time put_data spent waiting for room
         self.wait_max = 0.0
         self.blocked_puts = 0        # put_data calls that found no room at first and had to wait
+        self._put_waiting = False    # a put_data is waiting for room now (a lingering get() then returns)
 
     def put_data(self, f: bytes, timeout: float, abort: threading.Event | None = None) -> bool:
         with self._cv:
@@ -165,7 +167,10 @@ class FrameQueue:
                 if left <= 0 or (abort is not None and abort.is_set()):
                     ok = False
                     break
+                self._put_waiting = True
+                self._cv.notify_all()
                 self._cv.wait(min(left, 0.1))
+            self._put_waiting = False
             waited = time.monotonic() - t0
             self.wait_total += waited
             self.wait_max = max(self.wait_max, waited)
@@ -190,15 +195,23 @@ class FrameQueue:
         with self._cv:
             self._cv.notify_all()
 
-    def get(self, max_bytes: int, timeout: float) -> bytes:
+    def get(self, max_bytes: int, timeout: float, linger: float = 0.0) -> bytes:
         """Up to `max_bytes` of whole frames (at least one if any is waiting), or b"" if none arrives in `timeout`
-        or the stream is over."""
+        or the stream is over. With `linger`, once a frame is waiting, up to that long more for `max_bytes` of data
+        to gather -- cut short by the stream's end or a put_data waiting for room -- so that a consumer makes few
+        large reads instead of one per chunk, and a backlog is still read at full size without waiting."""
         with self._cv:
             deadline = time.monotonic() + timeout
             while not self._q and not self.closed:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     return b""
+                self._cv.wait(left)
+            t_end = time.monotonic() + linger
+            while self._data < max_bytes and not (self.closed or self._put_waiting):
+                left = t_end - time.monotonic()
+                if left <= 0:
+                    break
                 self._cv.wait(left)
             out, n = [], 0
             while self._q and (not out or n + len(self._q[0][0]) <= max_bytes):
@@ -319,6 +332,7 @@ class StreamWorker(threading.Thread):
             while not st.finished:
                 if self._abort.is_set():
                     raise StreamAborted("aborted by the consumer")
+                t_iter = clk()
                 chunk = st.step() if stalled is None else None
                 # DONE is sampled AFTER the chunk landed: a chunk counts as early only if the program was still
                 # running then (a DONE seen later says nothing about when the chunk arrived)
@@ -347,9 +361,13 @@ class StreamWorker(threading.Thread):
                                    % (self.consumer_timeout_s, self.frames.max_data, self.frames.limit, st.sent))
                 if prog_done and stalled is not None:
                     break                     # the run is complete in PL DDR; nothing more is read
-                if chunk is None and not st.finished:
-                    self.stats["idle_polls"] += 1
-                    self.idle(self.poll_s)
+                # once caught up with the frontier, one poll per poll_s (a backlog is read without waiting): a
+                # chunk then carries about rate x poll_s bytes, not one bank per spin of the loop
+                if not st.finished and (stalled is not None or st.committed <= st.sent):
+                    rest = self.poll_s - (clk() - t_iter)
+                    if rest > 0:
+                        self.stats["idle_polls"] += 1
+                        self.idle(rest)
             if stalled is not None:
                 raise ConsumerStalled(stalled)
             if self.want_results:

@@ -20,6 +20,7 @@ import serpent
 DEFAULT_BITS = "~/riscq-bits"
 DEFAULT_PORT = 9091
 CHUNK_MAX = 4 * 1024 * 1024   # spec 10 §4: <= 4 MB per store_chunk
+STREAM_DMA_BYTES = 4 << 20    # qubic3 S1: the live stream's (cacheable) S2MM buffer = its largest chunk
 
 
 def _locked(fn):
@@ -39,7 +40,10 @@ class BoardServer:
     Starts empty (driver ops fail loud) until load() — or CI passes a fake driver directly."""
 
     def __init__(self, bits_dir: str | Path = DEFAULT_BITS, driver=None,
-                 params_text: str | None = None):
+                 params_text: str | None = None, ddr_port=None, stream_control=None):
+        """`ddr_port` / `stream_control` are CI seams for the live readout (qubic3 S1): the uplink's driver
+        surface (default: a cacheable `DdrBoard` around the loaded PynqDriver) and the run control factory
+        (default: `riscq.board.ddr_stream.KernelControl`)."""
         self._lock = threading.RLock()
         self._bits = Path(bits_dir).expanduser()
         self._drv = driver
@@ -49,6 +53,10 @@ class BoardServer:
         self._m = None                # server-side SocMap, built on remote_setup
         self._progs = {}              # core -> Program, rebuilt from the wire on remote_setup
         self._upload = None           # in-flight store_begin state (one at a time)
+        self._ddr = ddr_port          # the uplink's driver surface, made on first use (S1)
+        self._stream_control = stream_control
+        self._stream = None           # the StreamWorker of the current / last streamed run
+        self._stream_id = 0
 
     def _driver(self):
         if self._drv is None:
@@ -138,6 +146,71 @@ class BoardServer:
         return {c: {n: bytes(a.astype("<i4").tobytes()) for n, a in d.items()}
                 for c, d in out.items()}
 
+    # ── the live readout (qubic3 S1): one streamed run at a time. The worker thread holds the server lock
+    # for the whole run (it owns the MMIO meanwhile); `ddr_stream_read` / `ddr_stream_abort` only touch the
+    # worker's frame queue, so they are NOT locked and the host can pull while the run is live. ──
+
+    def _ddr_port(self):
+        if self._ddr is None:
+            from riscq.board.ddr_board import DdrBoard
+            self._ddr = DdrBoard(soc=self._driver(), cma_bytes=STREAM_DMA_BYTES, cacheable=True,
+                                 wait_poll_s=50e-6)
+        return self._ddr
+
+    @_locked
+    def ddr_stream_start(self, params_json, cores, params, arrays, expected, wr_base, opts=None):
+        """Run the programs remote_setup() loaded once, with the live readout: prepare the uplink at `wr_base`,
+        start the programs, stream the results as they are committed, end the run at DONE (core reset, FLUSH)
+        and certify it. Returns the stream id for `ddr_stream_read`. `opts`: StreamWorker.OPTS."""
+        from riscq.board.ddr_stream import KernelControl, StreamWorker
+        from riscq.ddr import DdrReadout
+        from riscq.map import SocParams
+
+        theirs, mine = SocParams.from_json(params_json), SocParams.from_json(self.get_params())
+        if theirs != mine:
+            raise ValueError(f"client SocParams ({theirs.name!r}) != the loaded bundle's "
+                             f"({mine.name!r}) — wrong bundle loaded?")
+        if self._m is None:
+            raise RuntimeError("ddr_stream_start before remote_setup")
+        if not self._m.params.with_antq_uplink:
+            raise RuntimeError(f"{self._m.params.name} has results_path={self._m.params.results_path!r}: "
+                               "there is no readout uplink to stream")
+        if self._stream is not None and self._stream.is_alive():
+            raise RuntimeError("a streamed run is still in progress")
+        opts = dict(opts or {})
+        bad = sorted(set(opts) - set(StreamWorker.OPTS))
+        if bad:
+            raise ValueError(f"unknown stream options {bad} (known: {list(StreamWorker.OPTS)})")
+        missing = [int(c) for c in cores if int(c) not in self._progs]
+        if missing:
+            raise ValueError(f"cores {missing} have no program loaded (remote_setup)")
+        progs = {int(c): self._progs[int(c)] for c in cores}
+        params = {int(c): v for c, v in dict(params or {}).items()}
+        arrays = {int(c): v for c, v in dict(arrays or {}).items()}
+        make = self._stream_control or KernelControl
+        ctl = make(self._driver(), self._m, progs, params=params, arrays=arrays)
+        ro = DdrReadout(self._ddr_port(), soc_map=self._m)
+        self._stream_id += 1
+        self._stream = StreamWorker(ro, int(wr_base), {int(c): int(n) for c, n in dict(expected).items()}, ctl,
+                                    lock=self._lock, **opts)
+        self._stream.start()
+        return self._stream_id
+
+    def _stream_of(self, sid):
+        w = self._stream
+        if w is None or int(sid) != self._stream_id:
+            raise RuntimeError(f"no streamed run {sid} (the current one is {self._stream_id or None})")
+        return w
+
+    def ddr_stream_read(self, sid, max_bytes=4 << 20, timeout=1.0):
+        """The next frames of streamed run `sid` (riscq.board.ddr_stream): up to `max_bytes` of whole frames,
+        b"" if none arrived within `timeout` s. END or ERROR is the last frame."""
+        return self._stream_of(sid).frames.get(int(max_bytes), float(timeout))
+
+    def ddr_stream_abort(self, sid):
+        """Stop streamed run `sid`: the worker stops the programs, flushes the run and ends with ERROR."""
+        self._stream_of(sid).abort()
+
     # ── board ops: thin delegates (spec 10 §3.3) ──
 
     @_locked
@@ -218,6 +291,11 @@ class BoardServer:
         board = json.loads(board_file.read_text()) if board_file.exists() else None
 
         from riscq.board.pynq_driver import PynqDriver   # lazy: only importable on the board
+        if self._stream is not None and self._stream.is_alive():
+            raise RuntimeError("a streamed run is in progress; abort it before loading another bundle")
+        if self._ddr is not None:                         # S1: the stream's DMA buffer goes first
+            self._ddr.close()
+            self._ddr = None
         # free the previous driver's CMA result buffer BEFORE allocating the next one: it is
         # 16 MB per core (224 MB on the 14q build), so waiting for the GC to reclaim it would make
         # a reload fail the CMA pre-check for no reason (specs/software/22 §3).

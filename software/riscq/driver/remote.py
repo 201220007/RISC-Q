@@ -12,6 +12,7 @@ from pathlib import Path
 
 import Pyro5.api
 
+from riscq.board.ddr_stream import FrameReader
 from riscq.driver.cosim import _RemoteExtras, _to_bytes
 
 CHUNK = 4 * 1024 * 1024   # bundle-upload chunk size (spec 10 §4: <= 4 MB, one in flight)
@@ -59,6 +60,7 @@ class RemoteDriver:
 
     def __init__(self, host: str, port: int = 9091):
         uri = host if host.startswith("PYRO:") else f"PYRO:riscq.board@{host}:{port}"
+        self._uri = uri
         self._proxy = Pyro5.api.Proxy(uri)
         self.remote = _RemoteExtras(self._proxy)
         self.board = _BoardExtras(self._proxy)
@@ -92,6 +94,55 @@ class RemoteDriver:
         if self._host_base is None:
             self._host_base = int(self._proxy.get_host_base())
         return self._host_base
+
+    def ddr_stream(self, m, progs, expected: dict, wr_base: int, params=None, arrays=None,
+                   serializer: str = "marshal", read_bytes: int = 4 << 20, read_timeout: float = 1.0,
+                   **opts) -> "DdrStreamClient":
+        """Run the programs `riscq.run.setup` loaded once, with the live readout (qubic3 S1), and return the
+        iterator over its provisional chunks (`riscq.ddr.StreamChunk`, in DDR order). The run is valid only once
+        the iterator ends with `certificate` set; an uncertified run raises `riscq.ddr.DdrUplinkError`.
+        `opts` go to the board's StreamWorker (buffer_bytes, max_chunk, poll_s, consumer_timeout_s, ...)."""
+        from riscq import run as rq
+        rq._check_results_path(m, progs)
+        sid = self._proxy.ddr_stream_start(rq._params_json(m), [int(c) for c in progs], params or {},
+                                           arrays or {}, {int(c): int(n) for c, n in expected.items()},
+                                           int(wr_base), opts)
+        return DdrStreamClient(self._uri, sid, serializer=serializer, read_bytes=read_bytes,
+                               read_timeout=read_timeout)
+
+    def close(self) -> None:
+        self._proxy._pyroRelease()
+
+
+class DdrStreamClient:
+    """The host end of a streamed run (qubic3 S1): size-prefixed frames pulled over this client's OWN Pyro5
+    connection, so the pulls never queue behind other calls. marshal by default: bytes cross as bytes, where
+    serpent would base64 them (three times slower on loopback, more on the board's A53). Every frame passes
+    `riscq.board.ddr_stream.FrameReader`'s checks (contiguous DATA; at END the per-core count of what arrived
+    equals the certificate). The board waits for this client at most its `consumer_timeout_s` with at most its
+    `buffer_bytes` of data queued, so a slow host cannot stall the PS drain beyond that bound: the run then ends
+    with a recoverable ConsumerStalled error, and stays in PL DDR for `drain()`."""
+
+    def __init__(self, uri: str, sid: int, serializer: str = "marshal", read_bytes: int = 4 << 20,
+                 read_timeout: float = 1.0):
+        self._proxy = Pyro5.api.Proxy(uri)
+        self._proxy._pyroSerializer = serializer
+        self._proxy._pyroTimeout = read_timeout + 60.0     # a dead board raises instead of hanging the host
+        self.sid, self.read_bytes, self.read_timeout = int(sid), int(read_bytes), float(read_timeout)
+        self.reader = FrameReader()
+
+    certificate = property(lambda self: self.reader.certificate)
+    warnings = property(lambda self: self.reader.warnings)
+    end = property(lambda self: self.reader.end)
+
+    def __iter__(self):
+        while not self.reader.done:
+            blob = _to_bytes(self._proxy.ddr_stream_read(self.sid, self.read_bytes, self.read_timeout))
+            yield from self.reader.feed(blob)
+
+    def abort(self) -> None:
+        """Ask the board to stop the run (call between iterations: a Pyro5 proxy is not shared across threads)."""
+        self._proxy.ddr_stream_abort(self.sid)
 
     def close(self) -> None:
         self._proxy._pyroRelease()

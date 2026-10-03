@@ -371,3 +371,73 @@ def test_end_to_end_against_the_real_driver(fake_pynq):
     assert d.ddr_status() == (True, True)
     assert d.num_ch == 2
     assert d.bank_bytes == (1 << 4) * 32
+
+
+# ── qubic3 S1: the live stream's cacheable buffer ─────────────────────────────────────────────────────────────
+class FakeCacheBuffer:
+    """pynq 3.0's PynqBuffer as far as the cache maintenance goes: `flush`/`invalidate` sync the bytes the
+    (possibly sliced) array covers, from its offset. A slice records into its parent's log."""
+
+    def __init__(self, n, cacheable, parent=None, offset=0):
+        self.nbytes, self.cacheable, self.offset = n, cacheable, offset
+        self.device_address = 0x7000_0000 + offset
+        self._root = parent or self
+        if parent is None:
+            self._d = bytearray(n)
+            self.syncs = []
+            self.freed = 0
+
+    def __getitem__(self, s):
+        start, stop, _ = s.indices(self.nbytes)
+        return FakeCacheBuffer(stop - start, self.cacheable, parent=self._root, offset=self.offset + start)
+
+    def __bytes__(self):
+        return bytes(self._root._d[self.offset:self.offset + self.nbytes])
+
+    def flush(self):
+        self._root.syncs.append(("flush", self.offset, self.nbytes))
+
+    def invalidate(self):
+        self._root.syncs.append(("invalidate", self.offset, self.nbytes))
+
+    def freebuffer(self):
+        self._root.freed += 1
+
+
+@pytest.fixture
+def cache_pynq(fake_pynq, monkeypatch):
+    made = []
+
+    def allocate(shape, dtype, cacheable=False):
+        made.append(FakeCacheBuffer(shape[0], cacheable))
+        return made[-1]
+    sys.modules["pynq"].allocate = allocate
+    return fake_pynq, made
+
+
+def _complete(fake, b):
+    dma = fake[DdrMap().dma_base]
+    dma.regs[b.S2MM_DMASR] = dma.IDLE           # the transfer landed
+
+
+def test_a_cacheable_buffer_is_cleaned_once_and_each_transfer_range_invalidated(cache_pynq):
+    """HP0 is not coherent: the allocator's dirty lines are written back once, at allocation (the CPU never writes
+    the buffer afterwards), and each transfer's range is invalidated before it is read -- only that range."""
+    fake, made = cache_pynq
+    b = _board(cacheable=True, cma_bytes=4096)
+    for n in (512, 1536, 96):
+        buf = b.dma_recv_prepare(n)
+        _complete(fake, b)
+        b.dma_recv_wait(buf, n)
+    assert len(made) == 1 and made[0].cacheable, "one cacheable buffer, reused"
+    assert made[0].syncs == [("flush", 0, 4096), ("invalidate", 0, 512), ("invalidate", 0, 1536),
+                             ("invalidate", 0, 96)]
+
+
+def test_the_default_buffer_is_unchanged_non_cacheable(cache_pynq):
+    fake, made = cache_pynq
+    b = _board(cma_bytes=4096)
+    buf = b.dma_recv_prepare(512)
+    _complete(fake, b)
+    b.dma_recv_wait(buf, 512)
+    assert not made[0].cacheable and made[0].syncs == [("invalidate", 0, 4096)]

@@ -37,10 +37,17 @@ class DdrBoard:
     PynqDriver's convention). Pass `None` to use this object only for the uplink windows.
     """
 
-    def __init__(self, soc=None, m: DdrMap | None = None, cma_bytes: int = 8 << 20):
+    def __init__(self, soc=None, m: DdrMap | None = None, cma_bytes: int = 8 << 20, cacheable: bool = False,
+                 wait_poll_s: float = 0.001):
+        """`cacheable` (qubic3 S1, the live read): allocate the drain buffer cacheable, so the copy out of it runs at
+        memory speed instead of uncached-read speed; the cache maintenance that makes this correct is in `_cma` and
+        `dma_recv_wait`. `wait_poll_s` is the sleep between completion polls (1 ms, as before, by default; the live
+        stream uses less, because it adds directly to the result-to-PS latency of every chunk)."""
         self.soc = soc
         self.map = m or DdrMap()
         self._cma_bytes = cma_bytes
+        self._cacheable = bool(cacheable)
+        self._wait_poll_s = float(wait_poll_s)
         self._buf = None
         self._active = None      # (buffer, nbytes) while a transfer is in flight, else None
         self._mmio = {}
@@ -126,8 +133,17 @@ class DdrBoard:
             if self._buf is not None:
                 self._buf.freebuffer()
             n = max(nbytes, self._cma_bytes)
-            log.info("allocating %d B of CMA for the readout drain", n)
-            self._buf = pynq.allocate(shape=(n,), dtype="u1")
+            if self._cacheable:
+                log.info("allocating %d B of cacheable CMA for the readout drain", n)
+                self._buf = pynq.allocate(shape=(n,), dtype="u1", cacheable=True)
+                # HP0 is not cache-coherent. The CPU never writes this buffer, so once this clean has written back
+                # whatever the allocator left in dirty lines (its zero fill), no line of it can be dirty, and no
+                # eviction can overwrite DMA data. Lines the CPU prefetches or reads stay clean; `dma_recv_wait`
+                # invalidates the range each transfer wrote before reading it.
+                self._buf.flush()
+            else:
+                log.info("allocating %d B of CMA for the readout drain", n)
+                self._buf = pynq.allocate(shape=(n,), dtype="u1")
         return self._buf
 
     def _dma_win(self):
@@ -257,7 +273,7 @@ class DdrBoard:
                         "the uplink never streamed (check rd_start and STATUS) or fewer bytes arrived "
                         "than programmed -- the DMA waits for the full length."
                         % (timeout, sr, nbytes))
-                time.sleep(0.001)
+                time.sleep(self._wait_poll_s)
         except Exception:
             try:
                 self.dma_reset()
@@ -265,7 +281,12 @@ class DdrBoard:
                 log.exception("the S2MM reset after a failed drain also failed")
             raise
         self._active = None
-        buf.invalidate()                           # the PL wrote it; drop stale cache lines
+        if self._cacheable:
+            # only the range the PL just wrote: pynq 3.0's slice keeps its offset, so this syncs nbytes, not the
+            # whole buffer (FROM_DEVICE: stale and prefetched lines dropped before the copy below)
+            buf[:nbytes].invalidate()
+        else:
+            buf.invalidate()                       # the PL wrote it; drop stale cache lines
         return bytes(buf[:nbytes])
 
     def close(self):

@@ -269,6 +269,29 @@ def test_a_failed_arm_resets_the_channel(fake_pynq):
         "the arm failure must have reset the channel"
 
 
+def test_a_reset_is_confirmed_only_with_the_channel_halted(fake_pynq):
+    """S1: dma_reset() returns only once the reset bit self-cleared AND the channel reads Halted. A reset that leaves
+    the channel running is not confirmed: it raises, and the transfer it was meant to end is not forgotten, so the
+    channel cannot be re-armed as if it were quiescent (a drain port is never called idle on it)."""
+    from riscq.ddr import DdrMap
+    b = _board()
+    dma = b._win(DdrMap().dma_base, DdrMap().dma_size)
+    b.dma_reset()                                        # the model halts the channel: confirmed
+    b.dma_recv_prepare(32)
+    orig = dma.write
+
+    def write(off, val):
+        orig(off, val)
+        if off == 0x30 and val & FakeMMIO.RESET:
+            dma.regs[0x34] = FakeMMIO.IDLE               # the bit cleared, the channel did not halt
+    dma.write = write
+    with pytest.raises(RuntimeError, match="not Halted after its soft reset"):
+        b.dma_reset()
+    assert b._active is not None
+    with pytest.raises(RuntimeError, match="already in flight"):
+        b.dma_recv_prepare(32)
+
+
 def test_the_buffer_is_reused_and_grown_not_reallocated_per_drain(fake_pynq):
     b = _board(cma_bytes=1024)
     first = b.dma_recv_prepare(64)

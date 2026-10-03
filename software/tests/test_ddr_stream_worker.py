@@ -187,6 +187,30 @@ def test_a_chunk_that_cannot_reach_tlast_leaves_the_port_unusable():
         ro.prepare(BASE + 0x10000, exp)
 
 
+@pytest.mark.parametrize("reset_ok", [True, False], ids=["reset_confirmed", "reset_fails"])
+def test_a_chunk_past_tlast_whose_s2mm_fails_is_idle_only_with_a_confirmed_reset(reset_ok):
+    """A chunk reaches TLAST -- the uplink's read lock is over, nothing is owed to drain -- but its S2MM then reports
+    an error. The uplink alone reads idle. The port is idle, and the complete run recoverable, only once the S2MM's
+    soft reset is confirmed; if the reset does not complete, the port is UNUSABLE and nothing is recoverable."""
+    fake, ro, exp, words = _setup([100, 100, 100, 100], rate=200)     # every word produced at once: a complete run
+    fake.dma_err_after_tlast_at = {2}
+    fake.dma_reset_fails = not reset_ok
+    w = _worker(fake, ro, exp, max_chunk=BANK)
+    w.start()
+    w.join(5)
+    reader, _, err = _consume(w)
+    assert err is not None and "S2MM_DMASR error" in str(err)
+    assert not fake.rd_locked and ro.drain_idle() is None, "TLAST ended the lock: the uplink alone reads idle"
+    assert fake.drains == 0, "no lock was left, so nothing was drained"
+    if reset_ok:
+        assert reader.end["port"] == "idle" and w.port_unusable is None
+        assert reader.end["recoverable"] is True and reader.end["retained"] is None
+        ro.prepare(BASE + 0x10000, exp)
+    else:
+        assert "UNUSABLE" in reader.end["port"] and "S2MM soft reset was not confirmed" in w.port_unusable
+        assert reader.end["recoverable"] is False and "drain port is unusable" in reader.end["retained"]
+
+
 def test_a_stalled_run_that_fails_its_gates_is_retained_not_recoverable():
     """A stalled consumer leaves the run in PL DDR; it is advertised recoverable only if the certificate's
     prerequisite gates pass. A rejected result fails them: 'data retained in PL DDR; certification pending'."""

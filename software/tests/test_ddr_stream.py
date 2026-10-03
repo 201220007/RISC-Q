@@ -306,8 +306,24 @@ def test_a_dma_failure_propagates_and_the_lock_waits_for_tlast():
     with pytest.raises(DdrUplinkError, match="base_reset refused"):
         ro.prepare(BASE + 0x8000, exp)
     assert ro.release_drain(n) is None and ro.drain_idle() is None
+    assert fake.drains == 1 and fake.dma_resets == 1, "one reset, then one drain of the chunk the lock still held"
     st.close()
     ro.prepare(BASE + 0x8000, exp)
+
+
+def test_release_drain_needs_a_confirmed_s2mm_and_drains_only_a_held_lock():
+    """release_drain() returns None only with the S2MM confirmed: its soft reset completed and, where the uplink
+    still held the chunk's read lock, the rest of the chunk completed at TLAST. A lock that TLAST already ended is
+    owed no drain. A reset that does not complete is reported although the uplink reads idle -- that alone is not
+    enough to call the port free."""
+    fake, ro, exp, _ = _setup([100, 100, 100, 100])
+    _run(fake, ro, exp)
+    assert ro.drain_idle() is None
+    assert ro.release_drain(BANK) is None and fake.dma_resets == 1 and fake.drains == 0
+    fake.dma_reset_fails = True
+    why = ro.release_drain(BANK)
+    assert why is not None and "S2MM soft reset was not confirmed" in why
+    assert ro.drain_idle() is None and fake.drains == 0, "the uplink is idle: only the S2MM is in doubt"
 
 
 def test_an_error_seen_only_by_the_dma_check_refuses():

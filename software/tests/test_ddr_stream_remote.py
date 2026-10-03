@@ -184,18 +184,23 @@ def test_a_slow_then_silent_host_blocks_several_enqueues_then_stalls(board):
     cl.close()
 
 
-def test_an_unusable_port_refuses_the_next_stream(board):
-    """A chunk that could not reach TLAST leaves the read lock set: the worker reads the port unusable and the
-    server refuses every further stream until a reload (the established recovery)."""
+@pytest.mark.parametrize("cause", ["no_tlast", "s2mm_reset_fails"])
+def test_an_unusable_port_refuses_the_next_stream(board, cause):
+    """A chunk that could not reach TLAST leaves the read lock set; a chunk past TLAST whose S2MM failed and could not
+    be reset leaves the S2MM unconfirmed while the uplink reads idle. Either way the worker reads the port unusable
+    and the server refuses every further stream until a reload (the established recovery)."""
     drv, srv, m, new_run = board
     fake = new_run([300, 300], rate=0.5)
-    orig = fake.dma_recv_wait
+    if cause == "no_tlast":
+        orig = fake.dma_recv_wait
 
-    def wait(buf, n):
-        if fake.transfers == 1:
-            fake.uplink_stuck = True
-        return orig(buf, n)
-    fake.dma_recv_wait = wait
+        def wait(buf, n):
+            if fake.transfers == 1:
+                fake.uplink_stuck = True
+            return orig(buf, n)
+        fake.dma_recv_wait = wait
+    else:
+        fake.dma_err_after_tlast_at, fake.dma_reset_fails = {2}, True
     rq.setup(drv, m, {})
     cl = drv.ddr_stream(m, {}, {0: 300, 1: 300}, BASE, read_timeout=0.2, poll_s=1e-5, max_chunk=512)
     with pytest.raises(DdrUplinkError, match="UNUSABLE"):

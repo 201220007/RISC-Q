@@ -13,7 +13,8 @@ is read, so this model advances one time unit per register access (and a few per
     an accepted RD_START until the chunk's DMA completed, and a RD_START with no S2MM armed loses the stream
     (the DMA wait then times out). Every RD_START is logged with the frontier it was issued against.
 
-`events` injects faults at a time: `fake.at(t, fn)`.
+`events` injects faults at a time: `fake.at(t, fn)`. S2MM faults: `dma_stall_at` (no TLAST: the lock stays),
+`dma_err_after_tlast_at` (TLAST, then an S2MM error), `dma_reset_fails`, `uplink_stuck`.
 """
 
 from __future__ import annotations
@@ -83,9 +84,13 @@ class LiveFakeUplink:
         self.events = []              # (t, fn)
         self.flush_requests = 0
         self.dma_stall_at = set()     # transfer numbers (1-based) whose S2MM stalls: no TLAST, the read lock stays
+        self.dma_err_after_tlast_at = set()   # transfers whose S2MM takes the chunk up to TLAST (the lock ends), then
+                                              # reports an error instead of completing
+        self.dma_reset_fails = False  # the S2MM's soft reset never completes
         self.uplink_stuck = False     # the drain engine itself is stuck: no chunk reaches TLAST any more
         self.transfers = 0
         self.dma_resets = 0
+        self.drains = 0               # dma_drain_to_tlast calls
         self.max_transfer = None      # a fixed DMA buffer (DdrBoard(grow=False)): the largest transfer, or None
         self.on_read = None           # fn(fake, off), called before a register read is answered
         self.on_write = None          # fn(fake, off, val), called before a register write takes effect
@@ -269,15 +274,23 @@ class LiveFakeUplink:
         self.tick(1 + nbytes // 32 * self.dma_units_per_beat)
         data = bytes(self.mem[self.rd_base:self.rd_base + nbytes])
         self.rd_locked = False
+        if self.transfers in self.dma_err_after_tlast_at:
+            # the whole chunk reached TLAST, so the uplink's lock is over; the S2MM itself failed (e.g. SlvErr writing
+            # PS memory) -- nothing here says whether its channel is quiescent
+            raise RuntimeError("S2MM_DMASR error during the drain: 0x00000020 (fake: transfer %d, after TLAST)"
+                               % self.transfers)
         return data
 
     def dma_reset(self):
         self.dma_resets += 1
+        if self.dma_reset_fails:
+            raise RuntimeError("the S2MM soft reset did not clear within 1 s (fake)")
         self.armed = None
 
     def dma_drain_to_tlast(self, nbytes, timeout=1.0):
         """Arm for the rest of an interrupted chunk and take it up to TLAST: that ends the read lock. Fails if the
         drain engine is stuck, or if there is no chunk to finish (the real S2MM would wait for data in vain)."""
+        self.drains += 1
         self.tick(2)
         if self.uplink_stuck or not self.rd_locked:
             raise RuntimeError("the S2MM DMA did not complete within %ss (fake: no TLAST)" % timeout)

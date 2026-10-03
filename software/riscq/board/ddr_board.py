@@ -164,7 +164,9 @@ class DdrBoard:
     def dma_reset(self):
         """Soft-reset the S2MM channel and leave it halted. Used before arming and after any failure --
         r27-#6: an errored or timed-out channel is otherwise left active/faulted, and the next drain
-        would inherit it."""
+        would inherit it. Returns only once the reset is confirmed -- the reset bit self-cleared and the
+        channel reads Halted -- and raises otherwise (S1: a drain port is never called idle on an
+        unconfirmed S2MM, see riscq.ddr.DdrReadout.release_drain)."""
         import time
         dma = self._dma_win()
         dma.write(self.S2MM_DMACR, self.DMACR_RESET)
@@ -174,6 +176,9 @@ class DdrBoard:
                 raise RuntimeError("the S2MM soft reset did not clear within 1 s "
                                    "(DMACR=0x%08x)" % dma.read(self.S2MM_DMACR))
             time.sleep(0.001)
+        sr = dma.read(self.S2MM_DMASR)
+        if not sr & self.DMASR_HALTED:
+            raise RuntimeError("the S2MM channel is not Halted after its soft reset (DMASR=0x%08x)" % sr)
         self._active = None
 
     def dma_recv_prepare(self, nbytes):

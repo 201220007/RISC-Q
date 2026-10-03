@@ -414,12 +414,16 @@ class StreamWorker(threading.Thread):
 
     def _leave_idle(self, prepared, started, prog_done, st):
         """Leave the hardware as rerun() leaves it, whatever happened -- core reset asserted, the run flushed -- and
-        never claim the drain port free without having read it so. A chunk whose DMA failed keeps the read lock
-        until its AXIS TLAST (CONTRACT.md I7), and FLUSH does not clear it: release_drain() lets the rest of that
-        chunk drain into a re-armed S2MM up to TLAST, then drain_idle() reads STATUS and DIAG.run_idle, which is
-        what the next BASE_RESET needs. If the lock is still held, the port is reported unusable until the
-        established recovery (a PL reset, whose DSP-reset hold drains any owed R burst and resets the uplink's DDR
-        half; or the image reload of a board session's restore)."""
+        never claim the drain port free without having read it so. The port is free only if BOTH halves are:
+        - the S2MM: after a chunk whose DMA failed, release_drain() soft-resets the channel and, if the uplink still
+          holds the chunk's read lock (it lasts until the chunk's AXIS TLAST, CONTRACT.md I7, and FLUSH does not clear
+          it), lets the rest of the chunk drain into a re-armed S2MM up to TLAST. Its reset, and that completion
+          where one was owed, must be confirmed;
+        - the uplink: drain_idle() reads STATUS and DIAG.run_idle, which is what the next BASE_RESET needs.
+        A TLAST can end the uplink's lock while the S2MM's completion or reset fails: the uplink alone then reads
+        idle, and that is not enough. Otherwise the port is reported unusable until the established recovery (a PL
+        reset, whose DSP-reset hold drains any owed R burst and resets the uplink's DDR half; or the image reload of
+        a board session's restore, which resets the DMA as well)."""
         notes = []
         if started and not prog_done:
             try:
@@ -433,10 +437,12 @@ class StreamWorker(threading.Thread):
                     self.ro.flush(self.flush_timeout_s)
             except Exception as e:            # noqa: BLE001
                 notes.append("flush failed: %r" % e)
+        s2mm = None                           # why the S2MM is not confirmed quiescent, or None
         if st is not None and st.inflight is not None:
-            why = self.ro.release_drain(st.inflight[1])
+            s2mm = self.ro.release_drain(st.inflight[1])
             notes.append("interrupted chunk at 0x%x (%d B): %s"
-                         % (st.inflight[0], st.inflight[1], why or "drained to TLAST, data discarded"))
+                         % (st.inflight[0], st.inflight[1], s2mm or "S2MM reset confirmed, and drained to TLAST if the "
+                            "read lock still held it; data discarded"))
         try:                                  # read, never assumed; behind the readiness gate (no ui_clk access
             ready = self.ro.ddr_status()      # on an uncalibrated MIG)
             if ready is not None and not all(ready):
@@ -445,6 +451,9 @@ class StreamWorker(threading.Thread):
                 self.port_unusable = self.ro.drain_idle()
         except Exception as e:                # noqa: BLE001
             self.port_unusable = "the port state could not be read: %r" % e
+        if s2mm is not None:                  # an idle uplink does not make up for an unconfirmed S2MM
+            self.port_unusable = "the S2MM is not confirmed quiescent: %s%s" % (
+                s2mm, "" if self.port_unusable is None else "; " + self.port_unusable)
         self.port_state = "idle" if self.port_unusable is None else \
             "UNUSABLE until the established recovery (PL reset or image reload): %s" % self.port_unusable
         return notes

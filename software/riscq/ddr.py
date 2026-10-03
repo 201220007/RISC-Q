@@ -454,23 +454,52 @@ class DdrReadout:
         return DdrStream(self, wr_base, expected, max_chunk=max_chunk, clock=clock)
 
     def release_drain(self, nbytes, timeout=1.0):
-        """After a chunk failed (an S2MM timeout or error), end its drain lock the documented way: the lock lasts
-        from an accepted RD_START to that chunk's AXIS TLAST handshake (CONTRACT.md I7), and FLUSH does not clear
-        it. So arm the S2MM once more for the chunk's size and let whatever is left of the chunk drain into it,
-        up to TLAST (a short packet: the beats already taken are not sent again); the data are discarded. Returns
-        None, or why the TLAST could not be reached. Whether the port is then free is `drain_idle()`'s answer."""
+        """After a chunk failed (an S2MM timeout or error), bring the drain port to a state that is read, never
+        assumed. First the S2MM channel is soft-reset: a failed or refused transfer may have left it armed, halted or
+        errored. Then, if the uplink still holds the chunk's read lock -- it lasts from an accepted RD_START to that
+        chunk's AXIS TLAST handshake (CONTRACT.md I7), and FLUSH does not clear it -- the S2MM is armed once more for
+        the chunk's size and whatever is left of the chunk drains into it up to TLAST (a short packet: the beats
+        already taken are not sent again); the data are discarded. A lock that TLAST has already ended needs nothing
+        more than the reset.
+
+        Returns None only if the S2MM is confirmed quiescent: its reset completed and, where the lock still held a
+        chunk, that transfer completed at TLAST. Otherwise why not: an S2MM whose reset or completion is unconfirmed
+        may still write into the buffer or take the next chunk's beats, so the port is then unusable, whatever the
+        uplink reads. Whether the uplink is free is `drain_idle()`'s answer; the port is idle only if both are."""
         reset = getattr(self.drv, "dma_reset", None)
+        if reset is None:
+            return "the driver cannot reset its S2MM channel, so the channel's state after the failure is unknown"
         try:
-            if reset is not None:
-                reset()                                    # a refused RD_START may have left the S2MM armed
+            reset()
+        except Exception as e:                             # noqa: BLE001 -- reported, never raised from here
+            return "the S2MM soft reset was not confirmed: %s: %s" % (type(e).__name__, e)
+        try:
+            ready = self.ddr_status()                      # no ui_clk access on an uncalibrated MIG
+            if ready is not None and not all(ready):
+                return ("the DDR side is not ready (calib_done, ui_reset_released) = %s: the read lock cannot be read"
+                        % (ready,))
+            if not self._lock_held():
+                return None                                # TLAST already ended the lock: the reset was all it owed
+        except Exception as e:                             # noqa: BLE001
+            return "the read lock could not be read after the S2MM reset: %s: %s" % (type(e).__name__, e)
+        try:
             sink = getattr(self.drv, "dma_drain_to_tlast", None)
             if sink is not None:
                 sink(nbytes, timeout)
             else:
                 self.drv.dma_recv_wait(self.drv.dma_recv_prepare(nbytes), nbytes)
-        except Exception as e:                             # noqa: BLE001 -- reported, never raised from here
-            return "the interrupted chunk did not reach TLAST: %s: %s" % (type(e).__name__, e)
+        except Exception as e:                             # noqa: BLE001
+            return "the interrupted chunk did not complete at TLAST in a re-armed S2MM: %s: %s" % (type(e).__name__, e)
         return None
+
+    def _lock_held(self):
+        """Whether a drain chunk may still hold the read lock: True unless the run is over and the uplink shows no lock
+        (rd_busy clear, DIAG.run_idle set). While a run is active or flushing, run_idle includes the run, so the lock
+        cannot be told apart from it and is taken as held."""
+        s = self._status()
+        if s >> S_RUN_ACTIVE & 1 or s >> S_FLUSH_BUSY & 1:
+            return True
+        return bool(s >> S_RD_BUSY & 1) or not self._rd(DIAG) >> DIAG_RUN_IDLE & 1
 
     def drain_idle(self):
         """None if the port is free: no read lock (`rd_busy` clear and, the run being over, DIAG.run_idle, which is

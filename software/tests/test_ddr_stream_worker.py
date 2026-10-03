@@ -70,6 +70,7 @@ def test_the_worker_streams_a_run_and_ends_with_its_certificate():
     assert st["bytes"] == 1080 * 8 and st["chunks"] == len(chunks)
     assert ctl.started == 1 and ctl.stopped == 1 and fake.flush_requests == 1
     assert not fake.run_active and fake.sticky >> R.S_WRITE_DONE & 1
+    assert st["port"] == "idle" and st["t_first_read"] is not None and st["chunks_before_done"] >= 1
     assert fake.past_frontier() == [] and all(r[4] for r in fake.reads)
 
 
@@ -85,8 +86,8 @@ def test_a_slow_consumer_is_bounded_and_the_run_stays_recoverable():
     assert not w.is_alive() and time.monotonic() - t0 < 5
     assert w.frames.max_data <= 3 * BANK + 2 * 24, "more data waited than the stated bound"
     reader, chunks, err = _consume(w)
-    assert err is not None and "ConsumerStalled" in str(err) and "drain() can still certify it" in str(err)
-    assert reader.end["recoverable"] is True
+    assert err is not None and "ConsumerStalled" in str(err) and "drain() can certify" in str(err)
+    assert reader.end["recoverable"] is True and reader.end["retained"] is None and reader.end["port"] == "idle"
     assert ctl.stopped == 1 and not fake.run_active and fake.sticky >> R.S_WRITE_DONE & 1
     out = ro.drain(BASE, exp)                               # the post-run path recovers the whole run
     assert sum(len(v[0]) for v in out.values()) == 800
@@ -146,24 +147,74 @@ def test_a_program_that_never_finishes_is_bounded():
     assert ctl.stopped == 1 and not fake.run_active
 
 
-def test_a_dma_failure_ends_the_stream_and_resets_the_channel():
+def test_a_dma_timeout_with_data_outstanding_is_drained_to_tlast_and_the_port_read_idle():
+    """The second chunk's S2MM stalls: the transfer times out with the rest of the chunk still in the uplink, whose
+    read lock lasts until that chunk's TLAST (CONTRACT.md I7) and survives FLUSH. Nothing clears it by hand: the
+    worker drains the rest of the chunk into a re-armed S2MM, then READS the port idle (DIAG.run_idle), and the
+    next prepare() is accepted."""
     fake, ro, exp, words = _setup([100, 100, 100, 100], rate=0.5)
-    resets = []
-    fake.dma_reset = lambda: resets.append(1)
-    orig = fake.dma_recv_wait
-
-    def boom(buf, nbytes):
-        if len(fake.reads) == 2:
-            fake.armed, fake.rd_locked = None, False
-            raise RuntimeError("the S2MM DMA did not complete within 5.0s")
-        return orig(buf, nbytes)
-    fake.dma_recv_wait = boom
+    fake.dma_stall_at = {2}
     w = _worker(fake, ro, exp, max_chunk=BANK)
     w.start()
     w.join(5)
-    _, _, err = _consume(w)
+    reader, _, err = _consume(w)
     assert err is not None and "did not complete" in str(err)
-    assert resets == [1] and not fake.run_active
+    assert any("drained to TLAST" in n for n in reader.end["notes"]), reader.end["notes"]
+    assert reader.end["port"] == "idle" and w.port_unusable is None
+    assert not fake.rd_locked and not fake.run_active and fake.dma_resets >= 1
+    ro.prepare(BASE + 0x10000, exp)                         # BASE_RESET accepted: the port really is free
+
+
+def test_a_chunk_that_cannot_reach_tlast_leaves_the_port_unusable():
+    """If the interrupted chunk cannot be drained to TLAST (the drain engine itself is stuck), the read lock stays:
+    the worker reports the port UNUSABLE pending the established recovery, never idle, and BASE_RESET is refused."""
+    fake, ro, exp, words = _setup([100, 100, 100, 100], rate=0.5)
+    orig = fake.dma_recv_wait
+
+    def wait(buf, n):
+        if fake.transfers == 1:                # the second chunk: the drain engine stops for good
+            fake.uplink_stuck = True
+        return orig(buf, n)
+    fake.dma_recv_wait = wait
+    w = _worker(fake, ro, exp, max_chunk=BANK)
+    w.start()
+    w.join(5)
+    reader, _, err = _consume(w)
+    assert err is not None and "UNUSABLE" in reader.end["port"] and "read lock" in w.port_unusable
+    assert reader.end["recoverable"] is False and "drain port is unusable" in reader.end["retained"]
+    assert fake.rd_locked
+    with pytest.raises(DdrUplinkError, match="base_reset refused"):
+        ro.prepare(BASE + 0x10000, exp)
+
+
+def test_a_stalled_run_that_fails_its_gates_is_retained_not_recoverable():
+    """A stalled consumer leaves the run in PL DDR; it is advertised recoverable only if the certificate's
+    prerequisite gates pass. A rejected result fails them: 'data retained in PL DDR; certification pending'."""
+    fake, ro, exp, words = _setup([200, 200, 200, 200], rate=0.5)
+
+    def cb(f, off, val):
+        if off == R.FLUSH:
+            f.rejected[3] = 2
+    fake.on_write = cb
+    w = _worker(fake, ro, exp, max_chunk=BANK, buffer_bytes=2 * BANK, consumer_timeout_s=0.1)
+    w.start()
+    w.join(10)
+    reader, _, err = _consume(w)
+    assert err is not None and "ConsumerStalled" in str(err)
+    assert reader.end["recoverable"] is False
+    assert reader.end["retained"].startswith("data retained in PL DDR; certification pending: results were rejected")
+    assert "certification pending" in str(err) and reader.end["port"] == "idle"
+
+
+def test_a_chunk_that_lands_after_done_is_not_counted_early():
+    """DONE is sampled after each chunk lands; a program that is already DONE then contributes nothing early."""
+    fake, ro, exp, words = _setup([100, 100, 100, 100], rate=200)     # the program ends within a few accesses
+    w = _worker(fake, ro, exp, max_chunk=BANK)
+    w.start()
+    reader, chunks, err = _consume(w)
+    w.join(5)
+    assert err is None and reader.certificate["total"] == 400
+    assert reader.end["stats"]["bytes_before_done"] == 0 and reader.end["stats"].get("chunks_before_done") is None
 
 
 def test_frames_round_trip():
@@ -202,8 +253,12 @@ def test_the_reader_checks_contiguity_and_the_certificate():
     with pytest.raises(DdrUplinkError, match="after the stream's last frame"):
         r.feed(_data(1, [tag_word(0, 1, 2)]))
     r = FrameReader()
-    with pytest.raises(DdrUplinkError, match="not certified \\(ConsumerStalled\\).*drain\\(\\) can still"):
-        r.feed(json_frame(F_ERROR, {"type": "ConsumerStalled", "error": "x", "recoverable": True}))
+    with pytest.raises(DdrUplinkError, match="not certified \\(ConsumerStalled\\).*drain\\(\\) can certify"):
+        r.feed(json_frame(F_ERROR, {"type": "ConsumerStalled", "error": "x", "recoverable": True, "port": "idle"}))
+    r = FrameReader()
+    with pytest.raises(DdrUplinkError, match="data retained in PL DDR; certification pending: why"):
+        r.feed(json_frame(F_ERROR, {"type": "ConsumerStalled", "error": "x", "recoverable": False,
+                                    "retained": "data retained in PL DDR; certification pending: why"}))
 
 
 def test_the_frame_queue_bounds_data_but_never_control_frames():

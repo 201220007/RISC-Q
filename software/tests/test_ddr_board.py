@@ -441,3 +441,33 @@ def test_the_default_buffer_is_unchanged_non_cacheable(cache_pynq):
     _complete(fake, b)
     b.dma_recv_wait(buf, 512)
     assert not made[0].cacheable and made[0].syncs == [("invalidate", 0, 4096)]
+
+
+def test_a_fixed_buffer_reports_its_capacity_and_never_grows(cache_pynq):
+    """grow=False: the buffer allocated once (by a board session's owner, before its fork) is never reallocated; a
+    longer transfer is refused, and max_transfer tells DdrReadout to cut its reads to the buffer."""
+    fake, made = cache_pynq
+    b = _board(cacheable=True, cma_bytes=4096, grow=False)
+    assert b.max_transfer == 4096 and _board().max_transfer is None
+    buf = b.dma_recv_prepare(4096)
+    _complete(fake, b)
+    b.dma_recv_wait(buf, 4096)
+    with pytest.raises(ValueError, match="does not fit the fixed 4096-B DMA buffer"):
+        b.dma_recv_prepare(4128)
+    assert len(made) == 1
+
+
+def test_drain_to_tlast_arms_the_channel_and_waits_for_completion(cache_pynq):
+    """The rest of an interrupted chunk drains into a re-armed S2MM up to TLAST (completion = IDLE, a short packet
+    included); the arming order is the normal one."""
+    import threading
+    import time
+    fake, made = cache_pynq
+    b = _board(cacheable=True, cma_bytes=4096)
+    dma = b._dma_win()
+    t = threading.Thread(target=lambda: (time.sleep(0.05), dma.regs.__setitem__(b.S2MM_DMASR, dma.IDLE)))
+    t.start()
+    b.dma_drain_to_tlast(1024, timeout=2.0)
+    t.join()
+    offs = [e[1] for e in dma.log if e[0] == "w"]
+    assert offs[-4:] == [b.S2MM_DMACR, b.S2MM_DA, b.S2MM_DA_MSB, b.S2MM_LENGTH] and b._active is None

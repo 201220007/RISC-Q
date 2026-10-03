@@ -34,8 +34,10 @@ from .ddr_regs import (  # noqa: F401  (re-exported for callers/tests)
     STATUS_NAMES, FATAL_BITS, STICKY_MASK, DIAG_NAMES, status_str,
     S_RD_DONE, S_WRITE_DONE, S_FLUSH_BUSY, S_INJ_BUSY, S_OVF_ANY, S_RUN_ACTIVE, S_DSP_ADMIT, S_AXI_RST_FAULT,
     S_ERR_BADSIZE, S_ERR_BASE_BUSY, S_ERR_FLUSH_REFUSED, S_ERR_START_DROPPED, S_ERR_INJ_BUSY,
-    S_ERR_INJ_RANGE, S_EARLY_LATE, S_SKID_OVF, S_DSP_IN_RESET,
+    S_ERR_INJ_RANGE, S_EARLY_LATE, S_SKID_OVF, S_DSP_IN_RESET, S_RD_BUSY,
 )
+
+DIAG_RUN_IDLE = 7               # DIAG bit: the uplink is quiescent, the condition BASE_RESET needs (I7)
 
 
 class DdrUplinkError(RuntimeError):
@@ -109,6 +111,8 @@ class DdrReadout:
         self.soc_map = soc_map
         self.legacy_no_ddr_status = legacy_no_ddr_status
         self._geom = None
+        # S1: the live stream that wants every STATUS sample (DdrStream._observe), or None
+        self._status_observer = None
 
     # -- geometry, read from the ui_clk side only after readiness is established ----------
     def _ensure_geometry(self, timeout=1.0, deadline=None):
@@ -152,7 +156,10 @@ class DdrReadout:
         self.drv.write32(self.map.ctrl_base + off, val & 0xFFFF_FFFF)
 
     def _status(self):
-        return self._rd(STATUS)
+        s = self._rd(STATUS)
+        if self._status_observer is not None:    # S1: a live stream sees every sample (its DMA's, FLUSH's too)
+            self._status_observer(s)
+        return s
 
     def rd(self, off, timeout=1.0):
         self._gate(timeout)
@@ -414,10 +421,20 @@ class DdrReadout:
                              % (RD_BASE_ALIGN, base, nbytes))
         chunks, off = [], 0
         while off < nbytes:
-            n = min(nbytes - off, MAX_RD_SIZE)
+            n = min(nbytes - off, self.max_transfer())
             chunks.append(self._dma_read(base + off, n))
             off += n
         return b"".join(chunks)
+
+    def max_transfer(self):
+        """The largest single read: MAX_RD_SIZE (the DMA's 26-bit length), or less if the driver's DMA buffer is
+        fixed and smaller (`DdrBoard(grow=False)`: a buffer allocated before a fork must never be reallocated)."""
+        cap = getattr(self.drv, "max_transfer", None)
+        n = MAX_RD_SIZE if cap is None else min(MAX_RD_SIZE, int(cap))
+        n -= n % BEAT_BYTES
+        if n < BEAT_BYTES:
+            raise ValueError("the driver's DMA buffer holds %s B, less than one beat" % cap)
+        return n
 
     def _dma_read(self, base, n):
         """One chunk through the drain engine and the S2MM DMA. The DMA is armed BEFORE `rd_start`, so no AXIS
@@ -435,6 +452,38 @@ class DdrReadout:
     def stream(self, wr_base, expected, max_chunk=None, clock=time.monotonic):
         """Open a live read of the run that `prepare(wr_base, expected)` started. See `DdrStream`."""
         return DdrStream(self, wr_base, expected, max_chunk=max_chunk, clock=clock)
+
+    def release_drain(self, nbytes, timeout=1.0):
+        """After a chunk failed (an S2MM timeout or error), end its drain lock the documented way: the lock lasts
+        from an accepted RD_START to that chunk's AXIS TLAST handshake (CONTRACT.md I7), and FLUSH does not clear
+        it. So arm the S2MM once more for the chunk's size and let whatever is left of the chunk drain into it,
+        up to TLAST (a short packet: the beats already taken are not sent again); the data are discarded. Returns
+        None, or why the TLAST could not be reached. Whether the port is then free is `drain_idle()`'s answer."""
+        reset = getattr(self.drv, "dma_reset", None)
+        try:
+            if reset is not None:
+                reset()                                    # a refused RD_START may have left the S2MM armed
+            sink = getattr(self.drv, "dma_drain_to_tlast", None)
+            if sink is not None:
+                sink(nbytes, timeout)
+            else:
+                self.drv.dma_recv_wait(self.drv.dma_recv_prepare(nbytes), nbytes)
+        except Exception as e:                             # noqa: BLE001 -- reported, never raised from here
+            return "the interrupted chunk did not reach TLAST: %s: %s" % (type(e).__name__, e)
+        return None
+
+    def drain_idle(self):
+        """None if the port is free: no read lock (`rd_busy` clear and, the run being over, DIAG.run_idle, which is
+        what BASE_RESET requires) and no `axi_rst_fault`. Otherwise why not. While a run is active or flushing the
+        lock cannot be told apart from the run (run_idle includes them): that is reported as not idle."""
+        s = self._status()
+        if s >> S_RUN_ACTIVE & 1 or s >> S_FLUSH_BUSY & 1:
+            return "a run is still active or flushing: %s" % status_str(s)
+        if s >> S_AXI_RST_FAULT & 1:
+            return "axi_rst_fault: a DDR-domain reset is required: %s" % status_str(s)
+        if s >> S_RD_BUSY & 1 or not self._rd(DIAG) >> DIAG_RUN_IDLE & 1:
+            return "a drain chunk still holds the read lock (no TLAST yet): %s %s" % (status_str(s), self._diag())
+        return None
 
     # -- test injector (board self-test without RF) --------------------------------------
     def inject(self, core, real, imag, timeout=0.5):
@@ -522,9 +571,11 @@ class DdrStream:
         if wr_base % WR_BASE_ALIGN or wr_base + self.footprint > RING_LIMIT:
             raise ValueError("a run at 0x%x with a %d-B footprint breaks the no-wrap rule (%d-B aligned, end <= 0x%x)"
                              % (wr_base, self.footprint, WR_BASE_ALIGN, RING_LIMIT))
-        mc = MAX_RD_SIZE if max_chunk is None else int(max_chunk)
-        if not (self.bank <= mc <= MAX_RD_SIZE and mc % self.bank == 0):
-            raise ValueError("max_chunk %d must be a multiple of the %d-B bank, at most %d" % (mc, self.bank, MAX_RD_SIZE))
+        cap = ro.max_transfer()
+        mc = cap - cap % self.bank if max_chunk is None else int(max_chunk)
+        if not (self.bank <= mc <= cap and mc % self.bank == 0):
+            raise ValueError("max_chunk %d must be a multiple of the %d-B bank, at most %d (the DMA buffer)"
+                             % (mc, self.bank, cap))
         self.max_chunk = mc
         run_base = ro._rd(RUN_BASE)
         if run_base != wr_base:
@@ -543,12 +594,15 @@ class DdrStream:
         self._warned = set()
         self.certificate = None
         self.n_polls = self.n_chunks = 0
+        self.inflight = None        # (base, nbytes) of the chunk whose DMA is under way, until it lands
+        self.t_first_read = None    # just before the first chunk's DMA was armed
         self.t_open = clock()
+        ro._status_observer = self._observe     # every STATUS sample from here on: polls, DMA checks, FLUSH
         s = ro._status()
         if not (s >> S_RUN_ACTIVE & 1 or s >> S_WRITE_DONE & 1):
+            self.close()
             raise DdrUplinkError("no run to stream at 0x%x (neither run_active nor write_done; prepare() first): %s"
                                  % (wr_base, status_str(s)))
-        self._observe(s)
 
     @property
     def ended(self) -> bool:
@@ -558,6 +612,11 @@ class DdrStream:
     @property
     def finished(self) -> bool:
         return self.certificate is not None
+
+    def close(self):
+        """Stop receiving the readout's STATUS samples (done by the certificate; the worker calls it on every exit)."""
+        if self.ro._status_observer == self._observe:
+            self.ro._status_observer = None
 
     # -- the loop ----------------------------------------------------------------------------
     def step(self):
@@ -573,8 +632,7 @@ class DdrStream:
         number of bytes now safe to read."""
         if not self.ended:
             self.n_polls += 1
-            s = self.ro._status()
-            self._observe(s)
+            s = self.ro._status()                # seen by _observe
             if s >> S_WRITE_DONE & 1:
                 self._end(s)
             elif not s >> S_RUN_ACTIVE & 1:
@@ -589,7 +647,11 @@ class DdrStream:
         n = min(self.committed - self.sent, self.max_chunk)
         if n <= 0:
             return None
+        if self.t_first_read is None:
+            self.t_first_read = self.clock()
+        self.inflight = (self.wr_base + self.sent, n)
         data = self.ro._dma_read(self.wr_base + self.sent, n)
+        self.inflight = None
         t = self.clock()
         first = self.sent // WORD_BYTES
         nwords = n // WORD_BYTES
@@ -649,8 +711,26 @@ class DdrStream:
 
     def _end(self, s):
         """write_done: drain()'s gates before its read, on this status and on every status seen during the run."""
-        ro = self.ro
         self.status_end = s
+        self.total, self.final_bytes, self.accepted, self.rejected = self._gates(s)
+        self.committed = self.final_bytes
+
+    def certifiable(self):
+        """None if the run as it is now passes every gate the certificate applies before its read -- write_done,
+        run_base, no fatal bit in the current STATUS or in any sample this stream has seen, REJECTED = 0, ACCEPTED =
+        expected, final_addr in whole beats with 0..3 pad lanes and not below the frontier -- so that drain() can
+        still certify the data kept in PL DDR. Otherwise the first failure. Changes nothing."""
+        try:
+            s = self.ro._status()
+            if not s >> S_WRITE_DONE & 1:
+                return "write_done not set: %s" % status_str(s)
+            self._gates(s)
+        except DdrUplinkError as e:
+            return str(e)
+        return None
+
+    def _gates(self, s):
+        ro = self.ro
         run_base = ro._rd(RUN_BASE)
         if run_base != self.wr_base:
             raise DdrUplinkError("run_base 0x%x != wr_base 0x%x" % (run_base, self.wr_base))
@@ -659,7 +739,6 @@ class DdrStream:
         if bad:
             raise DdrUplinkError("run invalid (%s): %s" % (", ".join(bad), status_str(sall)))
         acc, rej = ro._accepted(), ro._rejected()
-        self.accepted, self.rejected = acc, rej
         if any(rej):
             raise DdrUplinkError("results were rejected per core: %s" % rej)
         for core in range(self.num_ch):
@@ -677,16 +756,17 @@ class DdrStream:
         if nbytes < self.committed:
             raise DdrUplinkError("final_addr-run_base = %d is below the %d B that CUR_ADDR showed committed"
                                  % (nbytes, self.committed))
-        self.total, self.final_bytes, self.committed = total, nbytes, nbytes
+        return total, nbytes, acc, rej
 
     def _certify(self):
         """After the last read: drain()'s gates after a read, then the histogram against ACCEPTED."""
         ro = self.ro
-        s2 = ro._status()
-        self._observe(s2)
-        bad = [STATUS_NAMES[b] for b in FATAL_BITS if s2 >> b & 1]
+        s2 = ro._status()                        # seen by _observe
+        # every STATUS sample of the stream since write_done -- the tail's DMA checks, this one -- not only the last
+        bad = [STATUS_NAMES[b] for b in FATAL_BITS if self.seen >> b & 1]
         if bad:
-            raise DdrUplinkError("error raised DURING the drain (%s): %s" % (", ".join(bad), status_str(s2)))
+            raise DdrUplinkError("error raised DURING the drain (%s): %s; seen in the stream's samples: %s"
+                                 % (", ".join(bad), status_str(s2), status_str(self.seen)))
         if not s2 >> S_WRITE_DONE & 1:
             raise DdrUplinkError("write_done vanished during the drain (uplink was reset): %s" % status_str(s2))
         if ro._rd(RUN_BASE) != self.wr_base:
@@ -699,6 +779,7 @@ class DdrStream:
                                      % (core, self.hist[core], self.accepted[core]))
         if self.words_out != self.total:
             raise DdrUplinkError("%d words were read for %d accepted" % (self.words_out, self.total))
+        self.close()
         self.certificate = {
             "wr_base": self.wr_base, "total": self.total, "accepted": list(self.accepted),
             "final_addr": self.wr_base + self.final_bytes, "pad": self.final_bytes // WORD_BYTES - self.total,

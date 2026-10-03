@@ -82,6 +82,11 @@ class LiveFakeUplink:
         self.reads = []               # (t, base, size, written_at_start, armed_ok)
         self.events = []              # (t, fn)
         self.flush_requests = 0
+        self.dma_stall_at = set()     # transfer numbers (1-based) whose S2MM stalls: no TLAST, the read lock stays
+        self.uplink_stuck = False     # the drain engine itself is stuck: no chunk reaches TLAST any more
+        self.transfers = 0
+        self.dma_resets = 0
+        self.max_transfer = None      # a fixed DMA buffer (DdrBoard(grow=False)): the largest transfer, or None
         self.on_read = None           # fn(fake, off), called before a register read is answered
         self.on_write = None          # fn(fake, off, val), called before a register write takes effect
         self.corrupt = {}             # word index -> tag written instead of the real one (DDR corruption)
@@ -184,6 +189,10 @@ class LiveFakeUplink:
             return self.accepted[(off - R.ACCEPTED) // 4]
         if R.REJECTED <= off < R.REJECTED + 4 * 32:
             return self.rejected[(off - R.REJECTED) // 4]
+        if off == R.DIAG:                          # [0] writer_idle, [1] cbuf_rd_empty, [7] run_idle, [9] calib
+            writer_idle = not self.banks_due
+            run_idle = not self.run_active and self.flush_at is None and not self.rd_locked and writer_idle
+            return int(writer_idle) | 1 << 1 | int(run_idle) << 7 | 1 << 9
         return self.regs.get(off, 0)
 
     def write32(self, addr, val):
@@ -247,14 +256,32 @@ class LiveFakeUplink:
     def dma_recv_wait(self, buf, nbytes):
         if buf != ("buf", self.armed) or nbytes != self.armed:
             raise RuntimeError("dma_recv_wait(%d) does not match the armed transfer" % nbytes)
+        if self.max_transfer is not None and nbytes > self.max_transfer:
+            raise ValueError("a %d-B transfer does not fit the fixed %d-B DMA buffer" % (nbytes, self.max_transfer))
         self.armed = None
+        self.transfers += 1
+        if self.transfers in self.dma_stall_at or self.uplink_stuck:
+            # TREADY stayed low (a stalled or failed S2MM) or the engine is stuck: the chunk never reached TLAST,
+            # so its read lock stays set (CONTRACT.md I7) -- nothing here clears it
+            raise RuntimeError("the S2MM DMA did not complete within 5.0s (fake: transfer %d stalled)" % self.transfers)
         if not self.rd_locked or not self.reads or not self.reads[-1][4]:
-            self.rd_locked = False
             raise RuntimeError("S2MM timeout: the stream started before the channel was armed (or never)")
         self.tick(1 + nbytes // 32 * self.dma_units_per_beat)
         data = bytes(self.mem[self.rd_base:self.rd_base + nbytes])
         self.rd_locked = False
         return data
+
+    def dma_reset(self):
+        self.dma_resets += 1
+        self.armed = None
+
+    def dma_drain_to_tlast(self, nbytes, timeout=1.0):
+        """Arm for the rest of an interrupted chunk and take it up to TLAST: that ends the read lock. Fails if the
+        drain engine is stuck, or if there is no chunk to finish (the real S2MM would wait for data in vain)."""
+        self.tick(2)
+        if self.uplink_stuck or not self.rd_locked:
+            raise RuntimeError("the S2MM DMA did not complete within %ss (fake: no TLAST)" % timeout)
+        self.rd_locked = False
 
     # -- what a test checks ---------------------------------------------------------------
     def past_frontier(self):

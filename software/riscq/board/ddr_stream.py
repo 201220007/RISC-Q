@@ -38,7 +38,7 @@ from collections import deque
 import numpy as np
 
 from riscq.ddr import DdrUplinkError, StreamChunk
-from riscq.ddr_regs import S_RUN_ACTIVE, S_WRITE_DONE, FATAL_BITS
+from riscq.ddr_regs import S_FLUSH_BUSY, S_RUN_ACTIVE
 
 F_DATA, F_WARN, F_END, F_ERROR = 1, 2, 3, 4
 _HDR = struct.Struct("<II")          # kind, payload bytes
@@ -81,9 +81,12 @@ def iter_frames(blob: bytes):
 
 
 class FrameReader:
-    """The consumer's side of the frames, with the end-to-end check: DATA must be contiguous from word 0, and at END
-    the words received, counted per core by their tags, must equal the certificate's ACCEPTED -- so a frame lost or
-    damaged between the PS and the consumer cannot pass as a certified run. ERROR raises DdrUplinkError."""
+    """The consumer's side of the frames. It checks the framing and the counts: every frame whole, DATA contiguous
+    from word 0, and at END the words received, counted per core by their tags, equal to the certificate's
+    ACCEPTED -- so a lost, repeated or misplaced DATA frame, or a short stream, cannot pass as a certified run. It
+    does not check the payload bits: their integrity and order on the way are TCP's (the transport is one TCP
+    connection), and the certificate itself is computed on the PS from the words it read. ERROR raises
+    DdrUplinkError."""
 
     def __init__(self):
         self.next_word = 0
@@ -123,10 +126,12 @@ class FrameReader:
             elif kind == F_ERROR:
                 err = json.loads(payload)
                 self.end, self.done = err, True
-                raise DdrUplinkError("streamed run not certified (%s): %s%s"
+                raise DdrUplinkError("streamed run not certified (%s): %s; %s; drain port %s"
                                      % (err.get("type"), err.get("error"),
-                                        "; the run is intact in PL DDR, drain() can still certify it"
-                                        if err.get("recoverable") else ""))
+                                        "its prerequisite gates pass, drain() can certify the data kept in PL DDR"
+                                        if err.get("recoverable") else
+                                        err.get("retained") or "the run is not certifiable",
+                                        err.get("port")))
             else:
                 raise DdrUplinkError("stream transport: unknown frame kind %d" % kind)
         return out
@@ -146,12 +151,15 @@ class FrameQueue:
         self.max_data = 0            # the largest amount of data ever waiting
         self.wait_total = 0.0        # time put_data spent waiting for room
         self.wait_max = 0.0
+        self.blocked_puts = 0        # put_data calls that found no room at first and had to wait
 
     def put_data(self, f: bytes, timeout: float, abort: threading.Event | None = None) -> bool:
         with self._cv:
             t0 = time.monotonic()
             deadline = t0 + timeout
             ok = True
+            if self._data and self._data + len(f) > self.limit:
+                self.blocked_puts += 1
             while self._data and self._data + len(f) > self.limit:   # an empty queue takes any one frame
                 left = deadline - time.monotonic()
                 if left <= 0 or (abort is not None and abort.is_set()):
@@ -269,6 +277,8 @@ class StreamWorker(threading.Thread):
         self.frames = FrameQueue(buffer_bytes)
         self._abort = threading.Event()
         self.stream = None
+        self.port_unusable = None     # why the drain port may not be used again (read, never assumed), or None
+        self.port_state = "not opened"
         self.stats = {"chunks": 0, "bytes": 0, "polls": 0, "idle_polls": 0, "max_chunk_bytes": 0,
                       "bytes_before_done": 0, "t_first_data": None, "t_done": None, "t_write_done": None,
                       "t_end": None, "buffer_bytes": self.frames.limit}
@@ -283,8 +293,10 @@ class StreamWorker(threading.Thread):
             with self.lock if self.lock is not None else contextlib.nullcontext():
                 self._run()
         except BaseException as e:            # noqa: BLE001 -- the stream must always end with a frame
+            self.port_unusable = self.port_unusable or "the worker crashed before checking the port: %r" % e
             self.frames.put_ctrl(json_frame(F_ERROR, {"error": "worker crashed: %r" % e, "type": type(e).__name__,
-                                                      "stats": self.stats, "recoverable": False}))
+                                                      "stats": self.stats, "recoverable": False,
+                                                      "port": "unknown (worker crashed)"}))
         finally:
             self.frames.close()
 
@@ -308,28 +320,32 @@ class StreamWorker(threading.Thread):
                 if self._abort.is_set():
                     raise StreamAborted("aborted by the consumer")
                 chunk = st.step() if stalled is None else None
+                # DONE is sampled AFTER the chunk landed: a chunk counts as early only if the program was still
+                # running then (a DONE seen later says nothing about when the chunk arrived)
+                done_now = prog_done or ctl.done()
                 if st.ended and self.stats["t_write_done"] is None:
                     self.stats["t_write_done"] = clk() - t_open
                 while nwarn < len(st.warnings):
                     self.frames.put_ctrl(json_frame(F_WARN, st.warnings[nwarn]))
                     nwarn += 1
                 if chunk is not None:
-                    self._count(chunk, t_open, prog_done)
+                    self._count(chunk, t_open, early=not done_now)
+                if not prog_done:
+                    if done_now:
+                        prog_done = True
+                        self.stats["t_done"] = clk() - t_open      # an upper bound of the program's end
+                        ctl.stop()
+                        ro.flush(self.flush_timeout_s)
+                    elif clk() - t_start > self.run_timeout_s:
+                        raise DdrUplinkError("the program was not DONE within %.0f s" % self.run_timeout_s)
+                if chunk is not None:
                     if not self.frames.put_data(data_frame(chunk, t_open), self.consumer_timeout_s, self._abort):
                         if self._abort.is_set():
                             raise StreamAborted("aborted by the consumer")
                         stalled = ("the consumer made no room in %.1f s with %d B of data waiting (bound %d B); "
                                    "reading stopped at byte %d of the run"
                                    % (self.consumer_timeout_s, self.frames.max_data, self.frames.limit, st.sent))
-                if not prog_done:
-                    if ctl.done():
-                        prog_done = True
-                        self.stats["t_done"] = clk() - t_open
-                        ctl.stop()
-                        ro.flush(self.flush_timeout_s)
-                    elif clk() - t_start > self.run_timeout_s:
-                        raise DdrUplinkError("the program was not DONE within %.0f s" % self.run_timeout_s)
-                elif stalled is not None:
+                if prog_done and stalled is not None:
                     break                     # the run is complete in PL DDR; nothing more is read
                 if chunk is None and not st.finished:
                     self.stats["idle_polls"] += 1
@@ -341,34 +357,51 @@ class StreamWorker(threading.Thread):
                            for c, d in ctl.results().items()}
         except Exception as e:                # noqa: BLE001 -- reported in the ERROR frame below
             err = e
-        finally:
-            notes = self._leave_idle(prepared, started, prog_done, err is not None)
+        notes = self._leave_idle(prepared, started, prog_done, st)
         self.stats["polls"] = st.n_polls if st is not None else 0
+        self.stats["t_first_read"] = (st.t_first_read - st.t_open) if st is not None and st.t_first_read else None
         self.stats["t_end"] = clk() - (st.t_open if st is not None else t_start)
         self.stats.update(queue_max_bytes=self.frames.max_data, consumer_wait_s=round(self.frames.wait_total, 6),
-                          consumer_wait_max_s=round(self.frames.wait_max, 6))
+                          consumer_wait_max_s=round(self.frames.wait_max, 6), blocked_puts=self.frames.blocked_puts,
+                          port=self.port_state)
         if err is None:
             self.frames.put_ctrl(json_frame(F_END, {"certificate": st.certificate, "stats": self.stats,
                                                     "results": results}))
             return
+        pending = None if st is None else (st.certifiable() if self.port_unusable is None else
+                                           "the drain port is unusable: %s" % self.port_unusable)
+        if st is not None:
+            st.close()
         self.frames.put_ctrl(json_frame(F_ERROR, {
             "error": str(err), "type": type(err).__name__, "stats": self.stats, "notes": notes,
-            "sent": st.sent if st is not None else 0, "wr_base": self.wr_base,
-            "recoverable": isinstance(err, ConsumerStalled) and self._recoverable()}))
+            "sent": st.sent if st is not None else 0, "wr_base": self.wr_base, "port": self.port_state,
+            # recoverable only if the certificate's prerequisite gates pass on the run as it now is, together with
+            # every fault the stream saw, and the drain port is free: then drain() can certify the retained data
+            "recoverable": st is not None and pending is None,
+            "retained": None if st is None or pending is None else
+            "data retained in PL DDR; certification pending: %s" % pending}))
 
-    def _count(self, chunk, t_open, prog_done):
+    def _count(self, chunk, t_open, early):
         s = self.stats
         s["chunks"] += 1
         s["bytes"] += len(chunk.data)
         s["max_chunk_bytes"] = max(s["max_chunk_bytes"], len(chunk.data))
         if s["t_first_data"] is None and chunk.data:
             s["t_first_data"] = chunk.t - t_open
-        if not prog_done:
+        if s["t_first_data"] is not None:
+            s["t_last_data"] = chunk.t - t_open
+        if early:
             s["bytes_before_done"] += len(chunk.data)
+            s["chunks_before_done"] = s.get("chunks_before_done", 0) + 1
 
-    def _leave_idle(self, prepared, started, prog_done, failed):
-        """Leave the hardware as rerun() leaves it, whatever happened: core reset asserted, the run flushed (so the
-        next prepare() is accepted), and on a failure the S2MM channel reset (a refused RD_START leaves it armed)."""
+    def _leave_idle(self, prepared, started, prog_done, st):
+        """Leave the hardware as rerun() leaves it, whatever happened -- core reset asserted, the run flushed -- and
+        never claim the drain port free without having read it so. A chunk whose DMA failed keeps the read lock
+        until its AXIS TLAST (CONTRACT.md I7), and FLUSH does not clear it: release_drain() lets the rest of that
+        chunk drain into a re-armed S2MM up to TLAST, then drain_idle() reads STATUS and DIAG.run_idle, which is
+        what the next BASE_RESET needs. If the lock is still held, the port is reported unusable until the
+        established recovery (a PL reset, whose DSP-reset hold drains any owed R burst and resets the uplink's DDR
+        half; or the image reload of a board session's restore)."""
         notes = []
         if started and not prog_done:
             try:
@@ -377,26 +410,26 @@ class StreamWorker(threading.Thread):
                 notes.append("core reset failed: %r" % e)
         if prepared:
             try:
-                if self.ro._status() >> S_RUN_ACTIVE & 1:
+                s = self.ro._status()
+                if s >> S_RUN_ACTIVE & 1 and not s >> S_FLUSH_BUSY & 1:
                     self.ro.flush(self.flush_timeout_s)
             except Exception as e:            # noqa: BLE001
                 notes.append("flush failed: %r" % e)
-        if failed:
-            reset = getattr(self.ro.drv, "dma_reset", None)
-            if reset is not None:
-                try:
-                    reset()
-                except Exception as e:        # noqa: BLE001
-                    notes.append("S2MM reset failed: %r" % e)
+        if st is not None and st.inflight is not None:
+            why = self.ro.release_drain(st.inflight[1])
+            notes.append("interrupted chunk at 0x%x (%d B): %s"
+                         % (st.inflight[0], st.inflight[1], why or "drained to TLAST, data discarded"))
+        try:                                  # read, never assumed; behind the readiness gate (no ui_clk access
+            ready = self.ro.ddr_status()      # on an uncalibrated MIG)
+            if ready is not None and not all(ready):
+                self.port_unusable = "the DDR side is not ready (calib_done, ui_reset_released) = %s" % (ready,)
+            else:
+                self.port_unusable = self.ro.drain_idle()
+        except Exception as e:                # noqa: BLE001
+            self.port_unusable = "the port state could not be read: %r" % e
+        self.port_state = "idle" if self.port_unusable is None else \
+            "UNUSABLE until the established recovery (PL reset or image reload): %s" % self.port_unusable
         return notes
-
-    def _recoverable(self):
-        """The run ended with write_done and no fatal bit: drain(wr_base, expected) can still certify it."""
-        try:
-            s = self.ro._status()
-        except Exception:                     # noqa: BLE001
-            return False
-        return bool(s >> S_WRITE_DONE & 1) and not any(s >> b & 1 for b in FATAL_BITS)
 
 
 class ConsumerStalled(RuntimeError):

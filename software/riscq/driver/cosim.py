@@ -180,6 +180,25 @@ class CosimDdr:
             raise RuntimeError(f"S2MM short packet: TLAST after {len(data)} of {nbytes} B")
         return data
 
+    def dma_reset(self) -> None:
+        """Disarm the S2MM stand-in (TREADY low again), like DdrBoard.dma_reset after a failure."""
+        if self._armed is not None:
+            self._armed = None
+            self.drv.sim.dma_get(1)
+
+    def dma_drain_to_tlast(self, nbytes: int, timeout=None) -> int:
+        """S1: like DdrBoard.dma_drain_to_tlast -- arm for `nbytes`, accept what is left of an interrupted chunk up to
+        TLAST (a short packet is the expected case), discard it. Returns the bytes taken; raises without TLAST."""
+        if self._armed is not None:
+            raise RuntimeError("an S2MM transfer is already in flight")
+        self.drv.sim.dma_arm(nbytes)
+        data, tlast, err = self.drv.sim.dma_get(self.timeout_cycles)
+        if err:
+            raise RuntimeError(f"S2MM error: {err}")
+        if not tlast:
+            raise RuntimeError(f"S2MM timeout: {len(data)} B and no TLAST")
+        return len(data)
+
 
 class _RemoteExtras:
     """Server-side batch runner (spec 08 §5): setup/rerun run the SAME riscq.run functions next

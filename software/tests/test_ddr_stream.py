@@ -285,21 +285,101 @@ def test_an_inconsistent_cur_addr_raises(cur):
         _run(fake, ro, exp, hook=hook)
 
 
-def test_a_dma_failure_propagates():
+def test_a_dma_failure_propagates_and_the_lock_waits_for_tlast():
+    """A stalled S2MM: the stream raises, names the chunk in flight, and the read lock (to TLAST, CONTRACT.md I7)
+    stays -- FLUSH does not clear it. release_drain() lets the rest of the chunk reach TLAST; then the port reads
+    idle. Nothing clears the lock by hand."""
     fake, ro, exp, _ = _setup([100, 100, 100, 100])
-    orig = fake.dma_recv_wait
-    n = {"k": 0}
-
-    def flaky(buf, nbytes):
-        n["k"] += 1
-        if n["k"] == 3:
-            fake.armed = None
-            fake.rd_locked = False
-            raise RuntimeError("the S2MM DMA did not complete within 5.0s")
-        return orig(buf, nbytes)
-    fake.dma_recv_wait = flaky
+    fake.dma_stall_at = {3}
+    ctl = FakeControl(fake)
+    ro.prepare(BASE, exp)
+    st = ro.stream(BASE, exp, max_chunk=BANK)
+    ctl.start()
     with pytest.raises(RuntimeError, match="S2MM DMA did not complete"):
+        for _ in range(100000):
+            st.step()
+    base, n = st.inflight
+    assert base == BASE + 2 * BANK and n == BANK and fake.rd_locked
+    ctl.stop()
+    ro.flush()
+    assert "read lock" in ro.drain_idle() and fake.rd_locked, "FLUSH must not have cleared the read lock"
+    with pytest.raises(DdrUplinkError, match="base_reset refused"):
+        ro.prepare(BASE + 0x8000, exp)
+    assert ro.release_drain(n) is None and ro.drain_idle() is None
+    st.close()
+    ro.prepare(BASE + 0x8000, exp)
+
+
+def test_an_error_seen_only_by_the_dma_check_refuses():
+    """A fatal bit visible only in the STATUS sample _dma_read() takes after RD_START (gone by the next poll) is in
+    the stream's history: the certificate refuses."""
+    fake, ro, exp, _ = _setup([200, 200, 200, 200])
+    state = {"last_w": None, "done": False}
+
+    def on_write(f, off, val):
+        state["last_w"] = off
+
+    def on_read(f, off):
+        if off == R.STATUS and state["last_w"] == R.RD_START and not state["done"] and f.reads and len(f.reads) == 3:
+            state["done"] = True
+            f.live |= 1 << R.S_RRESP_ERR
+            f.at(f.t + 1, lambda g: setattr(g, "live", g.live & ~(1 << R.S_RRESP_ERR)))
+    fake.on_write, fake.on_read = on_write, on_read
+    with pytest.raises(DdrUplinkError, match=r"run invalid \(rresp_err\)"):
         _run(fake, ro, exp, max_chunk=BANK)
+    assert state["done"]
+
+
+def test_an_error_seen_only_by_the_tail_dma_check_refuses():
+    """The same after write_done, in the tail's DMA check: 'error raised DURING the drain', from the history, though
+    the final STATUS is clean."""
+    fake, ro, exp, _ = _setup([100, 100, 100, 100])
+    state = {"last_w": None, "done": False}
+
+    def on_write(f, off, val):
+        state["last_w"] = off
+
+    def on_read(f, off):
+        if off == R.STATUS and state["last_w"] == R.RD_START and f.final and not state["done"]:
+            state["done"] = True
+            f.live |= 1 << R.S_RRESP_ERR
+            f.at(f.t + 1, lambda g: setattr(g, "live", g.live & ~(1 << R.S_RRESP_ERR)))
+    fake.on_write, fake.on_read = on_write, on_read
+    with pytest.raises(DdrUplinkError, match="error raised DURING the drain \\(rresp_err\\)"):
+        _run(fake, ro, exp, max_chunk=BANK)
+    assert state["done"] and not fake.live
+
+
+def test_an_error_seen_only_during_the_flush_refuses():
+    """A fatal bit visible only while FLUSH is busy (flush()'s own STATUS polls) is in the history too."""
+    fake, ro, exp, _ = _setup([100, 100, 100, 100])
+    seen = {"n": 0}
+
+    def on_read(f, off):
+        if off == R.STATUS and f.flush_at is not None and not seen["n"]:
+            seen["n"] += 1
+            f.live |= 1 << R.S_BRESP_ERR
+            f.at(f.t + 1, lambda g: setattr(g, "live", g.live & ~(1 << R.S_BRESP_ERR)))
+    fake.on_read = on_read
+    with pytest.raises(DdrUplinkError, match=r"run invalid \(bresp_err\)"):
+        _run(fake, ro, exp)
+    assert seen["n"] == 1 and not fake.live
+
+
+def test_reads_are_cut_to_a_fixed_dma_buffer():
+    """A fixed DMA buffer (DdrBoard(grow=False)): drain() cuts its read into buffer-sized transfers, the stream's
+    default chunk is the buffer, and a larger max_chunk is refused -- nothing ever asks to reallocate."""
+    fake, ro, exp, words = _setup([120, 120, 120, 120], rate=100)
+    fake.max_transfer = 1024
+    st, chunks, _ = _run(fake, ro, exp)
+    assert st.max_chunk == 1024 and max(len(c.data) for _, c in chunks) <= 1024
+    before = len(fake.reads)
+    out = ro.drain(BASE, exp)
+    assert sum(len(v[0]) for v in out.values()) == 480
+    assert [r[2] for r in fake.reads[before:]] == [1024, 1024, 1024, 768]
+    ro.prepare(BASE + 0x8000, exp)
+    with pytest.raises(ValueError, match="max_chunk"):
+        ro.stream(BASE + 0x8000, exp, max_chunk=2048)
 
 
 def test_a_word_with_no_core_tag_warns_and_refuses():

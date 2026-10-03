@@ -38,16 +38,20 @@ class DdrBoard:
     """
 
     def __init__(self, soc=None, m: DdrMap | None = None, cma_bytes: int = 8 << 20, cacheable: bool = False,
-                 wait_poll_s: float = 0.001):
+                 wait_poll_s: float = 0.001, grow: bool = True):
         """`cacheable` (qubic3 S1, the live read): allocate the drain buffer cacheable, so the copy out of it runs at
         memory speed instead of uncached-read speed; the cache maintenance that makes this correct is in `_cma` and
         `dma_recv_wait`. `wait_poll_s` is the sleep between completion polls (1 ms, as before, by default; the live
-        stream uses less, because it adds directly to the result-to-PS latency of every chunk)."""
+        stream uses less, because it adds directly to the result-to-PS latency of every chunk). `grow=False` fixes the
+        buffer at `cma_bytes`: a longer transfer is refused instead of reallocating, and `max_transfer` tells
+        `riscq.ddr.DdrReadout` to cut every read to that size (a buffer allocated by a board session's owner before
+        its fork must never be reallocated in the MMIO child)."""
         self.soc = soc
         self.map = m or DdrMap()
         self._cma_bytes = cma_bytes
         self._cacheable = bool(cacheable)
         self._wait_poll_s = float(wait_poll_s)
+        self._grow = bool(grow)
         self._buf = None
         self._active = None      # (buffer, nbytes) while a transfer is in flight, else None
         self._mmio = {}
@@ -126,9 +130,17 @@ class DdrBoard:
         from riscq.board.pynq_compat import numpy2_pynq_shim
         numpy2_pynq_shim()
 
+    @property
+    def max_transfer(self):
+        """The largest transfer one arm may ask for: None (the buffer grows) or, with `grow=False`, its size."""
+        return None if self._grow else self._cma_bytes
+
     def _cma(self, nbytes):
         import pynq
         self._numpy2_pynq_shim()
+        if not self._grow and nbytes > self._cma_bytes:
+            raise ValueError("a %d-B transfer does not fit the fixed %d-B DMA buffer (grow=False); cut the read"
+                             % (nbytes, self._cma_bytes))
         if self._buf is None or self._buf.nbytes < nbytes:
             if self._buf is not None:
                 self._buf.freebuffer()
@@ -288,6 +300,13 @@ class DdrBoard:
         else:
             buf.invalidate()                       # the PL wrote it; drop stale cache lines
         return bytes(buf[:nbytes])
+
+    def dma_drain_to_tlast(self, nbytes, timeout=1.0):
+        """S1: arm the S2MM for `nbytes` and wait for it to complete. The AXI DMA completes at TLAST, so whatever is
+        left of an interrupted chunk (a short packet) drains into the buffer and is discarded; that TLAST ends the
+        uplink's read lock (CONTRACT.md I7). Raises, with the channel reset, on a timeout or a DMA error."""
+        buf = self.dma_recv_prepare(nbytes)
+        self.dma_recv_wait(buf, nbytes, timeout=timeout)
 
     def close(self):
         """r28-#8: never free a CMA buffer the PL may still be writing into. Stop the channel first, and

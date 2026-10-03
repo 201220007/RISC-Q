@@ -41,9 +41,11 @@ class BoardServer:
 
     def __init__(self, bits_dir: str | Path = DEFAULT_BITS, driver=None,
                  params_text: str | None = None, ddr_port=None, stream_control=None):
-        """`ddr_port` / `stream_control` are CI seams for the live readout (qubic3 S1): the uplink's driver
-        surface (default: a cacheable `DdrBoard` around the loaded PynqDriver) and the run control factory
-        (default: `riscq.board.ddr_stream.KernelControl`)."""
+        """`ddr_port` is the uplink's driver surface for the live readout (qubic3 S1). A board session passes the
+        `DdrBoard` its buffer owner allocated before the fork, so the server never makes a second DMA buffer; by
+        default the server makes one fixed (grow=False) cacheable `DdrBoard` around the loaded PynqDriver, and
+        every read is cut to its size. `stream_control` is the run control factory (default
+        `riscq.board.ddr_stream.KernelControl`), a CI seam."""
         self._lock = threading.RLock()
         self._bits = Path(bits_dir).expanduser()
         self._drv = driver
@@ -154,7 +156,7 @@ class BoardServer:
         if self._ddr is None:
             from riscq.board.ddr_board import DdrBoard
             self._ddr = DdrBoard(soc=self._driver(), cma_bytes=STREAM_DMA_BYTES, cacheable=True,
-                                 wait_poll_s=50e-6)
+                                 wait_poll_s=50e-6, grow=False)
         return self._ddr
 
     @_locked
@@ -177,6 +179,10 @@ class BoardServer:
                                "there is no readout uplink to stream")
         if self._stream is not None and self._stream.is_alive():
             raise RuntimeError("a streamed run is still in progress")
+        if self._stream is not None and self._stream.port_unusable is not None:
+            raise RuntimeError(f"the DDR drain port is unusable since streamed run {self._stream_id}: "
+                               f"{self._stream.port_unusable}. It needs the established recovery (a PL reset, "
+                               "or an image reload: load())")
         opts = dict(opts or {})
         bad = sorted(set(opts) - set(StreamWorker.OPTS))
         if bad:
@@ -296,6 +302,7 @@ class BoardServer:
         if self._ddr is not None:                         # S1: the stream's DMA buffer goes first
             self._ddr.close()
             self._ddr = None
+        self._stream = None                               # a reload is the recovery of an unusable port
         # free the previous driver's CMA result buffer BEFORE allocating the next one: it is
         # 16 MB per core (224 MB on the 14q build), so waiting for the GC to reclaim it would make
         # a reload fail the CMA pre-check for no reason (specs/software/22 §3).

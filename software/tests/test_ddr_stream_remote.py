@@ -65,6 +65,12 @@ class Port:
     def dma_recv_wait(self, buf, n):
         return self.uplink.dma_recv_wait(buf, n)
 
+    def dma_reset(self):
+        return self.uplink.dma_reset()
+
+    def dma_drain_to_tlast(self, n, timeout=1.0):
+        return self.uplink.dma_drain_to_tlast(n, timeout)
+
 
 @pytest.fixture
 def board(tmp_path):
@@ -124,11 +130,63 @@ def test_a_slow_host_cannot_stall_the_board(board):
         time.sleep(0.05)
     assert not srv._stream.is_alive(), "the board waited on the host without a bound"
     assert srv._stream.frames.max_data <= 2048 + 2 * 24
-    with pytest.raises(DdrUplinkError, match="ConsumerStalled.*drain\\(\\) can still certify it"):
+    with pytest.raises(DdrUplinkError, match="ConsumerStalled.*prerequisite gates pass, drain\\(\\) can certify"):
         for _ in cl:
             pass
     assert fake.sticky >> 2 & 1 and not fake.run_active          # write_done: the run ended in hardware
     cl.close()
+
+
+def test_a_slow_then_silent_host_blocks_several_enqueues_then_stalls(board):
+    """Chunks capped well below the queue budget: a host that reads slowly makes several enqueues wait (bounded),
+    then stops reading altogether, and the board ends the run with ConsumerStalled -- never one oversized frame."""
+    drv, srv, m, new_run = board
+    fake = new_run([1500, 1500], rate=0.5)
+    rq.setup(drv, m, {})
+    cl = drv.ddr_stream(m, {}, {0: 1500, 1: 1500}, BASE, read_timeout=0.2, read_bytes=600, poll_s=1e-5,
+                        max_chunk=512, buffer_bytes=4 * 536, consumer_timeout_s=0.4)
+    it = iter(cl)
+    for _ in range(8):                                            # slow: one frame every 0.15 s
+        next(it)
+        time.sleep(0.15)
+    t0 = time.monotonic()                                         # then silent
+    while srv._stream.is_alive() and time.monotonic() - t0 < 10:
+        time.sleep(0.05)
+    with pytest.raises(DdrUplinkError, match="ConsumerStalled"):
+        for _ in it:
+            pass
+    st = cl.end["stats"]
+    assert st["blocked_puts"] >= 3 and st["max_chunk_bytes"] <= 512 and st["queue_max_bytes"] <= 4 * 536
+    cl.close()
+
+
+def test_an_unusable_port_refuses_the_next_stream(board):
+    """A chunk that could not reach TLAST leaves the read lock set: the worker reads the port unusable and the
+    server refuses every further stream until a reload (the established recovery)."""
+    drv, srv, m, new_run = board
+    fake = new_run([300, 300], rate=0.5)
+    orig = fake.dma_recv_wait
+
+    def wait(buf, n):
+        if fake.transfers == 1:
+            fake.uplink_stuck = True
+        return orig(buf, n)
+    fake.dma_recv_wait = wait
+    rq.setup(drv, m, {})
+    cl = drv.ddr_stream(m, {}, {0: 300, 1: 300}, BASE, read_timeout=0.2, poll_s=1e-5, max_chunk=512)
+    with pytest.raises(DdrUplinkError, match="UNUSABLE"):
+        for _ in cl:
+            pass
+    cl.close()
+    with pytest.raises(Exception, match="unusable since streamed run 1"):
+        drv._proxy.ddr_stream_start(rq._params_json(m), [], {}, {}, {0: 300, 1: 300}, BASE + 0x10000, {})
+
+
+def test_the_default_port_is_one_fixed_buffer(tmp_path):
+    from riscq.board.server import STREAM_DMA_BYTES
+    srv = BoardServer(bits_dir=tmp_path / "b", driver=SocFake(SocMap(SocParams.from_json(ANTQ))), params_text=ANTQ)
+    port = srv._ddr_port()
+    assert port.max_transfer == STREAM_DMA_BYTES and srv._ddr_port() is port and port._cacheable
 
 
 def test_the_start_guards(board, tmp_path):

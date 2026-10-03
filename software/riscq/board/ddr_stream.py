@@ -271,7 +271,9 @@ class StreamAborted(RuntimeError):
 class StreamWorker(threading.Thread):
     """One streamed run (see the module docstring). `lock` (the board server's) is held for the whole run, because
     the worker owns the MMIO while the run lasts. `clock` / `idle` are the time base and the wait between empty
-    polls: time.monotonic / time.sleep on the board, the simulated time base in co-sim."""
+    polls: time.monotonic / time.sleep on the board, the simulated time base in co-sim. Times in `stats` are seconds
+    after the stream opened; the program ended in (t_still_running, t_done], so t_end - t_still_running is a DONE->END
+    that cannot be shorter than the true one."""
 
     OPTS = ("buffer_bytes", "max_chunk", "poll_s", "consumer_timeout_s", "run_timeout_s", "flush_timeout_s",
             "prepare_timeout_s", "results")
@@ -293,8 +295,8 @@ class StreamWorker(threading.Thread):
         self.port_unusable = None     # why the drain port may not be used again (read, never assumed), or None
         self.port_state = "not opened"
         self.stats = {"chunks": 0, "bytes": 0, "polls": 0, "idle_polls": 0, "max_chunk_bytes": 0,
-                      "bytes_before_done": 0, "t_first_data": None, "t_done": None, "t_write_done": None,
-                      "t_end": None, "buffer_bytes": self.frames.limit}
+                      "bytes_before_done": 0, "t_first_data": None, "t_still_running": None, "t_done": None,
+                      "t_write_done": None, "t_end": None, "buffer_bytes": self.frames.limit}
 
     def abort(self):
         """Ask the worker to stop: it stops the program, flushes the run and ends the stream with ERROR."""
@@ -326,6 +328,7 @@ class StreamWorker(threading.Thread):
             prepared = True
             st = self.stream = ro.stream(self.wr_base, self.expected, max_chunk=self.max_chunk, clock=clk)
             t_open = st.t_open
+            t_running = clk()                 # the program cannot end before the core reset's release in start()
             ctl.start()
             started = True
             nwarn = 0
@@ -336,7 +339,15 @@ class StreamWorker(threading.Thread):
                 chunk = st.step() if stalled is None else None
                 # DONE is sampled AFTER the chunk landed: a chunk counts as early only if the program was still
                 # running then (a DONE seen later says nothing about when the chunk arrived)
-                done_now = prog_done or ctl.done()
+                if prog_done:
+                    done_now = True
+                else:
+                    t_read = clk()
+                    done_now = ctl.done()
+                    if done_now:
+                        t_done = clk()        # the program had ended by now ...
+                    else:
+                        t_running = t_read    # ... and was still running at some instant after this one
                 if st.ended and self.stats["t_write_done"] is None:
                     self.stats["t_write_done"] = clk() - t_open
                 while nwarn < len(st.warnings):
@@ -347,7 +358,11 @@ class StreamWorker(threading.Thread):
                 if not prog_done:
                     if done_now:
                         prog_done = True
-                        self.stats["t_done"] = clk() - t_open      # an upper bound of the program's end
+                        # the program's end is only bracketed: after the start of the last DONE read that saw it
+                        # running, before the end of the first that saw it done. A long chunk transfer between the two
+                        # widens the bracket, so DONE->END taken from t_still_running hides no backlog
+                        self.stats["t_done"] = t_done - t_open
+                        self.stats["t_still_running"] = t_running - t_open
                         ctl.stop()
                         ro.flush(self.flush_timeout_s)
                     elif clk() - t_start > self.run_timeout_s:

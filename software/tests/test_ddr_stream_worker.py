@@ -257,6 +257,32 @@ def test_once_caught_up_the_worker_polls_once_per_period():
     assert len(sizes) <= 16 and sizes[len(sizes) // 2] >= 16 * BANK, sizes
 
 
+def test_the_programs_end_is_bracketed_even_behind_a_long_chunk_transfer():
+    """L4's DONE->END must not hide a backlog behind a late observation of DONE. The worker records the start of the
+    last DONE read that still saw the program running (t_still_running) and the end of the first that saw it done
+    (t_done). A program that ends during a long chunk transfer lies between the two: t_end - t_still_running is never
+    shorter than the true DONE->END, while t_end - t_done is."""
+    fake, ro, exp, words = _setup([400] * 4, rate=1.0, dma_units_per_beat=8.0)   # a 4-bank chunk takes ~500 units
+    end = {}
+    orig = fake._offer
+
+    def offer():
+        orig()
+        if "t" not in end and fake.offered == len(fake.sched):
+            end["t"] = fake.t                                  # the program's true end, on the fake's clock
+    fake._offer = offer
+    w = _worker(fake, ro, exp, max_chunk=4 * BANK, poll_s=1.0, run_timeout_s=1e9, clock=lambda: float(fake.t),
+                idle=lambda s: fake.tick(max(1, round(s))))
+    w.start()
+    reader, chunks, err = _consume(w)
+    w.join(5)
+    assert err is None and reader.certificate["total"] == 1600
+    st, t_end = reader.end["stats"], end["t"] - w.stream.t_open
+    assert st["t_still_running"] < t_end <= st["t_done"], (st, t_end)
+    assert st["t_done"] - t_end > 100, "the end must have been seen late, behind a chunk transfer"
+    assert st["t_end"] - st["t_still_running"] > st["t_end"] - t_end > st["t_end"] - st["t_done"]
+
+
 def test_frames_round_trip():
     c = StreamChunk(5, bytes(range(16)), 1.5)
     blob = data_frame(c, 1.0) + json_frame(F_WARN, {"what": "x"}) + frame(F_END, b"{}")

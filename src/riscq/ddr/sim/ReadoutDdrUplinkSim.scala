@@ -1212,6 +1212,64 @@ object ReadoutDdrUplinkSim extends App {
     checkLive(h, ps, BASE0 + 0x40000L, frozen(exp), "live_axi_errors (clean run after)")
   }
 
+  /** 24. S1 a DMA timeout with AXIS data outstanding, and the recovery the worker uses. A live read of two committed
+   *  banks meets a DMA that never takes a beat (TREADY low): the drain engine's FIFO fills, R beats stay owed, and the
+   *  chunk stays in flight -- its read lock lasts until its TLAST (CONTRACT.md I7). The run is flushed meanwhile:
+   *  write_done comes, but FLUSH does not clear the lock: DIAG.run_idle stays 0 and BASE_RESET is refused
+   *  (err_base_busy). Re-arming the DMA lets the whole chunk drain to TLAST, intact and in order; then run_idle reads
+   *  1, BASE_RESET is accepted and the next run, read live, is exact. Nothing is cleared by hand. */
+  run("live_dma_timeout_recovery", 25) { (dut, h) =>
+    h.startRun()
+    val bus = new LiveBus(dut, h.ddrCd)
+    val exp1 = produce(h, 48, 18, 7)                                  // 192 words: three full banks
+    var n = 0
+    while ((h.rd(CUR_ADDR).toLong - BASE0) < 1024 && n < 10000) { h.ddrCd.waitSampling(10); n += 1 }
+    assert(h.rd(CUR_ADDR).toLong - BASE0 >= 1024, "two banks were never committed")
+    dut.io.rd.ready #= false                                          // the DMA takes nothing: its transfer times out
+    h.wr(RD_BASE, BigInt(BASE0)); h.wr(RD_SIZE, BigInt(1024)); h.wr(RD_START, BigInt(1))
+    var taken = 0
+    val watch = fork { while (true) { h.ddrCd.waitSampling()
+      if (dut.io.rd.valid.toBoolean && dut.io.rd.ready.toBoolean) taken += 1 } }
+    h.ddrCd.waitSampling(3000)
+    assert(taken == 0, s"the stalled DMA took $taken beats")
+    val s = h.flushRun()                                              // write_done, with the chunk still in flight
+    val d0 = h.rd(DIAG)
+    assert(((d0 >> 7) & 1) == 0, f"run_idle with a chunk in flight: diag=0x$d0%x (FLUSH must not clear the read lock)")
+    h.wr(BASE_RESET, BigInt(1))
+    assert(h.bit(h.status(), S_ERR_BASE_BUSY), "BASE_RESET was accepted while a chunk held the read lock")
+    h.wr(STATUS, BigInt(1) << S_ERR_BASE_BUSY)
+    // the recovery: re-arm the DMA and take the rest of the chunk up to TLAST (here: all of it, nothing was taken)
+    val beats = mutable.ArrayBuffer[BigInt](); var sawLast = false; var g = 0
+    while (!sawLast && g < 100000) {
+      dut.io.rd.ready #= h.rng.nextInt(3) != 0
+      h.ddrCd.waitSampling(); g += 1
+      if (dut.io.rd.valid.toBoolean && dut.io.rd.ready.toBoolean) {
+        beats += dut.io.rd.fragment.toBigInt; if (dut.io.rd.last.toBoolean) sawLast = true }
+    }
+    dut.io.rd.ready #= true
+    watch.terminate()
+    assert(sawLast && beats.size == 32, s"the drained chunk: TLAST=$sawLast after ${beats.size} beats (32 expected)")
+    val words = beats.flatMap(b => (0 until 4).map(k => (b >> (64 * k)) & ((BigInt(1) << 64) - 1)))
+    assert(words.toSeq == h.ddrWords(BASE0, 128), "the drained chunk is not the DDR image of the two banks")
+    h.ddrCd.waitSampling(20)
+    val d1 = h.rd(DIAG)
+    assert(((d1 >> 7) & 1) == 1, f"not idle after the chunk's TLAST: diag=0x$d1%x")
+    bus.stop()
+    println(f"[G2] live_dma_timeout_recovery: lock held across FLUSH (diag 0x$d0%x, BASE_RESET refused); drained " +
+            f"${beats.size} beats to TLAST, then diag 0x$d1%x (run_idle); next live run follows")
+    // the port is usable again
+    val base2 = BASE0 + 0x10000L
+    h.startRun(base2)
+    val bus2 = new LiveBus(dut, h.ddrCd)
+    var prodDone = false
+    var exp2: mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]] = null
+    val prod = fork { exp2 = produce(h, 100, 18, 8); prodDone = true }
+    val ps = new LivePs(h, bus2, base2, footprintOf(400), 1024)
+    ps.loop(() => prodDone)
+    prod.join(); bus2.stop()
+    checkLive(h, ps, base2, frozen(exp2), "live_dma_timeout_recovery (the next run)")
+  }
+
   if (STALLS) {
     println(s"[G2] stall injection totals: AW=${stallTotals(0)} AR=${stallTotals(1)} B=${stallTotals(2)} W=${stallTotals(3)} cycles")
     assert(stallTotals.forall(_ > 0), "a channel was never stalled: the stall pass would be vacuous for it")

@@ -16,6 +16,9 @@ Run 1 has delayed write responses; run 2 more delay plus random AW / AR / B stal
 one-to-one and in order per core, and the core reset of rerun() must not have reset the uplink.
 """
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -196,3 +199,244 @@ def test_bresp_and_rresp_errors_refuse_the_run(cosim_antq):
     for c in progs:
         cpu = np.asarray(out[c]["out"], dtype=np.int64).reshape(SHOTS, 3)
         assert np.array_equal(got[c][0], _trunc28(cpu[:, 1]))
+
+
+# ── qubic3 S1: the live read, end to end on the SoC ─────────────────────────────────────────────────────────────
+# The board's streaming worker (riscq.board.ddr_stream.StreamWorker) drives the run here exactly as it does on the
+# PS -- prepare, start the kernels, read the committed frontier while they run, DONE -> core reset -> FLUSH, the
+# tail, the certificate -- with the co-sim's CosimDdr in place of DdrBoard. Its time base is the simulated batch
+# time, counted in seconds of the board's 2-ns batch, and an idle poll advances the simulation instead of sleeping.
+from riscq.board.ddr_stream import FrameReader, KernelControl, StreamWorker  # noqa: E402
+from riscq.ddr import parse_words  # noqa: E402
+
+BATCH_S = 2e-9
+
+
+@kernel
+def k_live(demod: ParamTable, out: Array, ts: Array, code: int, n: int, period: int,
+           a0: int, a1: int, a2: int, a3: int):
+    init_pulse_params(demod.pulses)  # noqa: F821
+    set_freq(demod, code)  # noqa: F821
+    t = now() + LEAD  # noqa: F821
+    for i in range(n):
+        k = i & 3
+        if k == 0:
+            set_amp(demod, 0, a0)  # noqa: F821
+        elif k == 1:
+            set_amp(demod, 0, a1)  # noqa: F821
+        elif k == 2:
+            set_amp(demod, 0, a2)  # noqa: F821
+        else:
+            set_amp(demod, 0, a3)  # noqa: F821
+        play(demod, demod["sq"], t)  # noqa: F821  (one readout per shot, on an absolute grid of `period` batches)
+        wait_until(t + READOUT_LEAD)  # noqa: F821
+        out[3 * i] = read_res()  # noqa: F821  (halts until the result has settled: it is in the uplink now)
+        ts[i] = now()  # noqa: F821
+        out[3 * i + 1] = read_real()  # noqa: F821
+        out[3 * i + 2] = read_imag()  # noqa: F821
+        t = t + period
+
+
+def _live_progs(m, n, cores=(0, 1)):
+    kw = dict(out=Array(3 * n), ts=Array(n), code=pack16(4 * F), **{f"a{k}": c for k, c in enumerate(AMP_CODES)})
+    return {c: compile_kernel(k_live, m, core=c, tables=dict(demod=demod_table()), **kw) for c in cores}
+
+
+class _SimTime:
+    def __init__(self, drv):
+        self.drv = drv
+
+    def clock(self):
+        return self.drv.sim.batch_time() * BATCH_S
+
+    def idle(self, s):
+        self.drv.sim.advance(max(1, int(round(s / BATCH_S))))
+
+
+def _stream_run(drv, m, progs, n, period, base, max_chunk=1024, poll_batches=100, control=None):
+    """One run through StreamWorker (run in this thread), its frames through FrameReader. Returns (reader, chunks,
+    worker, error)."""
+    ro = DdrReadout(CosimDdr(drv), soc_map=m)
+    ctl = control or KernelControl(drv, m, progs, params={c: {"n": n, "period": period} for c in progs})
+    t = _SimTime(drv)
+    w = StreamWorker(ro, base, {c: n for c in progs}, ctl, max_chunk=max_chunk, poll_s=poll_batches * BATCH_S,
+                     run_timeout_s=1.0, flush_timeout_s=120, prepare_timeout_s=60, results=True,
+                     clock=t.clock, idle=t.idle)
+    ctl.worker = w
+    w.run()
+    reader, chunks, err = FrameReader(), [], None
+    try:
+        chunks = reader.feed(w.frames.get(1 << 30, 0.0))
+    except DdrUplinkError as e:
+        err = e
+    return reader, chunks, w, err
+
+
+def _per_core(chunks):
+    words = np.concatenate([c.words for c in chunks]) if chunks else np.zeros(0, dtype="<u8")
+    tag, real, imag = parse_words(words)
+    return {c: (real[tag == c], imag[tag == c]) for c in (0, 1)}, words
+
+
+# One bank (64 words) fills every 32 shots of the two cores: 32 x 600 batches x 10 ns = 192 us of simulation, about
+# 27 400 ui cycles of the 7-ns MIG stand-in.
+LIVE_BANK_UI = 32 * 600 * 10 // 7
+LIVE_RUNS = [
+    # run 1: delayed writes and a mildly stalled DMA, polled every 100 batches
+    dict(base=0x300000, n=200, poll=100, cfg=dict(b_delay=300, aw_stall=0.0, ar_stall=0.0, b_stall=0.0,
+                                                  tready_stall=0.3)),
+    # run 2: AW / AR / B held off 80 % of the cycles, TREADY low 70 %
+    dict(base=0x380000, n=200, poll=100, cfg=dict(b_delay=900, aw_stall=0.8, ar_stall=0.8, b_stall=0.8,
+                                                  tready_stall=0.7)),
+    # run 3, the overlap: each bank's write response comes 85 % of a bank time after its data, so a write burst is open
+    # most of the time, and the PS polls every two banks, so its reads start at any phase of the write cycle: R beats
+    # must arrive while a bank write is open. (Polled at once after a B, a read here finishes long before the next
+    # bank is full: the co-sim's result rate is low next to the AXI speeds.)
+    dict(base=0x3c0000, n=400, poll=2 * 32 * 600, overlap=True,
+         cfg=dict(b_delay=LIVE_BANK_UI * 85 // 100, aw_stall=0.0, ar_stall=0.0, b_stall=0.0, tready_stall=0.3)),
+]
+
+
+def test_runs_streamed_live_are_exact_and_certified(cosim_antq):
+    """S1, the live read: 2 cores x 200 shots (400 words: 6 full banks and a 16-word tail), read while the kernels
+    run. The results reach PS memory before the run ends (chunks before DONE, R beats on the bus while bank writes
+    are open), the streamed words equal the CPU-visible results one to one and in order, the run is certified at
+    write_done, and the post-run drain() of the same run agrees."""
+    drv, m = cosim_antq
+    drv.sim.set_model({"kind": "multi", "models": [
+        {"kind": "tone", "adc": m.adc_of(c), "freq_hz": units.code_to_freq(F, m.params), "amp": AMPS[c]}
+        for c in (0, 1)]})
+    period = 600
+    progs = _live_progs(m, max(run["n"] for run in LIVE_RUNS))
+    rq.setup(drv, m, progs)
+    for r, run in enumerate(LIVE_RUNS):
+        n = run["n"]
+        before = drv.sim.ddr_config(run["cfg"])
+        reader, chunks, w, err = _stream_run(drv, m, progs, n, period, run["base"], poll_batches=run["poll"])
+        assert err is None, f"run {r + 1}: {err}"
+        delta = {k: v - before[k] for k, v in drv.sim.ddr_config().items()}
+        cert, st = reader.certificate, reader.end["stats"]
+        assert cert["total"] == 2 * n and cert["accepted"][:2] == [n, n]
+        got, words = _per_core(chunks)
+        res = reader.end["results"]
+        for c in (0, 1):
+            cpu = np.asarray(res[str(c)]["out"], dtype=np.int64)[:3 * n].reshape(n, 3)
+            assert np.array_equal(got[c][0], _trunc28(cpu[:, 1])), f"run {r + 1} core {c}: real differs"
+            assert np.array_equal(got[c][1], _trunc28(cpu[:, 2])), f"run {r + 1} core {c}: imag differs"
+        live = [c for c in chunks if c.t < st["t_done"]]
+        assert len(live) >= 3 and st["bytes_before_done"] >= 3 * 512, f"run {r + 1}: not live: {st}"
+        if run.get("overlap"):
+            assert delta["r_during_w"] > 0, f"run {r + 1}: no R beat while a bank write was open: {delta}"
+        post = DdrReadout(CosimDdr(drv), soc_map=m).drain(run["base"], {0: n, 1: n})
+        for c in (0, 1):
+            assert np.array_equal(post[c][0], got[c][0]) and np.array_equal(post[c][1], got[c][1])
+        print(f"\n[S1] live run {r + 1} at {run['base']:#x}: {len(chunks)} chunks, {len(live)} before DONE "
+              f"({st['bytes_before_done']} of {8 * 2 * n} B), {delta['r_during_w']} R beats during bank writes, "
+              f"polls {st['polls']}, certified; model traffic {delta}")
+        if r == 1:
+            assert delta["aw_stalled"] > 0 and delta["b_stalled"] > 0 and delta["axis_stalled"] > 0, delta
+
+
+class _InjectAt(KernelControl):
+    """KernelControl that turns one DDR-model knob once the stream has read `after` bytes (a fault mid-run)."""
+
+    def __init__(self, *a, after, cfg, **k):
+        super().__init__(*a, **k)
+        self.after, self.cfg, self.fired_at, self.worker = after, cfg, None, None
+
+    def done(self):
+        st = self.worker.stream if self.worker is not None else None
+        if self.fired_at is None and st is not None and st.sent >= self.after:
+            self.drv.sim.ddr_config(self.cfg)
+            self.fired_at = st.sent
+        return super().done()
+
+
+def test_axi_errors_during_a_live_read_are_warned_live_and_refuse_the_run(cosim_antq):
+    """A SLVERR on a bank's write response, and a DECERR on the beats of a live read, each raised while the run is
+    being read: the stream warns at its next poll (before the run is read whole) and the run is refused. A clean
+    streamed run afterwards certifies."""
+    drv, m = cosim_antq
+    n, period = 120, 600
+    progs = _live_progs(m, n)
+    rq.setup(drv, m, progs)
+    drv.sim.ddr_config(dict(b_delay=50, aw_stall=0.0, ar_stall=0.0, b_stall=0.0, tready_stall=0.0))
+    for base, knob, bit in ((0x400000, dict(bresp_next=2), "bresp_err"), (0x480000, dict(rresp_next=3), "rresp_err")):
+        ctl = _InjectAt(drv, m, progs, params={c: {"n": n, "period": period} for c in progs}, after=1024, cfg=knob)
+        reader, chunks, w, err = _stream_run(drv, m, progs, n, period, base, control=ctl)
+        assert ctl.fired_at is not None, f"{bit}: the fault was never injected"
+        assert err is not None and bit in str(err), f"{bit}: the run was not refused: {err}"
+        warn = [x for x in reader.warnings if x["what"] == bit]
+        assert warn and warn[0]["sent"] < 8 * 2 * n, f"{bit}: no live warning before the run was read: {reader.warnings}"
+        print(f"\n[S1] {bit} injected after {ctl.fired_at} B, warned at {warn[0]['sent']} B; refused: {err}")
+    drv.sim.ddr_config(dict(bresp_next=0, rresp_next=0))
+    reader, chunks, w, err = _stream_run(drv, m, progs, n, period, 0x500000)
+    assert err is None and reader.certificate["total"] == 2 * n
+
+
+def _latency(reader, chunks, ts_by_core, t_open_s):
+    """Per-word result-to-PS latency [batches]: landing time of the word's chunk minus the time the kernel saw the
+    result settle (`ts`, right after read_res). Also the bank-fill share: a full bank lands only after its 64th word."""
+    t_open_b = t_open_s / BATCH_S
+    words = np.concatenate([c.words for c in chunks])
+    land = np.concatenate([np.full(c.n, t_open_b + c.t / BATCH_S) for c in chunks])
+    tags = (words >> np.uint64(56)).astype(int)
+    prod = np.empty(len(words))
+    k = {c: 0 for c in ts_by_core}
+    for j, c in enumerate(tags):
+        prod[j] = ts_by_core[c][k[c]]
+        k[c] += 1
+    lat = land - prod
+    fill = np.zeros(len(words))
+    nfull = len(words) // 64 * 64
+    for b in range(0, nfull, 64):
+        fill[b:b + 64] = prod[b + 63] - prod[b:b + 64]      # waiting for the bank's 64th word
+    return lat, fill, nfull
+
+
+LATENCY_CASES = [
+    # (cores, shots per core, period in batches): 2 cores fill a bank every 32 shots, 1 core every 64. The first case
+    # ends with a partial bank of 16 words, which waits for FLUSH at the end of the run.
+    ((0, 1), 200, 400),
+    ((0, 1), 128, 1600),
+    ((0,), 192, 400),
+]
+
+
+@pytest.mark.parametrize("cores,n,period", LATENCY_CASES, ids=["2c-p400", "2c-p1600", "1c-p400"])
+def test_live_latency_follows_the_bank_fill_time(cosim_antq, cores, n, period):
+    """S1 latency: result-to-PS latency of every word of a live run, against the result rate. A full 512-B bank
+    is committed only after its 64th word, so a word waits for the bank to fill: up to 63 more results, i.e. 64 /
+    (cores x results per shot) shots. The words of the final partial bank wait for FLUSH at the end of the run.
+    What is left after the fill wait (commit + poll + DMA) is the uplink's and the stream's own overhead."""
+    drv, m = cosim_antq
+    progs = _live_progs(m, n, cores)
+    rq.setup(drv, m, progs)
+    drv.sim.ddr_config(dict(b_delay=20, aw_stall=0.0, ar_stall=0.0, b_stall=0.0, tready_stall=0.0))
+    reader, chunks, w, err = _stream_run(drv, m, progs, n, period, 0x600000 + 0x10000 * period // 400 + 0x8000 * len(cores))
+    assert err is None, err
+    res = reader.end["results"]
+    ts = {c: np.asarray(res[str(c)]["ts"], dtype=np.int64) for c in cores}
+    lat, fill, nfull = _latency(reader, chunks, ts, w.stream.t_open)
+    assert (lat > 0).all(), "a word landed before the kernel saw its result: the time bases disagree"
+    over = lat[:nfull] - fill[:nfull]
+    bank_shots = 64 / len(cores)
+    row = {"cores": len(cores), "period_batches": period, "shots_per_bank": bank_shots,
+           "bank_fill_batches": bank_shots * period, "words": len(lat), "full_bank_words": int(nfull),
+           "lat_mean": float(lat[:nfull].mean()), "lat_p50": float(np.median(lat[:nfull])),
+           "lat_max": float(lat[:nfull].max()), "fill_mean": float(fill[:nfull].mean()),
+           "overhead_mean": float(over.mean()), "overhead_max": float(over.max()),
+           "tail_words": int(len(lat) - nfull), "tail_lat_max": float(lat[nfull:].max()) if len(lat) > nfull else 0.0,
+           "tail_lat_min_after_done": float((chunks[-1].t - reader.end["stats"]["t_done"]) / BATCH_S)
+           if len(lat) > nfull else 0.0,
+           "t_done_batches": reader.end["stats"]["t_done"] / BATCH_S, "polls": reader.end["stats"]["polls"],
+           "chunks": len(chunks)}
+    out = Path(__file__).resolve().parents[1] / "build" / "c1live"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"latency_{len(cores)}c_p{period}.json").write_text(json.dumps(row, indent=1))
+    print(f"\n[S1-LAT] {json.dumps(row)}")
+    # the fill wait dominates: overhead (commit + poll + DMA) is bounded and does not grow with the period
+    assert row["overhead_max"] < 6000, row
+    assert row["lat_max"] <= row["bank_fill_batches"] + row["overhead_max"] + 1, row
+    if row["tail_words"]:                    # the partial final bank lands only after DONE and FLUSH
+        assert row["tail_lat_min_after_done"] >= 0, row

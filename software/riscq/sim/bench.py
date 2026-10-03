@@ -377,7 +377,8 @@ class DdrModel:
         self.bresp_next = 0
         self.rresp_next = 0
         self.stats = {"aw": 0, "ar": 0, "w": 0, "r": 0, "b": 0, "aw_stalled": 0, "ar_stalled": 0,
-                      "b_stalled": 0, "axis": 0, "axis_stalled": 0}
+                      "b_stalled": 0, "axis": 0, "axis_stalled": 0,
+                      "r_during_w": 0}     # qubic3 S1: R beats taken while a write burst was open (AW..B)
         self.dma = None                          # the armed S2MM transfer, or None (TREADY low)
         self._next_dma = 0
 
@@ -446,7 +447,10 @@ async def _ddr_slave(dut, dm: DdrModel) -> None:
             if last:
                 awq.popleft()
                 wbeat = 0
-                bq.append((cyc + dm.b_delay, bid, dm.bresp_next))
+                # the WLAST handshake itself happens at the coming rising edge, and AXI allows BVALID only after it:
+                # due at the earliest in the next cycle (qubic3 S1: with b_delay=0 the model raised BVALID in the
+                # same cycle, the writer, still in its W state, never saw the B, and the run hung)
+                bq.append((cyc + max(1, dm.b_delay), bid, dm.bresp_next))
                 dm.bresp_next = 0
         sig("w_ready").value = int(w_ready)
         # ── B: presented once due (and not stalled); once BVALID is up it stays up until the handshake
@@ -487,6 +491,8 @@ async def _ddr_slave(dut, dm: DdrModel) -> None:
             sig("r_valid").value = 1
             if _int_or_zero(sig("r_ready")):
                 dm.stats["r"] += 1
+                if awq or bq:                       # a live read overlapping a bank write
+                    dm.stats["r_during_w"] += 1
                 rcur = None if left == 1 else [addr + DDR_BEAT, left - 1, rid, resp]
         else:
             sig("r_valid").value = 0

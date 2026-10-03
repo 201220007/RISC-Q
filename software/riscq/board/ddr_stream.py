@@ -6,6 +6,7 @@ One `StreamWorker` runs one live-read run end to end, next to the MMIO, in its o
     control.start()                         the program runs (KernelControl: params, then the core reset released)
     loop:  stream.step()                    one poll of STATUS / CUR_ADDR, at most one chunk into PS memory;
                                             once caught up with the frontier, at most one poll per poll_s
+                                            (StreamWorker.POLL_S, 3 ms, by default)
            frames.put_data(chunk)           to the consumer, bounded (below)
            control.done() -> stop(), flush()     DONE ends the run: core reset back on, FLUSH, write_done
     stream.certificate                      every gate of drain() (riscq.ddr.DdrStream)
@@ -278,8 +279,16 @@ class StreamWorker(threading.Thread):
     OPTS = ("buffer_bytes", "max_chunk", "poll_s", "consumer_timeout_s", "run_timeout_s", "flush_timeout_s",
             "prepare_timeout_s", "results")
 
+    # The default poll period, from the board (qubic3 evidence/C1_LIVE/BOARD_REPORT.md, L4). On the A53 one iteration
+    # of the loop costs about 0.88 ms of CPU at the 10-us demand (11.2 MB/s), nearly all of it per chunk, not per
+    # byte: with 100 us the loop never waited and took 0.85 of a core. Once caught up the worker iterates once per
+    # period, so its load is about 0.88 ms / POLL_S: 0.29 at 3 ms, where 2 ms (0.44) would leave little margin under
+    # half a core. A chunk then carries about rate x 3 ms; a commit waits at most one period more to be read; a backlog
+    # is still read without waiting.
+    POLL_S = 3e-3
+
     def __init__(self, ro, wr_base, expected, control, *, lock=None, buffer_bytes=64 << 20, max_chunk=4 << 20,
-                 poll_s=100e-6, consumer_timeout_s=10.0, run_timeout_s=600.0, flush_timeout_s=5.0,
+                 poll_s=POLL_S, consumer_timeout_s=10.0, run_timeout_s=600.0, flush_timeout_s=5.0,
                  prepare_timeout_s=1.0, results=False, clock=time.monotonic, idle=time.sleep):
         super().__init__(name="ddr-stream", daemon=True)
         self.ro, self.wr_base, self.expected, self.control = ro, int(wr_base), dict(expected), control

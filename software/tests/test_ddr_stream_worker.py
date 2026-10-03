@@ -257,6 +257,55 @@ def test_once_caught_up_the_worker_polls_once_per_period():
     assert len(sizes) <= 16 and sizes[len(sizes) // 2] >= 16 * BANK, sizes
 
 
+# One unit of the fake's clock is 10 us. The 10-us demand (14 cores, 8 B per result every 10 us: 11.2 MB/s) is then 14
+# words per unit, and an iteration of the worker costs what the board measured (qubic3 BOARD_REPORT.md, L4: about
+# 0.82 ms per chunk plus 4.8 ns per byte, so 0.88 ms at the demand's 11.5-kB chunks): the fake's register accesses
+# take 7 units, the DONE read stands for the other 75, and the transfer takes 0.015 units per 32-B beat.
+UNIT_S = 10e-6
+
+
+class _BoardCost(FakeControl):
+    def done(self):
+        self.fake.tick(75)
+        return self.fake.done()
+
+
+@pytest.mark.parametrize("poll_s", [100e-6, 2e-3, 3e-3, None], ids=["100us", "2ms", "3ms", "default"])
+def test_the_poll_period_sets_the_workers_load_at_the_demand(poll_s):
+    """The C-port trigger's load criterion -- at most half a core at the 10-us demand -- on the fake's clock, with the
+    board's cost per iteration. At 100 us the period never applies, since an iteration takes longer: the loop runs
+    back to back with a chunk of ~10 kB each time, as on the board (0.85 of a core). With a period longer than an
+    iteration the worker reads once per period, so a chunk carries rate x period and the load falls as cost / period.
+    The default, StreamWorker.POLL_S, keeps the worker under half a core."""
+    period = StreamWorker.POLL_S if poll_s is None else poll_s
+    fake, ro, exp, words = _setup([35_000] * 4, rate=14.0, dma_units_per_beat=0.015)    # 0.1 s at the demand
+    waits = []
+
+    def idle(s):
+        waits.append(max(1, round(s / UNIT_S)))
+        fake.tick(waits[-1])
+    kw = {} if poll_s is None else {"poll_s": poll_s}
+    w = _worker(fake, ro, exp, control=_BoardCost(fake), run_timeout_s=1e9, clock=lambda: fake.t * UNIT_S,
+                idle=idle, **kw)
+    t0 = fake.t
+    w.start()
+    reader, chunks, err = _consume(w)
+    w.join(10)
+    assert err is None and reader.certificate["total"] == 140_000
+    span = fake.t - t0
+    load = 1 - sum(waits) / span
+    sizes = sorted(len(c.data) for c in chunks)
+    if period < 1e-3:
+        assert reader.end["stats"]["idle_polls"] == 0 and load == 1.0
+        assert 5_000 < sizes[len(sizes) // 2] < 20_000, sizes
+    else:
+        per = period / UNIT_S
+        assert abs(len(chunks) - span / per) <= 0.15 * span / per + 2, (len(chunks), span / per)
+        assert abs(sizes[len(sizes) // 2] - 14 * 8 * per) <= 0.2 * 14 * 8 * per, sizes
+        assert load == pytest.approx((82 + 14 * 8 * per / 32 * 0.015) / per, rel=0.1)
+        assert load <= 0.5
+
+
 def test_the_programs_end_is_bracketed_even_behind_a_long_chunk_transfer():
     """L4's DONE->END must not hide a backlog behind a late observation of DONE. The worker records the start of the
     last DONE read that still saw the program running (t_still_running) and the end of the first that saw it done

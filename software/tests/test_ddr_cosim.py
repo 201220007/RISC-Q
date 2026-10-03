@@ -401,25 +401,30 @@ def _latency(reader, chunks, ts_by_core, t_open_s):
 
 
 LATENCY_CASES = [
-    # (cores, shots per core, period in batches): 2 cores fill a bank every 32 shots, 1 core every 64. The first case
-    # ends with a partial bank of 16 words, which waits for FLUSH at the end of the run.
-    ((0, 1), 200, 400),
-    ((0, 1), 128, 1600),
-    ((0,), 192, 400),
+    # (cores, shots per core, period in batches, poll period in batches): 2 cores fill a bank every 32 shots, 1 core
+    # every 64. The first case ends with a partial bank of 16 words, which waits for FLUSH at the end of the run.
+    ((0, 1), 200, 400, 100),
+    ((0, 1), 128, 1600, 100),
+    ((0,), 192, 400, 100),
+    # the board's default regime: StreamWorker.POLL_S (3 ms) spans ~65 bank fills at the 10-us demand. Here the poll
+    # period spans 2.5 bank fills (32 000 batches, 64 us), so a commit waits up to one period for the next poll
+    ((0, 1), 400, 400, 32_000),
 ]
 
 
-@pytest.mark.parametrize("cores,n,period", LATENCY_CASES, ids=["2c-p400", "2c-p1600", "1c-p400"])
-def test_live_latency_follows_the_bank_fill_time(cosim_antq, cores, n, period):
+@pytest.mark.parametrize("cores,n,period,poll", LATENCY_CASES, ids=["2c-p400", "2c-p1600", "1c-p400", "2c-p400-poll32k"])
+def test_live_latency_follows_the_bank_fill_time(cosim_antq, cores, n, period, poll):
     """S1 latency: result-to-PS latency of every word of a live run, against the result rate. A full 512-B bank
     is committed only after its 64th word, so a word waits for the bank to fill: up to 63 more results, i.e. 64 /
     (cores x results per shot) shots. The words of the final partial bank wait for FLUSH at the end of the run.
-    What is left after the fill wait (commit + poll + DMA) is the uplink's and the stream's own overhead."""
+    What is left after the fill wait (commit + poll + DMA) is the uplink's and the stream's own overhead; a poll
+    period longer than a bank fill adds at most one period to it, and the worker then reads about once per period."""
     drv, m = cosim_antq
     progs = _live_progs(m, n, cores)
     rq.setup(drv, m, progs)
     drv.sim.ddr_config(dict(b_delay=20, aw_stall=0.0, ar_stall=0.0, b_stall=0.0, tready_stall=0.0))
-    reader, chunks, w, err = _stream_run(drv, m, progs, n, period, 0x600000 + 0x10000 * period // 400 + 0x8000 * len(cores))
+    base = 0x600000 + 0x10000 * period // 400 + 0x8000 * len(cores) + (0x100000 if poll != 100 else 0)
+    reader, chunks, w, err = _stream_run(drv, m, progs, n, period, base, poll_batches=poll)
     assert err is None, err
     res = reader.end["results"]
     ts = {c: np.asarray(res[str(c)]["ts"], dtype=np.int64) for c in cores}
@@ -436,13 +441,17 @@ def test_live_latency_follows_the_bank_fill_time(cosim_antq, cores, n, period):
            "tail_lat_min_after_done": float((chunks[-1].t - reader.end["stats"]["t_done"]) / BATCH_S)
            if len(lat) > nfull else 0.0,
            "t_done_batches": reader.end["stats"]["t_done"] / BATCH_S, "polls": reader.end["stats"]["polls"],
-           "chunks": len(chunks)}
+           "chunks": len(chunks), "poll_batches": poll}
     out = Path(__file__).resolve().parents[1] / "build" / "c1live"
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"latency_{len(cores)}c_p{period}.json").write_text(json.dumps(row, indent=1))
+    tag = "" if poll == 100 else f"_poll{poll}"
+    (out / f"latency_{len(cores)}c_p{period}{tag}.json").write_text(json.dumps(row, indent=1))
     print(f"\n[S1-LAT] {json.dumps(row)}")
-    # the fill wait dominates: overhead (commit + poll + DMA) is bounded and does not grow with the period
-    assert row["overhead_max"] < 6000, row
+    # the fill wait dominates: overhead (commit + poll + DMA) is bounded and does not grow with the period; a long
+    # poll period adds at most itself, and the worker then reads about once per period
+    assert row["overhead_max"] < 6000 + (poll if poll != 100 else 0), row
+    if poll != 100:
+        assert row["chunks"] <= n * period / poll + 3, row
     assert row["lat_max"] <= row["bank_fill_batches"] + row["overhead_max"] + 1, row
     if row["tail_words"]:                    # the partial final bank lands only after DONE and FLUSH
         assert row["tail_lat_min_after_done"] >= 0, row

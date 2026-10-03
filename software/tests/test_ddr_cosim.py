@@ -323,15 +323,21 @@ def test_runs_streamed_live_are_exact_and_certified(cosim_antq):
             cpu = np.asarray(res[str(c)]["out"], dtype=np.int64)[:3 * n].reshape(n, 3)
             assert np.array_equal(got[c][0], _trunc28(cpu[:, 1])), f"run {r + 1} core {c}: real differs"
             assert np.array_equal(got[c][1], _trunc28(cpu[:, 2])), f"run {r + 1} core {c}: imag differs"
-        live = [c for c in chunks if c.t < st["t_done"]]
-        assert len(live) >= 3 and st["bytes_before_done"] >= 3 * 512, f"run {r + 1}: not live: {st}"
+        # independent completion witness: the kernels' own timestamps. A chunk is early if it was in PS memory
+        # before the FIRST core's last result had even settled (ts[n-1], taken right after read_res)
+        t_last = min(int(res[str(c)]["ts"][n - 1]) for c in (0, 1))
+        t_open_b = w.stream.t_open / BATCH_S
+        live = [c for c in chunks if t_open_b + c.t / BATCH_S < t_last]
+        assert len(live) >= 3, f"run {r + 1}: only {len(live)} chunks landed before the last results: {st}"
+        assert st["bytes_before_done"] > 0, f"run {r + 1}: the worker's own (conservative) count saw nothing early"
         if run.get("overlap"):
             assert delta["r_during_w"] > 0, f"run {r + 1}: no R beat while a bank write was open: {delta}"
         post = DdrReadout(CosimDdr(drv), soc_map=m).drain(run["base"], {0: n, 1: n})
         for c in (0, 1):
             assert np.array_equal(post[c][0], got[c][0]) and np.array_equal(post[c][1], got[c][1])
-        print(f"\n[S1] live run {r + 1} at {run['base']:#x}: {len(chunks)} chunks, {len(live)} before DONE "
-              f"({st['bytes_before_done']} of {8 * 2 * n} B), {delta['r_during_w']} R beats during bank writes, "
+        print(f"\n[S1] live run {r + 1} at {run['base']:#x}: {len(chunks)} chunks, {len(live)} landed before the "
+              f"kernels' last results (worker's DONE-sampled count {st['bytes_before_done']} of {8 * 2 * n} B), "
+              f"{delta['r_during_w']} R beats during bank writes, "
               f"polls {st['polls']}, certified; model traffic {delta}")
         if r == 1:
             assert delta["aw_stalled"] > 0 and delta["b_stalled"] > 0 and delta["axis_stalled"] > 0, delta

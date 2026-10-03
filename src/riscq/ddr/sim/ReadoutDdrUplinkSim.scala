@@ -50,6 +50,7 @@ object ReadoutDdrUplinkSim extends App {
           dut.io.results(i).payload.real #= 0; dut.io.results(i).payload.imag #= 0 }
         dut.io.rd.ready #= true
         dut.io.wStall #= false
+        dut.io.rStall #= false; dut.io.bErr #= false; dut.io.rErr #= false
         val stalls = new StallInjector(dut, ddrCd, if (STALLS) StallProfile.heavy else StallProfile.none, seed)
         curStalls = stalls
         val mem = AxiMemorySim(dut.io.ddr, ddrCd, AxiMemorySimConfig(
@@ -152,7 +153,7 @@ object ReadoutDdrUplinkSim extends App {
     /** Drain THROUGH the real path: program rd_base/rd_size, pulse rd_start, collect the AXIS stream
      *  until TLAST (never trusting `rd_done` — see VENDORED.md non-conformance 2), with random tready
      *  backpressure. Returns the 64-bit words in stream order. */
-    def drainViaMmu(base: Long, nBytes: Int, stall: Boolean = true): Seq[BigInt] = {
+    def drainViaMmu(base: Long, nBytes: Int, stall: Boolean = true, ready: () => Boolean = null): Seq[BigInt] = {
       require(nBytes % 32 == 0 && nBytes >= 32, s"drain size $nBytes must be a positive multiple of 32")
       wr(RD_BASE, BigInt(base)); wr(RD_SIZE, BigInt(nBytes))
       val beats = scala.collection.mutable.ArrayBuffer[BigInt]()
@@ -160,7 +161,7 @@ object ReadoutDdrUplinkSim extends App {
       val sink = fork {
         var guard = 0
         while (!sawLast && guard < 400000) {
-          dut.io.rd.ready #= (!stall || rng.nextInt(4) != 0)
+          dut.io.rd.ready #= (if (ready != null) ready() else (!stall || rng.nextInt(4) != 0))
           ddrCd.waitSampling()
           if (dut.io.rd.valid.toBoolean && dut.io.rd.ready.toBoolean) {
             beats += dut.io.rd.fragment.toBigInt
@@ -172,7 +173,7 @@ object ReadoutDdrUplinkSim extends App {
       }
       wr(RD_START, BigInt(1))
       var n = 0
-      while (!sawLast && n < 20000) { ddrCd.waitSampling(10); n += 1 }
+      while (!sawLast && n < 200000) { ddrCd.waitSampling(10); n += 1 }
       sink.join()
       assert(sawLast, s"AXIS TLAST never arrived draining $nBytes B from 0x${java.lang.Long.toHexString(base)}")
       assert(beats.size == nBytes / 32, s"got ${beats.size} beats, expected ${nBytes / 32}")
@@ -903,6 +904,316 @@ object ReadoutDdrUplinkSim extends App {
     assert(busyAtSecond, "the injector was already idle at the second write — the test would be vacuous")
     assert(refused, "a second INJ_FIRE while busy must set err_inj_busy")
     assert(hits == 1, s"the injected payload landed $hits times; a refused fire must produce NOTHING extra")
+  }
+
+  // ───────────────── qubic3 S1: live reads while the writer runs ─────────────────
+  /** What the AXI bus shows during a live read: B handshakes (each bank is one burst at a 512-B-aligned base, so
+   *  the writer may claim `512 * bCount` bytes at most), R beats accepted while a write burst is open (AW taken, B
+   *  not yet: the reader really ran while banks were being written) and in the same cycle as a W beat. */
+  class LiveBus(dut: ReadoutDdrUplinkDut, cd: ClockDomain) {
+    var bCount = 0L; var rDuringW = 0L; var rwSameCycle = 0L; var wOpen = 0; var rBeats = 0L
+    var awCount = 0L; var wBeats = 0L; var openCycles = 0L; var cycles = 0L; var inR = false
+    val timeline = mutable.ArrayBuffer[String]()
+    def ev(what: String): Unit = if (timeline.size < 60) timeline += s"$cycles:$what"
+    private val d = dut.up.io.ddr
+    private val mon = fork {
+      while (true) {
+        cd.waitSampling()
+        cycles += 1
+        val aw = d.aw.valid.toBoolean && d.aw.ready.toBoolean
+        val w = d.w.valid.toBoolean && d.w.ready.toBoolean
+        val b = d.b.valid.toBoolean && d.b.ready.toBoolean
+        val r = d.r.valid.toBoolean && d.r.ready.toBoolean
+        if (aw) { wOpen += 1; awCount += 1; ev("AW") }
+        if (w) wBeats += 1
+        if (wOpen > 0) openCycles += 1
+        if (r) { rBeats += 1; if (wOpen > 0) rDuringW += 1; if (w) rwSameCycle += 1; if (!inR) { inR = true; ev("R0") } }
+        else if (inR && !d.r.valid.toBoolean) { inR = false; ev("R1") }
+        if (d.ar.valid.toBoolean && d.ar.ready.toBoolean) ev("AR")
+        if (b) { bCount += 1; wOpen -= 1; ev("B") }
+      }
+    }
+    def stop(): Unit = mon.terminate()
+    def summary: String = s"bus: $cycles cycles, AW $awCount, W $wBeats, B $bCount, R $rBeats, write burst open " +
+                          s"$openCycles cycles, R inside open writes $rDuringW, R with W in the same cycle $rwSameCycle"
+  }
+
+  /** The PS side of the live read, as `software/riscq/ddr.py::DdrStream` does it. It keeps the largest
+   *  CUR_ADDR - base it has seen (the writer parks CUR_ADDR at the base on the final bank), reads only
+   *  [sent, committed) through the drain engine (the AXIS sink, armed before RD_START, stands for the S2MM DMA;
+   *  completion is TLAST, never rd_done) in whole banks up to `chunkMax`, and after write_done reads the tail to
+   *  FINAL_ADDR. Every CUR_ADDR it samples must be a bank boundary that the B responses already cover. */
+  class LivePs(h: Helper, bus: LiveBus, base: Long, footprint: Long, chunkMax: Long,
+               ready: () => Boolean = null, chunkPick: () => Long = null) {
+    var sent = 0L; var committed = 0L; var finalB = -1L; var parkSeen = false; var frontierAtEnd = 0L
+    var statusSeen = BigInt(0); var curSamples = 0; var reads = 0; var readsLive = 0
+    val words = mutable.ArrayBuffer[BigInt]()
+    def poll(): Unit = {
+      val s = h.status(); statusSeen |= s
+      if (finalB >= 0) return
+      if (h.bit(s, S_WRITE_DONE)) {
+        finalB = (h.rd(FINAL_ADDR) - base).toLong
+        assert(finalB >= committed && finalB % 32 == 0, s"final_addr - base = $finalB below the frontier $committed")
+        if ((h.rd(CUR_ADDR) - base).toLong == 0) parkSeen = true
+        frontierAtEnd = committed
+        committed = finalB
+      } else {
+        val cur = h.rd(CUR_ADDR).toLong; curSamples += 1
+        val rel = cur - base
+        if (rel == 0) { if (committed > 0) parkSeen = true }
+        else {
+          assert(rel > 0 && rel % 512 == 0 && rel >= committed && rel <= footprint,
+            f"CUR_ADDR 0x$cur%x is not a bank boundary in [committed $committed, footprint $footprint] above 0x$base%x")
+          assert(rel <= 512L * bus.bCount, s"CUR_ADDR claims $rel B but only ${bus.bCount} write bursts completed")
+          committed = rel
+        }
+      }
+    }
+    def readChunk(): Boolean = {
+      val lim = if (chunkPick != null) chunkPick() else chunkMax
+      val n = scala.math.min(committed - sent, lim)
+      if (n <= 0) return false
+      words ++= h.drainViaMmu(base + sent, n.toInt, ready = ready)
+      sent += n; reads += 1; if (finalB < 0) readsLive += 1
+      true
+    }
+    def done: Boolean = finalB >= 0 && sent >= finalB
+    /** Poll and read until the run is read whole; `flushWhen` says when the program is over (then FLUSH once). */
+    def loop(flushWhen: () => Boolean, idle: Int = 8): Unit = {
+      var flushed = false; var guard = 0
+      while (!done && guard < 400000) {
+        poll()
+        if (!readChunk()) h.ddrCd.waitSampling(idle)
+        if (!flushed && flushWhen()) { h.wr(FLUSH, BigInt(1)); flushed = true }
+        guard += 1
+      }
+      assert(done, s"the live read never finished: sent=$sent committed=$committed final=$finalB")
+    }
+  }
+
+  /** The run as `drain()` certifies it, applied to what the live read collected: the words read live are the DDR
+   *  image, word for word, and every core's words are its offers in order. */
+  def checkLive(h: Helper, ps: LivePs, base: Long, exp: Map[Int, Seq[(Int, Int)]], what: String): Unit = {
+    val s = h.status()
+    val S = exp.values.map(_.size).sum
+    for (i <- 0 until h.nch) assert(h.accepted(i) == exp.getOrElse(i, Nil).size, s"$what: core $i accepted")
+    for (i <- 0 until h.nch) assert(h.rejected(i) == 0, s"$what: core $i rejected")
+    val fatal = Seq(S_BRESP_ERR, S_RRESP_ERR, S_WRAPPED, S_OVF_ANY, S_CROSS_DROPPED, S_EARLY_LATE, S_ERR_BADSIZE,
+      S_ERR_BADBASE, S_ERR_FLUSH_TIMEOUT, S_ERR_START_DROPPED, S_ERR_FLUSH_DROPPED, S_SKID_OVF, S_ERR_INJ_RANGE)
+    for (b <- fatal) assert(!h.bit(s | ps.statusSeen, b), f"$what: fatal bit $b seen: 0x${s | ps.statusSeen}%x")
+    assert(h.bit(s, S_WRITE_DONE), s"$what: write_done")
+    assert(ps.finalB == 32L * ((S + 3) / 4), s"$what: final_addr - base = ${ps.finalB} for $S words")
+    val got = ps.words.take(S)
+    assert(ps.words.size - S >= 0 && ps.words.size - S <= 3, s"$what: ${ps.words.size} words read for $S")
+    val mem = h.ddrWords(base, S)
+    for (k <- 0 until S) assert(got(k) == mem(k), f"$what: live word $k 0x${got(k)}%x != DDR 0x${mem(k)}%x")
+    val perTag = got.groupBy(w => ((w >> 56) & 0xff).toInt)
+    for (i <- 0 until h.nch) {
+      val e = exp.getOrElse(i, Nil).map { case (r, im) => tagWord(i, r, im) }
+      assert(perTag.getOrElse(i, Nil).toSeq == e, s"$what: core $i's words differ from its offers")
+    }
+    assert(perTag.keySet.subsetOf((0 until h.nch).toSet), s"$what: stray tags ${perTag.keySet}")
+  }
+
+  /** Results on all `nch` cores, one per core per round, `gap` dsp cycles apart; returns the offers per core. */
+  def produce(h: Helper, rounds: Int, gap: Int, salt: Int): mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]] = {
+    val exp = mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]]()
+    for (round <- 0 until rounds) {
+      val vals = (0 until h.nch).map(i => i -> ((0x100000 * salt + 0x100 * round + 16 * i) & 0x7fffffff,
+                                                 (0x3000000 + 0x100 * round + i) & 0x7fffffff)).toMap
+      h.resultAll(0 until h.nch, vals, holdCycles = 2, gapCycles = gap)
+      for (i <- 0 until h.nch) exp.getOrElseUpdate(i, mutable.ArrayBuffer()) += vals(i)
+    }
+    exp
+  }
+  def frozen(e: mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]]): Map[Int, Seq[(Int, Int)]] =
+    e.map { case (k, v) => k -> v.toSeq }.toMap
+  def footprintOf(words: Int): Long = ((8L * words + 511) / 512) * 512
+
+  /** 18. S1 live frontier: 300 rounds on 4 cores (1200 words, 18 full banks and a 48-word tail), a bank every ~128
+   *  DDR cycles into a memory that answers a write after 80 (so a write burst is open most of the time). The PS polls
+   *  every ~200 cycles and reads what is committed in chunks of 1 to 8 banks -- reads longer than the drain engine's
+   *  16-beat FIFO, behind a slow DMA, so they span the following banks' writes. Exact words, and the reader really
+   *  ran while write bursts were open. (A one-bank read issued right after its B fits the FIFO in ~20 cycles and
+   *  can finish before the next AW: AxiMemorySim answers reads at once.) */
+  run("live_frontier", 19, memDelay = 80) { (dut, h) =>
+    h.startRun()
+    val bus = new LiveBus(dut, h.ddrCd)
+    var prodDone = false
+    var exp: mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]] = null
+    val prod = fork { exp = produce(h, 300, 6, 1); prodDone = true }
+    val ps = new LivePs(h, bus, BASE0, footprintOf(1200), 4096, ready = () => h.rng.nextInt(4) == 0,
+                        chunkPick = () => 512L * (1 + h.rng.nextInt(8)))
+    ps.loop(() => prodDone, idle = 200)
+    prod.join(); bus.stop()
+    checkLive(h, ps, BASE0, frozen(exp), "live_frontier")
+    println(s"[G2] live_frontier: ${ps.reads} reads (${ps.readsLive} before write_done), ${ps.curSamples} CUR_ADDR " +
+            s"samples; ${bus.summary}")
+    assert(ps.readsLive >= 8, s"only ${ps.readsLive} reads before write_done: the read was not live")
+    assert(bus.rDuringW > 0, "no R beat was accepted while a write burst was open: reads and writes never overlapped")
+  }
+
+  /** 19. S1 frontier race, 14 channels (the production poller): every bank is read the moment CUR_ADDR moves past it
+   *  (one bank per read, the PS polls without pause), while the next bank is already being written. A bank fills every
+   *  ~240 DDR cycles and the memory answers a write after 190, so the writer is busy ~90 % of the time: the next
+   *  bank's AW follows a bank's B within a few dozen cycles, while the PS is reading the bank that B committed. */
+  run("live_frontier_race_14ch", 20, nch = 14, memDelay = 190) { (dut, h) =>
+    h.startRun()
+    val bus = new LiveBus(dut, h.ddrCd)
+    var prodDone = false
+    var exp: mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]] = null
+    val prod = fork { exp = produce(h, 64, 3 * 14 + 4, 2); prodDone = true }       // 896 words, 14 banks
+    val ps = new LivePs(h, bus, BASE0, footprintOf(896), 512, ready = () => h.rng.nextInt(8) == 0)
+    ps.loop(() => prodDone, idle = 1)
+    prod.join(); bus.stop()
+    checkLive(h, ps, BASE0, frozen(exp), "live_frontier_race_14ch")
+    println(s"[G2] live_frontier_race_14ch: ${ps.reads} one-bank reads (${ps.readsLive} live); ${bus.summary}")
+    assert(ps.readsLive >= 10 && bus.rDuringW > 0, "the race was not exercised")
+  }
+
+  /** 20. S1 park and small tails: runs of 0..200 words, each read live; the frontier must survive the park
+   *  (CUR_ADDR back at the base), and the tail comes from FINAL_ADDR with 0..3 pad lanes. */
+  run("live_park_small_tails", 21) { (dut, h) =>
+    var base = BASE0
+    for ((n, k) <- Seq(0, 1, 3, 5, 63, 64, 65, 127, 128, 129, 200).zipWithIndex) {
+      h.startRun(base)
+      val bus = new LiveBus(dut, h.ddrCd)
+      var prodDone = false
+      val exp = mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]]()
+      val prod = fork {
+        for (j <- 0 until n) {
+          val i = j % NCH; val v = (0x200000 * (k + 1) + 16 * j + i, 0x5000000 + 16 * j + i)
+          h.result(i, v._1, v._2); exp.getOrElseUpdate(i, mutable.ArrayBuffer()) += v
+        }
+        prodDone = true
+      }
+      val ps = new LivePs(h, bus, base, footprintOf(n), 1024)
+      ps.loop(() => prodDone)
+      prod.join(); bus.stop()
+      checkLive(h, ps, base, frozen(exp), s"live_park_small_tails n=$n")
+      assert(h.rd(CUR_ADDR) == base, "CUR_ADDR must be parked at the base after the run")
+      println(s"[G2] live_park_small_tails: $n words, final_addr - base = ${ps.finalB}, frontier before write_done " +
+              s"${ps.frontierAtEnd} B (tail ${ps.finalB - ps.frontierAtEnd} B), park seen by the PS = ${ps.parkSeen}")
+      base += 0x2000
+    }
+  }
+
+  /** 21. S1 DMA back-pressure: the AXIS sink is held off for long spans (the DMA not draining) while results keep
+   *  arriving at a slow memory; the writer must keep writing banks under a stalled read, and the read stays exact. */
+  run("live_dma_backpressure", 22, memDelay = 30) { (dut, h) =>
+    h.startRun()
+    val bus = new LiveBus(dut, h.ddrCd)
+    var prodDone = false
+    var exp: mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]] = null
+    var wDuringHold = 0L; var holding = false
+    val hold = fork {
+      while (true) { holding = true; h.ddrCd.waitSampling(300 + h.rng.nextInt(1500)); holding = false
+                     h.ddrCd.waitSampling(50 + h.rng.nextInt(200)) }
+    }
+    val wmon = fork {
+      while (true) { h.ddrCd.waitSampling()
+        if (holding && dut.up.io.ddr.w.valid.toBoolean && dut.up.io.ddr.w.ready.toBoolean) wDuringHold += 1 }
+    }
+    val prod = fork { exp = produce(h, 200, 20, 3); prodDone = true }
+    val ps = new LivePs(h, bus, BASE0, footprintOf(800), 2048, ready = () => !holding && h.rng.nextInt(3) != 0)
+    ps.loop(() => prodDone)
+    prod.join(); hold.terminate(); wmon.terminate(); bus.stop()
+    checkLive(h, ps, BASE0, frozen(exp), "live_dma_backpressure")
+    println(s"[G2] live_dma_backpressure: ${ps.readsLive} live reads, $wDuringHold W beats written while the DMA held " +
+            s"TREADY low, ${bus.rDuringW} R beats inside open write bursts")
+    assert(wDuringHold > 0, "no bank was written while the DMA back-pressured the read")
+  }
+
+  /** 22. S1 R-channel stalls on top of the bus stalls: the memory withholds R beats in random runs (the test wrapper
+   *  never withdraws a beat the uplink has seen), so live reads stretch across many write bursts. */
+  run("live_r_stall", 23) { (dut, h) =>
+    h.startRun()
+    val bus = new LiveBus(dut, h.ddrCd)
+    var rStalled = 0L
+    val rs = fork {
+      var on = false; var left = 0
+      while (true) {
+        h.ddrCd.waitSampling()
+        if (dut.io.rStall.toBoolean && dut.io.ddr.r.valid.toBoolean && !dut.up.io.ddr.r.valid.toBoolean) rStalled += 1
+        if (left == 0) { on = h.rng.nextInt(3) == 0; left = 1 + h.rng.nextInt(12) } else left -= 1
+        dut.io.rStall #= on
+      }
+    }
+    var prodDone = false
+    var exp: mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]] = null
+    val prod = fork { exp = produce(h, 250, 18, 4); prodDone = true }
+    val ps = new LivePs(h, bus, BASE0, footprintOf(1000), 4096)
+    ps.loop(() => prodDone)
+    prod.join(); rs.terminate(); dut.io.rStall #= false; bus.stop()
+    checkLive(h, ps, BASE0, frozen(exp), "live_r_stall")
+    println(s"[G2] live_r_stall: $rStalled R-stall cycles with a beat waiting, ${ps.readsLive} live reads, " +
+            s"${bus.rDuringW} R beats inside open write bursts")
+    assert(rStalled > 100, s"the R channel was barely stalled ($rStalled cycles)")
+  }
+
+  /** 23. S1 AXI error responses during a live read: a SLVERR on one write burst's B, then (next run) on one R beat of a
+   *  live read. Each raises its sticky while the run is live, the PS sees it at its next poll, and the run must not
+   *  certify. The words themselves still arrive (the beat is forwarded), and the next clean live run is exact. */
+  run("live_axi_errors", 24) { (dut, h) =>
+    for ((kind, k) <- Seq("B", "R").zipWithIndex) {
+      val base = BASE0 + 0x10000L * k
+      h.startRun(base)
+      val bus = new LiveBus(dut, h.ddrCd)
+      var prodDone = false
+      var exp: mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]] = null
+      var fired = false
+      val errFork = fork {
+        val d = dut.up.io.ddr
+        if (kind == "B") {
+          while (bus.bCount < 3) h.ddrCd.waitSampling()
+          dut.io.bErr #= true                                    // the next B (the uplink takes B at once)
+          var seenResp = -1
+          while (seenResp <= 0) {
+            h.ddrCd.waitSampling()
+            if (d.b.valid.toBoolean && d.b.ready.toBoolean) seenResp = d.b.resp.toInt
+          }
+          h.ddrCd.waitSampling(); dut.io.bErr #= false; fired = true
+        } else {
+          while (bus.rBeats < 40) h.ddrCd.waitSampling()
+          dut.io.rErr #= true                                    // the wrapper applies it to the next beat's first cycle
+          while (!(d.r.valid.toBoolean && d.r.ready.toBoolean && d.r.resp.toInt != 0)) h.ddrCd.waitSampling()
+          h.ddrCd.waitSampling(); dut.io.rErr #= false; fired = true
+        }
+      }
+      val prod = fork { exp = produce(h, 150, 18, 5 + k); prodDone = true }
+      val ps = new LivePs(h, bus, base, footprintOf(600), 1024)
+      var seenLiveAt = -1L
+      var guard = 0; var flushed = false
+      while (!ps.done && guard < 400000) {
+        ps.poll()
+        val bitNow = if (kind == "B") S_BRESP_ERR else S_RRESP_ERR
+        if (seenLiveAt < 0 && h.bit(ps.statusSeen, bitNow)) seenLiveAt = ps.sent
+        if (!ps.readChunk()) h.ddrCd.waitSampling(8)
+        if (!flushed && prodDone) { h.wr(FLUSH, BigInt(1)); flushed = true }
+        guard += 1
+      }
+      prod.join(); errFork.join(); bus.stop()
+      val bitWant = if (kind == "B") S_BRESP_ERR else S_RRESP_ERR
+      assert(fired && seenLiveAt >= 0, s"$kind: the error response was not seen by the live read")
+      assert(seenLiveAt < ps.finalB, s"$kind: the error was seen only after the run was read whole")
+      assert(h.bit(h.status(), bitWant), s"$kind: the sticky did not survive to the end of the run")
+      // the data still arrived: the live words are the DDR image
+      val S = exp.values.map(_.size).sum
+      val mem = h.ddrWords(base, S)
+      for (j <- 0 until S) assert(ps.words(j) == mem(j), s"$kind: live word $j differs from DDR")
+      println(s"[G2] live_axi_errors: SLVERR on $kind seen by the PS at byte $seenLiveAt of ${ps.finalB}; the run would " +
+              s"be refused (status 0x${h.status().toString(16)})")
+    }
+    // and a clean live run afterwards
+    h.startRun(BASE0 + 0x40000L)
+    val bus = new LiveBus(dut, h.ddrCd)
+    var prodDone = false
+    var exp: mutable.Map[Int, mutable.ArrayBuffer[(Int, Int)]] = null
+    val prod = fork { exp = produce(h, 100, 18, 9); prodDone = true }
+    val ps = new LivePs(h, bus, BASE0 + 0x40000L, footprintOf(400), 1024)
+    ps.loop(() => prodDone)
+    prod.join(); bus.stop()
+    checkLive(h, ps, BASE0 + 0x40000L, frozen(exp), "live_axi_errors (clean run after)")
   }
 
   if (STALLS) {

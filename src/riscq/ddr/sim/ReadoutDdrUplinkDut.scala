@@ -32,6 +32,13 @@ case class ReadoutDdrUplinkDut(p: ReadoutDdrUplinkParams) extends Component {
     val awStall = in Bool()
     val arStall = in Bool()
     val bStall  = in Bool()
+    // qubic3 S1 (test only): R stalls (VALID towards the uplink and READY towards the memory held low) and error
+    // responses (`bErr` / `rErr` replace the response towards the uplink with SLVERR). A beat the uplink has seen and
+    // not yet taken is never withdrawn or changed (AXI A3.2.1): the R gates act only on a beat's first cycle.
+    // Undriven = 0 = pass-through.
+    val rStall  = in Bool()
+    val bErr    = in Bool()
+    val rErr    = in Bool()
   }
   noIoPrefix()
   val dspCd = ClockDomain(io.dspClk, io.dspRst)
@@ -64,9 +71,18 @@ case class ReadoutDdrUplinkDut(p: ReadoutDdrUplinkParams) extends Component {
   io.ddr.ar.valid    := up.io.ddr.ar.valid && !io.arStall
   up.io.ddr.ar.ready := io.ddr.ar.ready && !io.arStall
   up.io.ddr.b.payload := io.ddr.b.payload
+  when(io.bErr)(up.io.ddr.b.payload.resp := B"10")
   up.io.ddr.b.valid   := io.ddr.b.valid && !io.bStall
   io.ddr.b.ready      := up.io.ddr.b.ready && !io.bStall
-  up.io.ddr.r << io.ddr.r
+  val rWait    = ddrCd(RegNext(up.io.ddr.r.valid && !up.io.ddr.r.ready) init (False))   // a beat shown, not taken
+  val rErrShown = Bool()
+  val rErrHold = ddrCd(RegNext(rErrShown) init (False))
+  rErrShown := Mux(rWait, rErrHold, io.rErr)
+  val rGate    = io.rStall && !rWait
+  up.io.ddr.r.payload := io.ddr.r.payload
+  when(rErrShown)(up.io.ddr.r.payload.resp := B"10")
+  up.io.ddr.r.valid   := io.ddr.r.valid && !rGate
+  io.ddr.r.ready      := up.io.ddr.r.ready && !rGate
   io.ddr.w.payload  := up.io.ddr.w.payload
   io.ddr.w.valid    := up.io.ddr.w.valid && !io.wStall
   up.io.ddr.w.ready := io.ddr.w.ready && !io.wStall

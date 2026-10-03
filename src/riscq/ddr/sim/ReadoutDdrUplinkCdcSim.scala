@@ -68,6 +68,7 @@ object ReadoutDdrUplinkCdcSim extends App {
       dut.io.results(i).payload.real #= 0; dut.io.results(i).payload.imag #= 0 }
     dut.io.rd.ready #= true
     dut.io.wStall #= false
+    dut.io.rStall #= false; dut.io.bErr #= false; dut.io.rErr #= false
     val stalls = new StallInjector(dut, ddrCd, if (STALLS) StallProfile.addrB else StallProfile.none, rng.nextLong())
     var mons: Seq[ValidReadyMonitor] = Nil
     val axi = mutable.ArrayBuffer[AxiEvent]()
@@ -725,6 +726,99 @@ object ReadoutDdrUplinkCdcSim extends App {
     b.stalls.enabled = STALLS
     fullRun(b, base + 0x20000L, 70, 80)
   }
+
+  // ── qubic3 S1: resets while a LIVE read is in flight ──
+  /** A run read live, as ddr.py's DdrStream does it (max-held CUR_ADDR frontier, [sent, committed) through the drain
+   *  engine while results keep arriving, the tail to FINAL_ADDR after write_done), then the full contract (checkRun:
+   *  counts, words per core, the exact AW plan, quiescence) and the live words against the DDR image. */
+  def liveRun(b: Bench, base: Long, n: Int, salt: Int): Int = {
+    val t0 = b.now
+    b.startRun(base)
+    var prodDone = false
+    var exp: Map[Int, Seq[(Int, Int)]] = null
+    val prod = fork { exp = b.push(n, salt); prodDone = true }
+    var sent = 0L; var committed = 0L; var finalB = -1L; var flushed = false; var live = 0
+    val words = mutable.ArrayBuffer[BigInt]()
+    var guard = 0
+    while (!(finalB >= 0 && sent >= finalB) && guard < 200000) {
+      val s = b.status()
+      if (finalB < 0) {
+        if (b.bit(s, S_WRITE_DONE)) { finalB = b.rd(FINAL_ADDR).toLong - base; assert(finalB >= committed); committed = finalB }
+        else {
+          val rel = b.rd(CUR_ADDR).toLong - base
+          if (rel != 0) { assert(rel > 0 && rel % 512 == 0 && rel >= committed, s"CUR_ADDR at +$rel"); committed = rel }
+        }
+      }
+      val k = scala.math.min(committed - sent, 1024L)
+      if (k > 0) { words ++= b.drain(base + sent, k.toInt); sent += k; if (finalB < 0) live += 1 }
+      else b.ddrCd.waitSampling(8)
+      if (!flushed && prodDone) { b.wr(FLUSH, BigInt(1)); flushed = true }
+      guard += 1
+    }
+    prod.join()
+    var m = 0
+    while (b.bit(b.status(), S_FLUSH_BUSY) && m < 20000) { b.ddrCd.waitSampling(20); m += 1 }
+    b.checkRun(base, exp, b.status(), t0)
+    assert(words.take(n) == b.ddrWords(base, n), "the live words differ from the DDR image")
+    live
+  }
+
+  /** A lone DSP reset, or a raw DDR reset, while a live read of the committed banks is in flight (the AXIS sink is
+   *  held off) and the writer is still writing. DSP: a 1 KiB read, so R beats are still owed on the bus; the reset
+   *  hold lets the burst complete and discards its beats before the DDR half resets. DDR: a 256-B read whose beats
+   *  all sit in the engine's FIFO (on the board the fabric reset clears the bus with the uplink; this memory model
+   *  cannot be reset, so no R may be owed to it, and the B it still owes is delivered, as in reset_ddr_mid_run).
+   *  Either way the chunk never reaches TLAST -- the PS sees a DMA timeout, and ddr.py a run that ended without
+   *  write_done --, nothing of the run survives, and the next run, read live, is exact. */
+  def liveResetMidDrain(b: Bench, dsp: Boolean): Unit = {
+    normalStart(b)
+    val base = 0x200000L
+    b.startRun(base)
+    val prod = fork { b.push(260, 90) }
+    var n = 0
+    while ((b.rd(CUR_ADDR).toLong - base) < 1024 && n < 100000) { b.ddrCd.waitSampling(10); n += 1 }
+    assert(b.rd(CUR_ADDR).toLong - base >= 1024, "two banks were never committed")
+    b.dut.io.rd.ready #= false                             // the DMA does not drain: R beats stay owed
+    val ar0 = b.nAr; val rl0 = b.nRlast
+    b.wr(RD_BASE, BigInt(base)); b.wr(RD_SIZE, BigInt(if (dsp) 1024 else 256)); b.wr(RD_START, BigInt(1))
+    var m = 0
+    while (!(b.nAr > ar0 && b.events("R").nonEmpty) && m < 10000) { b.ddrCd.waitSampling(); m += 1 }
+    b.ddrCd.waitSampling(150)                            // the engine's FIFO fills (DSP case: RREADY drops)
+    if (!dsp) assert(b.nRlast == b.nAr, "the 256-B read must sit whole in the engine's FIFO before a DDR reset")
+    val wOpenAtReset = if (b.wOpen) 1 else 0; val rOwed = b.nAr - b.nRlast
+    val t0 = b.now
+    var axisAfter = 0L
+    val axisMon = fork { while (true) { b.ddrCd.waitSampling()
+      if (b.dut.io.rd.valid.toBoolean && b.dut.io.rd.ready.toBoolean) axisAfter += 1 } }
+    if (dsp) { b.dut.io.dspRst #= true; b.waitNs(160); b.dut.io.dspRst #= false }
+    else     { b.dut.io.ddrRst #= true; b.waitNs(240); b.dut.io.ddrRst #= false }
+    if (dsp) {
+      var k = 0
+      while (b.applyEvents.isEmpty && k < 40000) { b.ddrCd.waitSampling(); k += 1 }
+      assert(b.applyEvents.size == 1 && b.applyEvents.head._2 == 0 && b.applyEvents.head._3 == 0 && !b.applyEvents.head._4,
+        s"the DDR half reset with a transaction outstanding: ${b.applyEvents}")
+      assert(b.nRlast == b.nAr, "the live read burst was not completed on the bus before the reset")
+    } else {
+      var k = 0
+      while (b.wOpen && k < 20000) { b.ddrCd.waitSampling(); k += 1 }
+    }
+    b.ddrCd.waitSampling(40)
+    b.dut.io.rd.ready #= true                              // the DMA drains again: nothing of the chunk may come out
+    b.ddrCd.waitSampling(2000)
+    axisMon.terminate()
+    prod.join()
+    val s = b.status()
+    println(s"[P3a-CDC] live_reset_${if (dsp) "dsp" else "ddr"}_mid_drain: reset with $rOwed read burst(s) owed and " +
+            s"$wOpenAtReset write burst(s) open; AXIS beats after the reset: $axisAfter; status 0x${s.toString(16)}")
+    assert(axisAfter == 0, s"$axisAfter AXIS beats of the aborted chunk came out after the reset")
+    assert(!b.bit(s, S_RUN_ACTIVE) && !b.bit(s, S_WRITE_DONE) && !b.bit(s, S_AXI_RST_FAULT), f"the run survived: 0x$s%x")
+    val d = b.rd(DIAG)
+    assert(((d >> 1) & 1) == 1 && ((d >> 7) & 1) == 1, f"not quiescent after the reset: diag=0x$d%x")
+    val live = liveRun(b, 0x300000L, 330, 91)
+    assert(live >= 2, s"the run after the reset was not read live ($live reads before write_done)")
+  }
+  run("live_reset_dsp_mid_drain", 17) { b => liveResetMidDrain(b, dsp = true) }
+  run("live_reset_ddr_mid_drain", 18) { b => liveResetMidDrain(b, dsp = false) }
 
   if (STALLS) {
     println(s"[P3a-CDC] stall injection totals: AW=${stallTotals(0)} AR=${stallTotals(1)} B=${stallTotals(2)} cycles")

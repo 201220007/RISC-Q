@@ -71,6 +71,7 @@ class LiveFakeUplink:
         self.prod_list = []           # the accepted words, in DDR order
         self.banks_due = deque()      # (t_due, bank)
         self.banks_done = 0
+        self.commit_t = {}            # bank -> the time CUR_ADDR moved past it (this run)
         self.written = 0              # bytes of the run written to DDR (the safe region)
         self.sticky = 0
         self.live = 0                 # live (non-sticky) status bits to OR in
@@ -117,6 +118,7 @@ class LiveFakeUplink:
                 self._write_words(bank * WORDS_PER_BANK, (bank + 1) * WORDS_PER_BANK)
                 self.banks_done = bank + 1
                 self.cur = self.run_base + (bank + 1) * BANK
+                self.commit_t[bank] = self.t
             if self.flush_at is not None and self.t >= self.flush_at and not self.banks_due and self.run_active:
                 self._final_bank()
 
@@ -223,6 +225,7 @@ class LiveFakeUplink:
             self.rejected = [0] * self.num_ch
             self.counts = [0] * self.num_ch
             self.produced, self.prod_list, self.banks_done, self.written = 0, [], 0, 0
+            self.commit_t = {}
             self._acc = 0.0
             self.banks_due.clear()
             self.run_active = True

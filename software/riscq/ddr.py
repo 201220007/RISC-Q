@@ -625,6 +625,7 @@ class DdrStream:
         self.n_polls = self.n_chunks = 0
         self.inflight = None        # (base, nbytes) of the chunk whose DMA is under way, until it lands
         self.t_first_read = None    # just before the first chunk's DMA was armed
+        self.poll_log = None        # a list to record every poll in (see poll()), or None
         self.t_open = clock()
         ro._status_observer = self._observe     # every STATUS sample from here on: polls, DMA checks, FLUSH
         s = ro._status()
@@ -658,17 +659,34 @@ class DdrStream:
 
     def poll(self) -> int:
         """Read STATUS, then CUR_ADDR (before write_done) or the run's end (once write_done is set). Returns the
-        number of bytes now safe to read."""
+        number of bytes now safe to read.
+
+        With `poll_log` a list, every poll appends (t_status_before, t_status_after, status, t_cur_before,
+        t_cur_after, cur_addr, committed, ended), each register read bracketed by a timestamp on the stream's clock
+        taken just before and just after it (the CUR_ADDR fields are None when the poll did not read CUR_ADDR). A
+        commit that one read shows and the read before it does not lies after that earlier read's start and before
+        this read's end."""
         if not self.ended:
             self.n_polls += 1
+            log, clock = self.poll_log, self.clock
+            ts0 = clock() if log is not None else None
             s = self.ro._status()                # seen by _observe
+            ts1 = clock() if log is not None else None
+            tc0 = tc1 = cur = None
             if s >> S_WRITE_DONE & 1:
                 self._end(s)
             elif not s >> S_RUN_ACTIVE & 1:
                 raise DdrUplinkError("the run ended without write_done (a reset, or a refused or timed-out flush): %s"
                                      % status_str(s))
             else:
-                self._frontier(self.ro._rd(CUR_ADDR))
+                if log is not None:
+                    tc0 = clock()
+                cur = self.ro._rd(CUR_ADDR)
+                if log is not None:
+                    tc1 = clock()
+                self._frontier(cur)
+            if log is not None:
+                log.append((ts0, ts1, s, tc0, tc1, cur, self.committed, self.ended))
         return self.committed - self.sent
 
     def read(self):

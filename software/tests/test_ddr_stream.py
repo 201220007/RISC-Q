@@ -382,6 +382,40 @@ def test_an_error_seen_only_during_the_flush_refuses():
     assert seen["n"] == 1 and not fake.live
 
 
+def test_the_poll_log_brackets_every_commit_it_shows():
+    """Board L5's production timestamps. With `poll_log` set, every poll records its STATUS and CUR_ADDR reads, each
+    bracketed by a timestamp just before and just after it, on the stream's clock (here the fake's own). For every
+    bank seen through CUR_ADDR, the commit lies after the start of the previous CUR_ADDR read, which did not show it,
+    and no later than the end of the read that first did. Polls that saw write_done read no CUR_ADDR."""
+    fake, ro, exp, _ = _setup([400, 400, 400, 400], rate=0.5, commit_lag=5)
+    ctl = FakeControl(fake)
+    ro.prepare(BASE, exp)
+    st = ro.stream(BASE, exp, max_chunk=2 * BANK, clock=lambda: float(fake.t))
+    st.poll_log = log = []
+    ctl.start()
+    for _ in range(200000):
+        if st.finished:
+            break
+        st.step()
+        if not st.ended and ctl.done() and fake.run_active and fake.flush_at is None:
+            ctl.stop()
+            ro.flush()
+    assert st.finished and len(log) == st.n_polls
+    for ts0, ts1, s, tc0, tc1, cur, committed, ended in log:
+        assert ts0 < ts1 and (tc0 is None) == (cur is None) == bool(s >> R.S_WRITE_DONE & 1)
+        assert tc0 is None or ts1 <= tc0 < tc1
+    reads = [(tc0, tc1, cur - BASE) for _, _, _, tc0, tc1, cur, _, _ in log if tc0 is not None]
+    checked = 0
+    for b, t_commit in sorted(fake.commit_t.items()):
+        end = (b + 1) * BANK
+        i = next((k for k, r in enumerate(reads) if r[2] >= end), None)
+        if not i:
+            continue                                 # first seen at write_done, or at the very first read
+        assert reads[i - 1][2] < end and reads[i - 1][0] < t_commit <= reads[i][1], (b, t_commit, reads[i - 1:i + 1])
+        checked += 1
+    assert checked >= 20
+
+
 def test_reads_are_cut_to_a_fixed_dma_buffer():
     """A fixed DMA buffer (DdrBoard(grow=False)): drain() cuts its read into buffer-sized transfers, the stream's
     default chunk is the buffer, and a larger max_chunk is refused -- nothing ever asks to reallocate."""

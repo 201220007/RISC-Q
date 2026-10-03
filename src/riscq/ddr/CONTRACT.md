@@ -155,6 +155,23 @@ against `ddr_regs.py`. In particular:
 - `ctrl`: the AXI4 register slave.
 - `dspAdmit`, `calibDone`: unchanged.
 
+### I9. Live frontier (qubic3 S1, `ddr.py::DdrStream`)
+
+During a run, `CUR_ADDR` is the end of the run's committed full banks, and software reads behind it while the
+writer runs:
+
+- It starts at `run_base` (BASE_RESET) and moves by one bank (512 B) only after that bank's last B handshake, so it
+  is always a bank boundary and never claims a bank whose B has not been taken. The writer's AWCACHE is 0, so the B
+  comes from the final destination, and AXI requires a read issued after it to observe the write. (The simulations'
+  memories are coherent by construction; the MIG's own read-after-write order is a board check.)
+- On the final bank's B, or the empty final presentation, it parks at `run_base` in the cycle `FINAL_ADDR` is
+  latched. The run's end beyond its last full bank is known only from `FINAL_ADDR`, after `write_done`.
+- `RD_START` is accepted during a run (`rdSizeOk && !rdLocked`); the drain engine owns AR/R and the writer AW/W/B,
+  so a read of `[run_base, CUR_ADDR)` runs alongside the writes and changes nothing the writer does.
+- Depends: `ddr.py::DdrStream` (the max-held frontier, the end at `FINAL_ADDR`), `riscq/board/ddr_stream.py`;
+  G2 `live_*` (CUR_ADDR against the B responses at every sample, the words read live against the DDR image), CDC
+  `live_reset_*`, `software/tests/test_ddr_stream.py`, the S1 tests of `test_ddr_cosim.py`.
+
 ## 2. Permitted changes
 
 These may differ from the vendored implementation. Each one is recorded in the P3a report:

@@ -912,9 +912,7 @@ object ReadoutDdrUplinkSim extends App {
    *  not yet: the reader really ran while banks were being written) and in the same cycle as a W beat. */
   class LiveBus(dut: ReadoutDdrUplinkDut, cd: ClockDomain) {
     var bCount = 0L; var rDuringW = 0L; var rwSameCycle = 0L; var wOpen = 0; var rBeats = 0L
-    var awCount = 0L; var wBeats = 0L; var openCycles = 0L; var cycles = 0L; var inR = false
-    val timeline = mutable.ArrayBuffer[String]()
-    def ev(what: String): Unit = if (timeline.size < 60) timeline += s"$cycles:$what"
+    var awCount = 0L; var wBeats = 0L; var openCycles = 0L; var cycles = 0L
     private val d = dut.up.io.ddr
     private val mon = fork {
       while (true) {
@@ -924,13 +922,11 @@ object ReadoutDdrUplinkSim extends App {
         val w = d.w.valid.toBoolean && d.w.ready.toBoolean
         val b = d.b.valid.toBoolean && d.b.ready.toBoolean
         val r = d.r.valid.toBoolean && d.r.ready.toBoolean
-        if (aw) { wOpen += 1; awCount += 1; ev("AW") }
+        if (aw) { wOpen += 1; awCount += 1 }
         if (w) wBeats += 1
         if (wOpen > 0) openCycles += 1
-        if (r) { rBeats += 1; if (wOpen > 0) rDuringW += 1; if (w) rwSameCycle += 1; if (!inR) { inR = true; ev("R0") } }
-        else if (inR && !d.r.valid.toBoolean) { inR = false; ev("R1") }
-        if (d.ar.valid.toBoolean && d.ar.ready.toBoolean) ev("AR")
-        if (b) { bCount += 1; wOpen -= 1; ev("B") }
+        if (r) { rBeats += 1; if (wOpen > 0) rDuringW += 1; if (w) rwSameCycle += 1 }
+        if (b) { bCount += 1; wOpen -= 1 }
       }
     }
     def stop(): Unit = mon.terminate()
